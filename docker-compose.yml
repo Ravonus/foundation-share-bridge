@@ -1,0 +1,15 @@
+services:
+  kubo:
+    image: ipfs/kubo:latest
+    container_name: foundation-share-kubo
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5001:5001"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data/kubo:/data/ipfs
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs id >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5

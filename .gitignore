@@ -1,0 +1,7 @@
+/target
+/bridge-state.json
+/bridge-config.json
+/data
+/dist
+/logs
+/.DS_Store
