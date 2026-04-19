@@ -76,3 +76,25 @@ pub fn parse_ipfs_reference(raw: &str) -> Option<(String, String)> {
     let index = path.find("/ipfs/")?;
     parse_ipfs_path(&path[(index + "/ipfs/".len())..])
 }
+
+/// Build a gateway URL that addresses a specific file inside a CID, preserving
+/// any sub-path. Falls back to [`build_gateway_url`] when the relative path is
+/// empty or whitespace.
+pub fn build_gateway_asset_url(base: &str, cid: &str, relative_path: &str) -> String {
+    let cleaned = relative_path.trim().trim_matches('/');
+    if cleaned.is_empty() {
+        return build_gateway_url(base, cid);
+    }
+
+    format!("{}/ipfs/{}/{}", trim_trailing_slash(base), cid.trim(), cleaned)
+}
+
+/// If `raw` parses as an IPFS reference, rewrite it to point at the given
+/// gateway base; otherwise hand back the original string unchanged.
+pub fn normalize_asset_url_for_gateway(raw: &str, gateway_base: &str) -> String {
+    if let Some((cid, relative_path)) = parse_ipfs_reference(raw) {
+        return build_gateway_asset_url(gateway_base, &cid, &relative_path);
+    }
+
+    raw.to_string()
+}

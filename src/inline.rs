@@ -32,23 +32,39 @@ use crate::{
         config::{
             BridgeConfig, BridgeConfigResponse, BridgePersistentState, RootPageQuery,
             SettingsPageQuery, ShareWorkViewQuery, UpdateBridgeConfigFormRequest,
-            UpdateBridgeConfigRequest,
+            UpdateBridgeConfigRequest, bridge_config_uses_yaml, default_bridge_config,
+            legacy_bridge_json_path, parse_bridge_config,
         },
         pin::{
-            AddFilesResult, AddedFileEntry, DiscoveredDependency, ExportQuery,
-            InventoryEntryDescriptor, InventorySourcePin, PinCidRequest, PinCidResult,
-            PinInventoryItem, PinLsResponse, PinMetadataField, PinMetadataView, PinVerification,
-            PinsPageQuery, PinsPageResponse, PinsResponse, RepairCycleOutcome, RepairNowResponse,
-            ResolvedWorkDisplay, RetryPinResponse, RetrySyncResponse, SetPinTagsRequest,
-            SetPinTagsResponse, SyncNowResponse, SyncOutcome, UnwatchPinsRequest,
-            UnwatchPinsResponse, VerifyPinsRequest, VerifyPinsResponse, WatchPinInput, WatchedPin,
+            AddFilesResult, AddedFileEntry, ExportQuery, InventoryEntryDescriptor,
+            InventorySourcePin, PinCidRequest, PinCidResult, PinInventoryItem, PinLsResponse,
+            PinVerification, PinsPageQuery, PinsPageResponse, PinsResponse, RepairCycleOutcome,
+            RepairNowResponse, ResolvedWorkDisplay, RetryPinResponse, RetrySyncResponse,
+            SetPinTagsRequest, SetPinTagsResponse, SyncNowResponse, SyncOutcome,
+            UnwatchPinsRequest, UnwatchPinsResponse, VerifyPinsRequest, VerifyPinsResponse,
+            WatchPinInput, WatchedPin,
+            dependency::{
+                build_work_dependency_input, collect_dependency_refs_from_json_value,
+                enqueue_dependency_probe, extract_absolute_ipfs_reference_strings,
+                is_dependency_probe_candidate, push_unique_dependency,
+            },
+            inventory::{
+                INVENTORY_PAGE_SIZE, build_single_inventory_item, categorize_pin_error,
+                collect_inventory_descriptors, inventory_work_group_key, parse_inventory_cursor,
+                related_cids_from_members, render_inventory_fallback_table,
+                resolve_inventory_page_size,
+            },
+            metadata::{
+                build_metadata_view, detect_media_kind_from_text, metadata_file_url,
+                metadata_image_url, metadata_primary_media_url,
+            },
         },
         relay::{
             PairingDeepLink, RelayForceDisconnectMessage, RelayInventoryMessage, RelayJobMessage,
             RelayJobResultMessage, RelayLinkFormRequest, RelayLinkRequest, RelayLinkResponse,
             RelayRequestInventoryMessage, RelayShareWorkPayload, RelayUnlinkResponse,
             RelayWelcomeMessage, ShareProfileRequest, ShareProfileResponse, ShareWorkRequest,
-            ShareWorkResponse,
+            ShareWorkResponse, build_relay_socket_url, relay_is_connected,
         },
         session::{
             BridgeSession, ConnectSessionRequest, ConnectSessionResponse, DisconnectSessionRequest,
@@ -61,8 +77,7 @@ use crate::{
     },
     util::{
         data::{
-            first_present_error, first_present_string, json_display_value, json_string,
-            max_timestamp_by, nested_json_value, unique_trimmed_strings,
+            first_present_error, first_present_string, max_timestamp_by, unique_trimmed_strings,
         },
         file::{
             ensure_leaf_file_extension, leaf_name_from_ipfs_path,
@@ -71,9 +86,10 @@ use crate::{
         format::{format_bytes_human, format_timestamp},
         text::{csv_escape, escape_html, sanitize_custom_tag},
         url::{
-            PUBLIC_UTILITY_GATEWAY_BASE_URL, build_direct_ip_gateway_base_url, build_gateway_url,
-            build_public_utility_gateway_url, encode_query_component, parse_ipfs_path,
-            parse_ipfs_reference, trim_trailing_slash,
+            PUBLIC_UTILITY_GATEWAY_BASE_URL, build_direct_ip_gateway_base_url,
+            build_gateway_asset_url, build_gateway_url, encode_query_component,
+            normalize_asset_url_for_gateway, parse_ipfs_path, parse_ipfs_reference,
+            trim_trailing_slash,
         },
     },
 };
@@ -112,11 +128,6 @@ use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
-const DEFAULT_RELAY_SERVER_URL: &str = "https://foundation.agorix.io";
-const FOUNDATION_SITE_HOSTNAME: &str = "foundation.agorix.io";
-const FOUNDATION_SOCKET_HOSTNAME: &str = "socket-foundation.agorix.io";
-const INVENTORY_PAGE_SIZE: usize = 12;
-const INVENTORY_MAX_PAGE_SIZE: usize = 24;
 const VERIFY_CONCURRENCY: usize = 6;
 const MAX_DISCOVERY_TEXT_BYTES: usize = 512 * 1024;
 const MAX_DEPENDENCY_DISCOVERY_DEPTH: usize = 2;
@@ -395,106 +406,6 @@ async fn load_persistent_state(path: &Path) -> anyhow::Result<BridgePersistentSt
             format!("Unable to read persistent bridge state at {}", path.display())
         }),
     }
-}
-
-fn default_download_root_dir(state_file: &Path) -> String {
-    state_file
-        .parent()
-        .map(|parent| parent.join("synced-ipfs"))
-        .unwrap_or_else(|| PathBuf::from("./synced-ipfs"))
-        .display()
-        .to_string()
-}
-
-fn default_bridge_config(state_file: &Path) -> BridgeConfig {
-    BridgeConfig {
-        download_root_dir: env::var("BRIDGE_DOWNLOAD_ROOT_DIR")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| default_download_root_dir(state_file)),
-        sync_enabled: env::var("BRIDGE_SYNC_ENABLED")
-            .ok()
-            .map(|value| {
-                matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(false),
-        local_gateway_base_url: env::var("LOCAL_IPFS_GATEWAY_BASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),
-        public_gateway_base_url: env::var("PUBLIC_IPFS_GATEWAY_BASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "https://ipfs.io".to_string()),
-        relay_enabled: env::var("BRIDGE_RELAY_ENABLED")
-            .ok()
-            .map(|value| {
-                matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(false),
-        relay_server_url: env::var("BRIDGE_RELAY_SERVER_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_RELAY_SERVER_URL.to_string()),
-        relay_device_name: env::var("BRIDGE_DEVICE_NAME")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "Foundation desktop helper".to_string()),
-        relay_device_id: None,
-        relay_device_label: None,
-        relay_device_token: None,
-        relay_last_connected_at: None,
-        relay_last_error: None,
-        storage_quota_gb: env::var("BRIDGE_STORAGE_QUOTA_GB")
-            .ok()
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .filter(|value| *value > 0.0),
-        max_retry_attempts: env::var("BRIDGE_MAX_RETRY_ATTEMPTS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok()),
-        remote_pinning_enabled: env::var("BRIDGE_REMOTE_PINNING_ENABLED")
-            .ok()
-            .map(|value| {
-                matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(false),
-        remote_pinning_service_name: env::var("BRIDGE_REMOTE_PINNING_SERVICE_NAME")
-            .ok()
-            .filter(|value| !value.trim().is_empty()),
-        remote_pinning_service_url: env::var("BRIDGE_REMOTE_PINNING_SERVICE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty()),
-        remote_pinning_access_token: env::var("BRIDGE_REMOTE_PINNING_ACCESS_TOKEN")
-            .ok()
-            .filter(|value| !value.trim().is_empty()),
-        onboarded_at: None,
-    }
-}
-
-fn bridge_config_uses_yaml(path: &Path) -> bool {
-    matches!(path.extension().and_then(|value| value.to_str()), Some("yaml" | "yml"))
-}
-
-fn parse_bridge_config(contents: &str, path: &Path) -> anyhow::Result<BridgeConfig> {
-    if bridge_config_uses_yaml(path) {
-        serde_yaml::from_str::<BridgeConfig>(contents)
-            .or_else(|_| serde_json::from_str::<BridgeConfig>(contents))
-            .with_context(|| format!("Unable to parse bridge config from {}", path.display()))
-    } else {
-        serde_json::from_str::<BridgeConfig>(contents)
-            .or_else(|_| serde_yaml::from_str::<BridgeConfig>(contents))
-            .with_context(|| format!("Unable to parse bridge config from {}", path.display()))
-    }
-}
-
-fn legacy_bridge_json_path(path: &Path) -> Option<PathBuf> {
-    if !bridge_config_uses_yaml(path) {
-        return None;
-    }
-
-    let file_stem = path.file_stem()?.to_str()?;
-    let parent = path.parent()?;
-    Some(parent.join(format!("{file_stem}.json")))
 }
 
 async fn load_bridge_config(path: &Path, state_file: &Path) -> anyhow::Result<BridgeConfig> {
@@ -831,12 +742,6 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-fn relay_is_connected(config: &BridgeConfig) -> bool {
-    config.relay_enabled
-        && config.relay_last_error.as_deref().map(str::trim).unwrap_or("").is_empty()
-        && !config.relay_device_token.as_deref().map(str::trim).unwrap_or("").is_empty()
-}
-
 fn build_config_response(state: &AppState, config: &BridgeConfig) -> BridgeConfigResponse {
     BridgeConfigResponse {
         download_root_dir: config.download_root_dir.clone(),
@@ -863,98 +768,6 @@ fn build_config_response(state: &AppState, config: &BridgeConfig) -> BridgeConfi
             .unwrap_or(false),
         onboarded_at: config.onboarded_at,
     }
-}
-
-fn render_inventory_table_rows(items: &[PinInventoryItem], limit: usize) -> String {
-    items.iter()
-        .take(limit)
-        .map(|pin| {
-            let status_pill = if pin.pinned {
-                format!(
-                    r#"<span class="pill ok">{}</span>"#,
-                    escape_html(pin.pin_type.as_deref().unwrap_or("pinned"))
-                )
-            } else {
-                r#"<span class="pill warn">Repair needed</span>"#.to_string()
-            };
-
-            let links = {
-                let mut parts = Vec::new();
-                if let Some(url) = pin.local_gateway_url.as_deref() {
-                    parts.push(format!(
-                        r#"<a href="{}" target="_blank" rel="noreferrer">local</a>"#,
-                        escape_html(url)
-                    ));
-                }
-                if let Some(url) = pin.public_gateway_url.as_deref() {
-                    parts.push(format!(
-                        r#"<a href="{}" target="_blank" rel="noreferrer">pinned</a>"#,
-                        escape_html(url)
-                    ));
-                }
-                parts.push(format!(
-                    r#"<a href="{}" target="_blank" rel="noreferrer">public</a>"#,
-                    escape_html(&build_public_utility_gateway_url(&pin.cid))
-                ));
-                if parts.is_empty() {
-                    r#"<span class="muted">—</span>"#.to_string()
-                } else {
-                    parts.join(" · ")
-                }
-            };
-
-            format!(
-                r#"<tr><td><div>{}</div><div class="cid">{}</div></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
-                escape_html(
-                    pin.title
-                        .as_deref()
-                        .or(pin.label.as_deref())
-                        .unwrap_or("Local IPFS pin")
-                ),
-                escape_html(&pin.cid),
-                escape_html(
-                    pin.foundation_url
-                        .as_deref()
-                        .or(pin.contract_address.as_deref())
-                        .or(pin.username.as_deref())
-                        .unwrap_or("—")
-                ),
-                status_pill,
-                escape_html(
-                    &pin.last_verified_at
-                        .map(format_timestamp)
-                        .unwrap_or_else(|| "never".to_string())
-                ),
-                links,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn render_inventory_fallback_table(items: &[PinInventoryItem]) -> String {
-    let rows = render_inventory_table_rows(items, INVENTORY_PAGE_SIZE);
-    if rows.is_empty() {
-        return r#"<div class="empty">No pins yet. Once the archive site hands you something to rescue, it will appear here.</div>"#.to_string();
-    }
-
-    format!(
-        r#"<div class="table-wrap">
-  <table>
-    <thead>
-      <tr>
-        <th>Item</th>
-        <th>Context</th>
-        <th>Status</th>
-        <th>Last verified</th>
-        <th>Gateway</th>
-      </tr>
-    </thead>
-    <tbody>{rows}</tbody>
-  </table>
-</div>"#,
-        rows = rows
-    )
 }
 
 async fn root_page(
@@ -2045,44 +1858,6 @@ async fn resolve_verify_targets(state: &AppState, requested: Option<&[String]>) 
     persistent.watched_pins.keys().cloned().collect()
 }
 
-fn parse_inventory_cursor(raw: Option<&str>) -> usize {
-    raw.and_then(|value| value.trim().parse::<usize>().ok()).unwrap_or(0)
-}
-
-fn resolve_inventory_page_size(raw: Option<usize>) -> usize {
-    raw.unwrap_or(INVENTORY_PAGE_SIZE).clamp(1, INVENTORY_MAX_PAGE_SIZE)
-}
-
-fn collect_inventory_descriptors(
-    pinset: &HashMap<String, String>,
-    persistent: &BridgePersistentState,
-) -> Vec<InventoryEntryDescriptor> {
-    let mut grouped_work_members = HashMap::<String, Vec<InventorySourcePin>>::new();
-    let mut descriptors = Vec::new();
-
-    for watched in persistent.watched_pins.values() {
-        let source = InventorySourcePin {
-            cid: watched.cid.clone(),
-            pinned: pinset.contains_key(&watched.cid),
-            pin_type: pinset.get(&watched.cid).cloned(),
-            watched: watched.clone(),
-        };
-
-        if let Some(group_key) = inventory_work_group_key(&source.watched) {
-            grouped_work_members.entry(group_key).or_default().push(source);
-        } else {
-            descriptors.push(InventoryEntryDescriptor::Single(source));
-        }
-    }
-
-    for members in grouped_work_members.into_values() {
-        descriptors.push(InventoryEntryDescriptor::Work(members));
-    }
-
-    descriptors.sort_by_key(|entry| std::cmp::Reverse(entry.added_at()));
-    descriptors
-}
-
 async fn build_inventory_item_from_descriptor(
     state: &AppState,
     config: &BridgeConfig,
@@ -2988,116 +2763,6 @@ async fn list_kubo_pinset(state: &AppState) -> anyhow::Result<HashMap<String, St
     Ok(pins)
 }
 
-fn inventory_work_group_key(pin: &WatchedPin) -> Option<String> {
-    if pin.source_kind != "work" {
-        return None;
-    }
-
-    if let (Some(contract_address), Some(token_id)) =
-        (pin.contract_address.as_deref(), pin.token_id.as_deref())
-    {
-        let contract = contract_address.trim().to_ascii_lowercase();
-        let token = token_id.trim();
-        if !contract.is_empty() && !token.is_empty() {
-            return Some(format!("work:{contract}:{token}"));
-        }
-    }
-
-    if let Some(foundation_url) = pin.foundation_url.as_deref() {
-        let trimmed = foundation_url.trim();
-        if !trimmed.is_empty() {
-            return Some(format!("work-url:{trimmed}"));
-        }
-    }
-
-    if let Some(title) = pin.title.as_deref() {
-        let trimmed = title.trim();
-        if !trimmed.is_empty() {
-            return Some(format!(
-                "work-title:{}:{}",
-                trimmed.to_ascii_lowercase(),
-                pin.artist_username.as_deref().unwrap_or_default().trim().to_ascii_lowercase()
-            ));
-        }
-    }
-
-    None
-}
-
-fn related_cids_from_members(members: &[InventorySourcePin]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    members.iter().map(|member| member.cid.clone()).filter(|cid| seen.insert(cid.clone())).collect()
-}
-
-fn parse_discovered_dependency(raw: &str) -> Option<DiscoveredDependency> {
-    let (cid, relative_path) = parse_ipfs_reference(raw)?;
-    Some(DiscoveredDependency {
-        cid,
-        preferred_file_name: preferred_file_name_from_relative_path(&relative_path),
-    })
-}
-
-fn push_unique_dependency(
-    dependencies: &mut Vec<DiscoveredDependency>,
-    candidate: DiscoveredDependency,
-) -> bool {
-    if let Some(existing) = dependencies.iter_mut().find(|entry| entry.cid == candidate.cid) {
-        if existing.preferred_file_name.is_none() {
-            existing.preferred_file_name = candidate.preferred_file_name;
-        }
-        false
-    } else {
-        dependencies.push(candidate);
-        true
-    }
-}
-
-fn extract_absolute_ipfs_reference_strings(text: &str) -> Vec<DiscoveredDependency> {
-    let mut dependencies = Vec::new();
-    for token in text.split(|character: char| {
-        character.is_whitespace()
-            || matches!(
-                character,
-                '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '='
-            )
-    }) {
-        let candidate = token.trim_matches(|character: char| {
-            matches!(
-                character,
-                '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
-            )
-        });
-        if let Some(dependency) = parse_discovered_dependency(candidate) {
-            push_unique_dependency(&mut dependencies, dependency);
-        }
-    }
-    dependencies
-}
-
-fn collect_dependency_refs_from_json_value(
-    value: &serde_json::Value,
-    dependencies: &mut Vec<DiscoveredDependency>,
-) {
-    match value {
-        serde_json::Value::String(text) => {
-            if let Some(dependency) = parse_discovered_dependency(text) {
-                push_unique_dependency(dependencies, dependency);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_dependency_refs_from_json_value(item, dependencies);
-            }
-        }
-        serde_json::Value::Object(entries) => {
-            for item in entries.values() {
-                collect_dependency_refs_from_json_value(item, dependencies);
-            }
-        }
-        _ => {}
-    }
-}
-
 async fn fetch_ipfs_text(state: &AppState, ipfs_path: &str) -> anyhow::Result<Option<String>> {
     let endpoint = format!("{}/api/v0/cat", state.ipfs_api_url.trim_end_matches('/'));
     let mut request = state.http.post(endpoint).query(&[("arg", ipfs_path)]);
@@ -3121,18 +2786,6 @@ async fn fetch_ipfs_text(state: &AppState, ipfs_path: &str) -> anyhow::Result<Op
     }
 
     Ok(Some(String::from_utf8_lossy(bounded).into_owned()))
-}
-
-fn is_dependency_probe_candidate(file_name: &str) -> bool {
-    let lower = file_name.trim().to_ascii_lowercase();
-    lower.ends_with(".html")
-        || lower.ends_with(".htm")
-        || lower.ends_with(".gltf")
-        || lower.ends_with(".json")
-        || lower.ends_with(".svg")
-        || lower.ends_with(".css")
-        || lower.ends_with(".js")
-        || lower.ends_with(".txt")
 }
 
 async fn resolve_dependency_probe_paths(
@@ -3187,25 +2840,6 @@ async fn resolve_dependency_probe_paths(
 
     candidates.truncate(6);
     candidates
-}
-
-fn build_work_dependency_input(
-    input: &RelayShareWorkPayload,
-    dependency: DiscoveredDependency,
-) -> WatchPinInput {
-    WatchPinInput {
-        cid: dependency.cid,
-        label: Some("dependency".to_string()),
-        preferred_file_name: dependency.preferred_file_name,
-        source_kind: "work".to_string(),
-        title: Some(input.title.clone()),
-        contract_address: Some(input.contract_address.clone()),
-        token_id: Some(input.token_id.clone()),
-        foundation_url: input.foundation_url.clone(),
-        artist_username: input.artist_username.clone(),
-        account_address: None,
-        username: None,
-    }
 }
 
 async fn resolve_work_root_file_hints(
@@ -3266,18 +2900,6 @@ async fn resolve_work_root_file_hints(
         };
 
     (metadata_hint, media_hint)
-}
-
-fn enqueue_dependency_probe(
-    queued: &mut HashSet<String>,
-    queue: &mut VecDeque<(String, Option<String>, usize)>,
-    cid: String,
-    preferred_file_name: Option<String>,
-    depth: usize,
-) {
-    if queued.insert(cid.clone()) {
-        queue.push_back((cid, preferred_file_name, depth));
-    }
 }
 
 async fn discover_work_dependency_inputs(
@@ -3385,247 +3007,6 @@ async fn discover_work_dependency_inputs(
         .filter(|dependency| !root_cids.contains(&dependency.cid))
         .map(|dependency| build_work_dependency_input(input, dependency))
         .collect()
-}
-
-fn build_gateway_asset_url(base: &str, cid: &str, relative_path: &str) -> String {
-    let cleaned = relative_path.trim().trim_matches('/');
-    if cleaned.is_empty() {
-        return build_gateway_url(base, cid);
-    }
-
-    format!("{}/ipfs/{}/{}", trim_trailing_slash(base), cid.trim(), cleaned)
-}
-
-fn normalize_asset_url_for_gateway(raw: &str, gateway_base: &str) -> String {
-    if let Some((cid, relative_path)) = parse_ipfs_reference(raw) {
-        return build_gateway_asset_url(gateway_base, &cid, &relative_path);
-    }
-
-    raw.to_string()
-}
-
-fn collect_url_candidates(value: Option<&serde_json::Value>) -> Vec<String> {
-    let mut candidates = Vec::new();
-    let entries = match value {
-        Some(serde_json::Value::Array(items)) => items.iter().collect::<Vec<_>>(),
-        Some(other) => vec![other],
-        None => Vec::new(),
-    };
-
-    for entry in entries {
-        let Some(record) = entry.as_object() else {
-            continue;
-        };
-
-        for key in ["uri", "url", "src", "href", "animation_url", "animation", "image", "image_url"]
-        {
-            let candidate = json_string(record.get(key));
-            if let Some(candidate) = candidate.filter(|value| !candidates.contains(value)) {
-                candidates.push(candidate);
-            }
-        }
-    }
-
-    candidates
-}
-
-fn metadata_image_url(metadata: &serde_json::Value) -> Option<String> {
-    first_present_string([
-        json_string(metadata.get("image")),
-        json_string(metadata.get("image_url")),
-        json_string(nested_json_value(metadata, &["properties", "image"])),
-        json_string(nested_json_value(metadata, &["properties", "image_url"])),
-        json_string(nested_json_value(metadata, &["displayUri"])),
-        json_string(nested_json_value(metadata, &["display_uri"])),
-        json_string(nested_json_value(metadata, &["thumbnailUri"])),
-        json_string(nested_json_value(metadata, &["thumbnail_uri"])),
-    ])
-}
-
-fn metadata_file_url(metadata: &serde_json::Value) -> Option<String> {
-    first_present_string(
-        collect_url_candidates(nested_json_value(metadata, &["media", "files"]))
-            .into_iter()
-            .map(Some)
-            .chain(
-                collect_url_candidates(nested_json_value(metadata, &["properties", "files"]))
-                    .into_iter()
-                    .map(Some),
-            )
-            .chain(
-                collect_url_candidates(nested_json_value(metadata, &["files"]))
-                    .into_iter()
-                    .map(Some),
-            )
-            .chain(
-                collect_url_candidates(nested_json_value(metadata, &["formats"]))
-                    .into_iter()
-                    .map(Some),
-            ),
-    )
-}
-
-fn metadata_primary_media_url(metadata: &serde_json::Value) -> Option<String> {
-    first_present_string([
-        json_string(metadata.get("animation_url")),
-        json_string(metadata.get("animation")),
-        json_string(nested_json_value(metadata, &["media", "uri"])),
-        json_string(nested_json_value(metadata, &["media", "url"])),
-        json_string(nested_json_value(metadata, &["properties", "animation_url"])),
-        json_string(nested_json_value(metadata, &["properties", "animation"])),
-        json_string(nested_json_value(metadata, &["artifactUri"])),
-        json_string(nested_json_value(metadata, &["artifact_uri"])),
-        json_string(nested_json_value(metadata, &["content", "uri"])),
-        json_string(nested_json_value(metadata, &["content", "url"])),
-    ])
-}
-
-fn metadata_description(metadata: &serde_json::Value) -> Option<String> {
-    first_present_string([
-        json_string(metadata.get("description")),
-        json_string(nested_json_value(metadata, &["properties", "description"])),
-        json_string(nested_json_value(metadata, &["content", "description"])),
-    ])
-}
-
-fn metadata_external_url(metadata: &serde_json::Value) -> Option<String> {
-    first_present_string([
-        json_string(metadata.get("external_url")),
-        json_string(metadata.get("externalUrl")),
-        json_string(nested_json_value(metadata, &["properties", "external_url"])),
-        json_string(nested_json_value(metadata, &["properties", "externalUrl"])),
-    ])
-}
-
-fn metadata_mime_type(metadata: &serde_json::Value) -> Option<String> {
-    first_present_string([
-        json_string(metadata.get("mimeType")),
-        json_string(metadata.get("mime_type")),
-        json_string(nested_json_value(metadata, &["content", "mimeType"])),
-        json_string(nested_json_value(metadata, &["content", "mime_type"])),
-        json_string(nested_json_value(metadata, &["properties", "mimeType"])),
-        json_string(nested_json_value(metadata, &["properties", "mime_type"])),
-    ])
-}
-
-fn build_metadata_summary_fields(
-    metadata: &serde_json::Value,
-    image_raw: Option<&str>,
-    media_raw: Option<&str>,
-) -> Vec<PinMetadataField> {
-    let mut fields = Vec::new();
-    let mut seen = HashSet::new();
-
-    let mut push_field = |label: &str, value: Option<String>| {
-        let Some(value) = value.filter(|entry| !entry.trim().is_empty()) else {
-            return;
-        };
-        let dedupe_key = format!("{}:{}", label.to_ascii_lowercase(), value);
-        if seen.insert(dedupe_key) {
-            fields.push(PinMetadataField { label: label.to_string(), value });
-        }
-    };
-
-    push_field("Metadata title", json_string(metadata.get("name")));
-    push_field("External URL", metadata_external_url(metadata));
-    push_field("Preview image", image_raw.map(ToOwned::to_owned));
-    push_field(
-        "Primary media",
-        media_raw.filter(|entry| Some(*entry) != image_raw).map(ToOwned::to_owned),
-    );
-    push_field("Mime type", metadata_mime_type(metadata));
-
-    fields
-}
-
-fn build_metadata_attribute_fields(metadata: &serde_json::Value) -> Vec<PinMetadataField> {
-    let mut attributes = Vec::new();
-    let mut seen = HashSet::new();
-
-    for candidate in [
-        metadata.get("attributes"),
-        nested_json_value(metadata, &["properties", "attributes"]),
-        metadata.get("traits"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let Some(entries) = candidate.as_array() else {
-            continue;
-        };
-
-        for (index, entry) in entries.iter().enumerate() {
-            let Some(record) = entry.as_object() else {
-                continue;
-            };
-
-            let label = first_present_string([
-                json_string(record.get("trait_type")),
-                json_string(record.get("type")),
-                json_string(record.get("name")),
-                json_string(record.get("key")),
-            ])
-            .unwrap_or_else(|| format!("Trait {}", index + 1));
-
-            let value = first_present_string([
-                json_display_value(record.get("value")),
-                json_display_value(record.get("display_value")),
-                json_display_value(record.get("trait_value")),
-            ]);
-            let Some(value) = value.filter(|entry| !entry.trim().is_empty()) else {
-                continue;
-            };
-
-            let dedupe_key = format!("{}:{}", label.to_ascii_lowercase(), value);
-            if seen.insert(dedupe_key) {
-                attributes.push(PinMetadataField { label, value });
-            }
-        }
-    }
-
-    attributes
-}
-
-fn build_metadata_view(
-    metadata: &serde_json::Value,
-    image_raw: Option<&str>,
-    media_raw: Option<&str>,
-) -> Option<PinMetadataView> {
-    const MAX_METADATA_JSON_CHARS: usize = 24_000;
-
-    let mut raw_json = serde_json::to_string_pretty(metadata).ok()?;
-    let mut raw_json_truncated = false;
-    if raw_json.chars().count() > MAX_METADATA_JSON_CHARS {
-        raw_json = raw_json.chars().take(MAX_METADATA_JSON_CHARS).collect();
-        raw_json.push_str("\n…");
-        raw_json_truncated = true;
-    }
-
-    let description = metadata_description(metadata);
-    let fields = build_metadata_summary_fields(metadata, image_raw, media_raw);
-    let attributes = build_metadata_attribute_fields(metadata);
-
-    if description.is_none() && fields.is_empty() && attributes.is_empty() && raw_json.is_empty() {
-        return None;
-    }
-
-    Some(PinMetadataView { description, fields, attributes, raw_json, raw_json_truncated })
-}
-
-fn detect_media_kind_from_text(value: &str) -> Option<String> {
-    let lower = value.to_ascii_lowercase();
-    let markers: [(&str, &[&str]); 6] = [
-        ("VIDEO", &[".mp4", ".mov", ".webm", "video"]),
-        ("AUDIO", &[".mp3", ".wav", ".ogg", ".aac", "audio"]),
-        ("IMAGE", &[".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", "image"]),
-        ("HTML", &[".html", "text/html"]),
-        ("MODEL", &[".glb", ".gltf", ".usdz", "model", "model/gltf", "model/vnd.usdz", "3d"]),
-        ("JSON", &[".json", "application/json", "text/json"]),
-    ];
-
-    markers.iter().find_map(|(kind, entries)| {
-        entries.iter().any(|marker| lower.contains(marker)).then(|| (*kind).to_string())
-    })
 }
 
 async fn detect_media_kind_for_url(
@@ -3815,58 +3196,6 @@ async fn resolve_work_display(
     }
 
     display
-}
-
-fn build_single_inventory_item(
-    config: &BridgeConfig,
-    source: InventorySourcePin,
-) -> PinInventoryItem {
-    let cid = source.cid.clone();
-
-    PinInventoryItem {
-        cid: cid.clone(),
-        pinned: source.pinned,
-        pin_type: source.pin_type.clone(),
-        managed: true,
-        label: source.watched.label.clone(),
-        source_kind: Some(source.watched.source_kind.clone()),
-        title: source.watched.title.clone(),
-        contract_address: source.watched.contract_address.clone(),
-        token_id: source.watched.token_id.clone(),
-        foundation_url: source.watched.foundation_url.clone(),
-        artist_username: source.watched.artist_username.clone(),
-        account_address: source.watched.account_address.clone(),
-        username: source.watched.username.clone(),
-        added_at: Some(source.watched.added_at),
-        last_verified_at: source.watched.last_verified_at,
-        last_repaired_at: source.watched.last_repaired_at,
-        last_error: source.watched.last_error.clone(),
-        pin_reference: source.watched.pin_reference.clone(),
-        verify_count: source.watched.verify_count,
-        repair_count: source.watched.repair_count,
-        sync_path: source.watched.sync_path.clone(),
-        local_gateway_url: Some(build_gateway_url(&config.local_gateway_base_url, &cid)),
-        public_gateway_url: Some(build_gateway_url(&config.public_gateway_base_url, &cid)),
-        preview_local_gateway_url: Some(build_gateway_url(&config.local_gateway_base_url, &cid)),
-        preview_public_gateway_url: Some(build_gateway_url(&config.public_gateway_base_url, &cid)),
-        media_kind: None,
-        metadata_view: None,
-        metadata_cid: None,
-        media_cid: None,
-        related_cids: vec![cid],
-        last_synced_at: source.watched.last_synced_at,
-        last_sync_error: source.watched.last_sync_error.clone(),
-        sync_count: source.watched.sync_count,
-        retry_attempts: source.watched.retry_attempts,
-        next_retry_at: source.watched.next_retry_at,
-        error_category: source.watched.error_category.clone(),
-        provider_count: source.watched.provider_count,
-        provider_checked_at: source.watched.provider_checked_at,
-        custom_tags: source.watched.custom_tags.clone(),
-        remote_pinned: source.watched.remote_pinned,
-        remote_pin_service: source.watched.remote_pin_service.clone(),
-        remote_pin_last_error: source.watched.remote_pin_last_error.clone(),
-    }
 }
 
 async fn build_work_inventory_item(
@@ -4284,37 +3613,6 @@ async fn download_ipfs_file(
     })?;
 
     Ok(())
-}
-
-fn build_relay_socket_url(relay_server_url: &str, device_token: &str) -> anyhow::Result<Url> {
-    let mut url = Url::parse(relay_server_url)
-        .with_context(|| format!("Unable to parse relay server URL {relay_server_url}"))?;
-
-    let next_scheme = match url.scheme() {
-        "https" => "wss",
-        "http" => "ws",
-        other => {
-            return Err(anyhow!(
-                "Unsupported relay server scheme for websocket transport: {other}"
-            ));
-        }
-    };
-
-    url.set_scheme(next_scheme)
-        .map_err(|_| anyhow!("Unable to convert relay server URL to websocket scheme"))?;
-
-    if matches!(url.host_str(), Some(FOUNDATION_SITE_HOSTNAME)) {
-        url.set_host(Some(FOUNDATION_SOCKET_HOSTNAME))
-            .map_err(|_| anyhow!("Unable to route relay websocket to the socket host"))?;
-    }
-
-    url.set_path("/desktop-relay");
-    url.query_pairs_mut()
-        .clear()
-        .append_pair("role", "device")
-        .append_pair("deviceToken", device_token);
-
-    Ok(url)
 }
 
 async fn clear_relay_link(state: &AppState) -> anyhow::Result<()> {
@@ -4877,56 +4175,6 @@ async fn build_storage_snapshot(state: &AppState) -> StorageSnapshot {
         ipfs_daemon_reachable,
         checked_at: Utc::now(),
     }
-}
-
-fn categorize_pin_error(message: &str) -> (&'static str, &'static str) {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("connection refused")
-        || lower.contains("failed to reach ipfs")
-        || lower.contains("failed to connect")
-        || lower.contains("connection reset")
-        || lower.contains("dial tcp")
-    {
-        return (
-            "daemon_unreachable",
-            "The local IPFS daemon is not responding. Start Kubo and retry.",
-        );
-    }
-    if lower.contains("deadline exceeded")
-        || lower.contains("timeout")
-        || lower.contains("timed out")
-    {
-        return ("timeout", "The IPFS network took too long to answer. Try again in a minute.");
-    }
-    if lower.contains("no providers")
-        || lower.contains("could not find provider")
-        || lower.contains("no route to host")
-    {
-        return (
-            "no_providers",
-            "No peers know about this CID yet. A remote pinning service can keep a copy.",
-        );
-    }
-    if lower.contains("not pinned") {
-        return ("not_pinned", "The CID is not pinned locally. The next cycle will pin it.");
-    }
-    if lower.contains("invalid") || lower.contains("not a valid cid") {
-        return ("invalid_cid", "The CID looks malformed. Re-request the share.");
-    }
-    if lower.contains("unauthorized")
-        || lower.contains("forbidden")
-        || lower.contains("401")
-        || lower.contains("403")
-    {
-        return ("unauthorized", "The IPFS API rejected the request. Verify IPFS_API_AUTH_HEADER.");
-    }
-    if lower.contains("disk") || lower.contains("no space") || lower.contains("quota") {
-        return (
-            "disk_full",
-            "The IPFS datastore cannot accept more data. Free space or raise the quota.",
-        );
-    }
-    ("unknown", "Cause not recognized. Check the detail for the raw message.")
 }
 
 async fn compute_next_retry_at(state: &AppState, attempt: u32) -> DateTime<Utc> {
