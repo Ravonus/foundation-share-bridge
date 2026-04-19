@@ -19,14 +19,19 @@ use std::{
 use crate::{
     AppError, AppState, OperationStatus,
     html::{
-        assets::LOGO_MARK_SVG,
+        render::{
+            artist::render_artist_summary,
+            page::render_page,
+            settings::{render_export_card, render_gateway_card},
+            status::render_live_status_panel,
+        },
         scripts::{
             autolink::ROOT_AUTOLINK_SCRIPT,
             inventory::INVENTORY_BROWSER_SCRIPT,
             live_status::LIVE_STATUS_SCRIPT,
             settings::{SETTINGS_CONTROLS_SCRIPT, SETTINGS_GATEWAY_HELPER_SCRIPT},
         },
-        styles::{page::PAGE_STYLE, settings::SETTINGS_PAGE_STYLE},
+        styles::settings::SETTINGS_PAGE_STYLE,
     },
     model::{
         config::{
@@ -91,9 +96,8 @@ use crate::{
         format::{format_bytes_human, format_timestamp},
         text::{csv_escape, escape_html, sanitize_custom_tag},
         url::{
-            PUBLIC_UTILITY_GATEWAY_BASE_URL, build_direct_ip_gateway_base_url,
-            build_gateway_asset_url, build_gateway_url, encode_query_component,
-            normalize_asset_url_for_gateway, trim_trailing_slash,
+            build_direct_ip_gateway_base_url, build_gateway_asset_url, build_gateway_url,
+            encode_query_component, normalize_asset_url_for_gateway, trim_trailing_slash,
         },
     },
 };
@@ -3843,217 +3847,4 @@ async fn artist_summary_handler(State(state): State<AppState>) -> Json<ArtistSum
         top_artists,
         total_copies_pinned: total_copies,
     })
-}
-
-fn render_artist_summary(
-    persistent: &BridgePersistentState,
-    sessions: &HashMap<String, BridgeSession>,
-) -> String {
-    if persistent.watched_pins.is_empty() {
-        return String::new();
-    }
-
-    let current_username = sessions.values().filter_map(|s| s.profile_username.clone()).next();
-
-    let mut artist_counts: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut group_keys: HashSet<String> = HashSet::new();
-    let mut works_by_you = 0_usize;
-
-    for pin in persistent.watched_pins.values() {
-        let group = inventory_work_group_key(pin).unwrap_or_else(|| pin.cid.clone());
-        if group_keys.insert(group.clone()) {
-            let artist = pin.artist_username.clone().unwrap_or_else(|| "unknown".to_string());
-            artist_counts.entry(artist).or_default().insert(group.clone());
-            if let Some(me) = current_username.as_deref()
-                && pin
-                    .artist_username
-                    .as_deref()
-                    .map(|v| v.eq_ignore_ascii_case(me))
-                    .unwrap_or(false)
-            {
-                works_by_you += 1;
-            }
-        }
-    }
-
-    let total_works = group_keys.len();
-    let artists_tracked = artist_counts.len();
-    let mut top: Vec<(String, usize)> =
-        artist_counts.iter().map(|(artist, set)| (artist.clone(), set.len())).collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    top.truncate(5);
-
-    let chips = if top.is_empty() {
-        String::new()
-    } else {
-        let inner = top
-            .iter()
-            .map(|(artist, count)| {
-                format!(r#"<span class="pill">@{} · {count}</span>"#, escape_html(artist))
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!(r#"<div class="btn-row" style="margin-top:14px;">{inner}</div>"#)
-    };
-
-    let me_line = match current_username.as_deref() {
-        Some(name) if works_by_you > 0 => format!(
-            r#"<p class="pin-context" style="margin-top:10px;">You are pinning {works_by_you} work{} that credit @{} as the artist.</p>"#,
-            if works_by_you == 1 { "" } else { "s" },
-            escape_html(name)
-        ),
-        Some(name) => format!(
-            r#"<p class="pin-context" style="margin-top:10px;">No works by @{} are pinned on this device yet.</p>"#,
-            escape_html(name)
-        ),
-        None => String::new(),
-    };
-
-    format!(
-        r#"<section id="artists" class="card">
-  <p class="eyebrow">Preservation summary</p>
-  <h2 style="margin-top:8px;">You are caring for {total_works} work{plural} from {artists_tracked} artist{a_plural}</h2>
-  <p class="muted settings-copy">This device keeps these roots pinned forever. Other collectors running the bridge may be pinning the same works alongside you.</p>
-  {me_line}
-  {chips}
-</section>"#,
-        plural = if total_works == 1 { "" } else { "s" },
-        a_plural = if artists_tracked == 1 { "" } else { "s" },
-    )
-}
-
-fn render_gateway_card(config: &BridgeConfig) -> String {
-    format!(
-        r#"<section id="gateway-card" class="card">
-  <p class="eyebrow">Gateway health</p>
-  <h2 style="margin-top:8px;">Are your gateways reachable?</h2>
-  <p class="muted settings-copy">Confirms the local Kubo gateway, your configured external gateway, and the public fallback can all serve pinned content.</p>
-  <dl class="kv" style="margin-top:12px;">
-    <dt>Local</dt><dd><code>{local}</code> <span class="pill" id="gateway-check-local-pill">Idle</span></dd>
-    <dt>External</dt><dd><code>{public}</code> <span class="pill" id="gateway-check-public-pill">Idle</span></dd>
-    <dt>Fallback</dt><dd><code>{utility}</code> <span class="pill" id="gateway-check-utility-pill">Idle</span></dd>
-  </dl>
-  <div class="btn-row">
-    <button type="button" class="btn ghost" id="gateway-check-run">Check gateways now</button>
-  </div>
-  <p class="muted inventory-status" id="gateway-check-status">Not yet tested in this session.</p>
-</section>"#,
-        local = escape_html(&config.local_gateway_base_url),
-        public = escape_html(&config.public_gateway_base_url),
-        utility = escape_html(PUBLIC_UTILITY_GATEWAY_BASE_URL),
-    )
-}
-
-fn render_export_card() -> String {
-    r#"<section id="export-card" class="card">
-  <p class="eyebrow">Backup</p>
-  <h2 style="margin-top:8px;">Export your rescue list</h2>
-  <p class="muted settings-copy">If this machine ever fails, keep an offline copy of what you are pinning. JSON is a complete restore payload; CSV is easier to skim in a spreadsheet.</p>
-  <div class="btn-row">
-    <a class="btn" href="/pins/export?format=json" download>Download JSON</a>
-    <a class="btn ghost" href="/pins/export?format=csv" download>Download CSV</a>
-  </div>
-</section>"#
-        .to_string()
-}
-
-fn render_live_status_panel(status: &OperationStatus) -> String {
-    let (phase_label, phase_class) =
-        if status.phase == "idle" { ("Idle", "pill") } else { (status.phase.as_str(), "pill ok") };
-
-    let detail = status.detail.clone().unwrap_or_else(|| {
-        if status.phase == "idle" {
-            "The helper is resting between cycles.".to_string()
-        } else {
-            String::new()
-        }
-    });
-
-    let progress = match (status.progress_current, status.progress_total) {
-        (Some(current), Some(total)) if total > 0 => format!(" · {current} of {total}"),
-        _ => String::new(),
-    };
-
-    format!(
-        r#"<section id="live-status" class="card">
-  <p class="eyebrow">Live status</p>
-  <h2 style="margin-top:8px;">What this helper is doing right now</h2>
-  <div class="btn-row" style="margin-top:14px;">
-    <span class="{cls}" id="live-status-phase">{phase}</span>
-    <span class="muted inventory-status" id="live-status-detail">{detail}{progress}</span>
-  </div>
-</section>"#,
-        cls = phase_class,
-        phase = escape_html(phase_label),
-        detail = escape_html(&detail),
-    )
-}
-
-fn render_page(title: &str, body_html: &str) -> String {
-    let year = Utc::now().format("%Y").to_string();
-    let mut out = String::with_capacity(8192 + body_html.len());
-    out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n");
-    out.push_str("  <meta charset=\"utf-8\" />\n");
-    out.push_str("  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n");
-    out.push_str("  <title>");
-    out.push_str(&escape_html(title));
-    out.push_str(" · Agorix Share Bridge</title>\n");
-    out.push_str("  <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\" />\n");
-    out.push_str("  <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin />\n");
-    out.push_str("  <link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Inter:wght@400;500;600&display=swap\" />\n");
-    out.push_str("  <script type=\"module\" src=\"https://cdn.jsdelivr.net/npm/@google/model-viewer/dist/model-viewer.min.js\"></script>\n");
-    out.push_str("  <style>:root{--font-inter:'Inter';--font-fraunces:'Fraunces';}");
-    out.push_str(PAGE_STYLE);
-    out.push_str("</style>\n</head>\n<body>\n");
-    out.push_str("<div class=\"page-wrap\">\n");
-    out.push_str("  <nav class=\"site-nav\"><div class=\"site-nav-inner\">");
-    out.push_str("<a class=\"brand\" href=\"/\" aria-label=\"Agorix home\">");
-    out.push_str(LOGO_MARK_SVG);
-    out.push_str("<span class=\"brand-word\">Agorix</span>");
-    out.push_str("<span class=\"brand-eyebrow\">share bridge</span>");
-    out.push_str("</a>");
-    out.push_str(
-        "<div class=\"nav-links\">\
-         <a href=\"/#status\">Status</a>\
-         <a href=\"/#inventory\">Pins</a>\
-         <a href=\"/#connection\">Connection</a>\
-         <a href=\"/settings\">Settings</a>\
-         </div>",
-    );
-    out.push_str("</div></nav>\n");
-    out.push_str(body_html);
-    out.push_str(
-        "\n  <footer class=\"site-footer\"><div class=\"site-footer-inner\">\
-        <div>\
-          <div class=\"brand-row\">",
-    );
-    out.push_str(LOGO_MARK_SVG);
-    out.push_str(
-        "<span class=\"brand-word\">Agorix</span>\
-          </div>\
-          <p class=\"about\">Agorix is the broader preservation project. This local companion app keeps rescued Foundation roots pinned on your IPFS node and self-repairs anything that drops. Not affiliated with Foundation.</p>\
-          <p class=\"tagline\">Local pin companion · Forever repair · Artist-aligned</p>\
-        </div>\
-        <div>\
-          <p class=\"foot-col-label\">Bridge</p>\
-          <ul class=\"foot-links\">\
-            <li><a href=\"/#status\">Status</a></li>\
-            <li><a href=\"/#inventory\">Local pins</a></li>\
-            <li><a href=\"/#connection\">Connection</a></li>\
-            <li><a href=\"/settings\">Settings</a></li>\
-          </ul>\
-        </div>\
-      </div>\
-      <div class=\"footer-meta\"><div class=\"footer-meta-inner\">\
-        <p>© ",
-    );
-    out.push_str(&year);
-    out.push_str(
-        " Agorix</p>\
-        <p>Independent · Decentralized · Artist-aligned</p>\
-      </div></div>\
-    </footer>\n",
-    );
-    out.push_str("</div>\n</body>\n</html>");
-    out
 }
