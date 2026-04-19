@@ -4,7 +4,7 @@
 //!
 //! The pure parsing helpers (`parse_discovered_dependency`,
 //! `extract_absolute_ipfs_reference_strings`, etc.) live in
-//! `model::pin::dependency`; this module glues them to the live Kubo daemon.
+//! `model::pin::metadata`; this module glues them to the live Kubo daemon.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -12,12 +12,12 @@ use crate::{
     AppState,
     model::{
         pin::{
-            dependency::{
+            metadata::{
                 build_work_dependency_input, collect_dependency_refs_from_json_value,
                 enqueue_dependency_probe, extract_absolute_ipfs_reference_strings,
-                is_dependency_probe_candidate, push_unique_dependency,
+                is_dependency_probe_candidate, metadata_file_url, metadata_image_url,
+                metadata_primary_media_url, push_unique_dependency,
             },
-            metadata::{metadata_file_url, metadata_image_url, metadata_primary_media_url},
             types::WatchPinInput,
         },
         relay::RelayShareWorkPayload,

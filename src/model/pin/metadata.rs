@@ -1,11 +1,20 @@
-//! Pure metadata helpers — extracts display fields, attribute lists, URL
-//! candidates, and media-kind hints from arbitrary [`serde_json::Value`]
-//! payloads fetched from IPFS.
+//! Pure metadata + dependency-discovery helpers — extracts display fields,
+//! attribute lists, URL candidates, and media-kind hints from arbitrary
+//! [`serde_json::Value`] payloads fetched from IPFS, and parses candidate
+//! IPFS references out of JSON/text so the dependency-probe loop knows which
+//! CIDs to walk next.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
-use super::types::{PinMetadataField, PinMetadataView};
-use crate::util::data::{first_present_string, json_display_value, json_string, nested_json_value};
+use super::types::{DiscoveredDependency, PinMetadataField, PinMetadataView, WatchPinInput};
+use crate::{
+    model::relay::RelayShareWorkPayload,
+    util::{
+        data::{first_present_string, json_display_value, json_string, nested_json_value},
+        file::preferred_file_name_from_relative_path,
+        url::parse_ipfs_reference,
+    },
+};
 
 pub fn collect_url_candidates(value: Option<&serde_json::Value>) -> Vec<String> {
     let mut candidates = Vec::new();
@@ -230,4 +239,123 @@ pub fn detect_media_kind_from_text(value: &str) -> Option<String> {
     markers.iter().find_map(|(kind, entries)| {
         entries.iter().any(|marker| lower.contains(marker)).then(|| (*kind).to_string())
     })
+}
+
+pub fn parse_discovered_dependency(raw: &str) -> Option<DiscoveredDependency> {
+    let (cid, relative_path) = parse_ipfs_reference(raw)?;
+    Some(DiscoveredDependency {
+        cid,
+        preferred_file_name: preferred_file_name_from_relative_path(&relative_path),
+    })
+}
+
+pub fn push_unique_dependency(
+    dependencies: &mut Vec<DiscoveredDependency>,
+    candidate: DiscoveredDependency,
+) -> bool {
+    if let Some(existing) = dependencies.iter_mut().find(|entry| entry.cid == candidate.cid) {
+        if existing.preferred_file_name.is_none() {
+            existing.preferred_file_name = candidate.preferred_file_name;
+        }
+        false
+    } else {
+        dependencies.push(candidate);
+        true
+    }
+}
+
+pub fn extract_absolute_ipfs_reference_strings(text: &str) -> Vec<DiscoveredDependency> {
+    let mut dependencies = Vec::new();
+    for token in text.split(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '='
+            )
+    }) {
+        let candidate = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+        });
+        if let Some(dependency) = parse_discovered_dependency(candidate) {
+            push_unique_dependency(&mut dependencies, dependency);
+        }
+    }
+    dependencies
+}
+
+pub fn collect_dependency_refs_from_json_value(
+    value: &serde_json::Value,
+    dependencies: &mut Vec<DiscoveredDependency>,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(dependency) = parse_discovered_dependency(text) {
+                push_unique_dependency(dependencies, dependency);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_dependency_refs_from_json_value(item, dependencies);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for item in entries.values() {
+                collect_dependency_refs_from_json_value(item, dependencies);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn is_dependency_probe_candidate(file_name: &str) -> bool {
+    // Extension comparison is already case-insensitive because `lower` is
+    // pre-lowercased above; the clippy lint that flags `ends_with(".html")` as
+    // case-sensitive doesn't track that, so suppress it locally.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    {
+        let lower = file_name.trim().to_ascii_lowercase();
+        lower.ends_with(".html")
+            || lower.ends_with(".htm")
+            || lower.ends_with(".gltf")
+            || lower.ends_with(".json")
+            || lower.ends_with(".svg")
+            || lower.ends_with(".css")
+            || lower.ends_with(".js")
+            || lower.ends_with(".txt")
+    }
+}
+
+pub fn build_work_dependency_input(
+    input: &RelayShareWorkPayload,
+    dependency: DiscoveredDependency,
+) -> WatchPinInput {
+    WatchPinInput {
+        cid: dependency.cid,
+        label: Some("dependency".to_string()),
+        preferred_file_name: dependency.preferred_file_name,
+        source_kind: "work".to_string(),
+        title: Some(input.title.clone()),
+        contract_address: Some(input.contract_address.clone()),
+        token_id: Some(input.token_id.clone()),
+        foundation_url: input.foundation_url.clone(),
+        artist_username: input.artist_username.clone(),
+        account_address: None,
+        username: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn enqueue_dependency_probe(
+    queued: &mut HashSet<String>,
+    queue: &mut VecDeque<(String, Option<String>, usize)>,
+    cid: String,
+    preferred_file_name: Option<String>,
+    depth: usize,
+) {
+    if queued.insert(cid.clone()) {
+        queue.push_back((cid, preferred_file_name, depth));
+    }
 }

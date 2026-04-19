@@ -80,7 +80,7 @@ pub async fn sync_cid_to_download_dir(state: &AppState, cid: &str) -> anyhow::Re
         let local_gateway_url = build_gateway_url(&config.local_gateway_base_url, cid);
         let public_gateway_url = build_gateway_url(&config.public_gateway_base_url, cid);
 
-        crate::inline::mark_pin_synced(
+        crate::model::pin::service::mark_pin_synced(
             state,
             cid,
             root_dir.display().to_string(),
@@ -94,7 +94,8 @@ pub async fn sync_cid_to_download_dir(state: &AppState, cid: &str) -> anyhow::Re
     .await;
 
     if let Err(error) = &sync_result {
-        let _ = crate::inline::mark_pin_sync_failed(state, cid, error.to_string()).await;
+        let _ =
+            crate::model::pin::service::mark_pin_sync_failed(state, cid, error.to_string()).await;
     }
 
     sync_result
