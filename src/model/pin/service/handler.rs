@@ -157,9 +157,11 @@ pub async fn pin_cid(
     State(state): State<AppState>,
     Json(input): Json<PinCidRequest>,
 ) -> Result<Json<PinCidResult>, AppError> {
-    if let Some(secret) = input.session_secret.as_deref() {
-        validate_session(&state, secret).await?;
-    }
+    let secret = input
+        .session_secret
+        .as_deref()
+        .ok_or_else(|| AppError::unauthorized("session_secret is required to pin a CID"))?;
+    validate_session(&state, secret).await?;
 
     let result = pin_and_watch_cid(
         &state,
@@ -235,9 +237,10 @@ pub async fn add_files(
         }
     }
 
-    if let Some(secret) = session_secret.as_deref() {
-        validate_session(&state, secret).await?;
-    }
+    let secret = session_secret
+        .as_deref()
+        .ok_or_else(|| AppError::unauthorized("session_secret is required to upload files"))?;
+    validate_session(&state, secret).await?;
 
     if files.is_empty() {
         return Err(AppError::bad_request(

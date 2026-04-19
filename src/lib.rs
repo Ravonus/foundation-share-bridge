@@ -16,7 +16,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::DefaultBodyLimit,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -26,7 +26,7 @@ use reqwest::Client;
 use serde::Serialize;
 use tokio::{net::TcpListener, sync::RwLock};
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::{AllowOrigin, Any, CorsLayer},
     trace::TraceLayer,
 };
 use tracing::info;
@@ -181,6 +181,26 @@ fn deep_link_url_from_args() -> Option<String> {
     if command == "handle-url" || command == "open-url" { args.next() } else { None }
 }
 
+/// Build the CORS layer for the bridge HTTP API.
+///
+/// Only allow the archive site and loopback origins. Same-origin local UI
+/// (served from this binary) does not need CORS; the allowlist exists so
+/// browsers running the archive site or a dev gateway can talk to the
+/// bridge without opening it up to the entire public web.
+fn bridge_cors_layer() -> CorsLayer {
+    let allowlist = AllowOrigin::predicate(|origin: &HeaderValue, _request_head| {
+        let Ok(origin_str) = origin.to_str() else { return false };
+        origin_str == "https://foundation.agorix.io"
+            || origin_str.starts_with("http://127.0.0.1:")
+            || origin_str.starts_with("http://localhost:")
+    });
+    CorsLayer::new()
+        .allow_origin(allowlist)
+        .allow_headers(Any)
+        .allow_methods(Any)
+        .allow_credentials(false)
+}
+
 /// Start the HTTP server. Invoked from `src/main.rs` after tracing init.
 ///
 /// Honours env vars `BRIDGE_HOST`, `BRIDGE_PORT`, `IPFS_API_URL`,
@@ -279,7 +299,7 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/share/work/view", get(share_work_view))
         .route("/share/work/form", post(share_work_form))
         .route("/share/profile", post(share_profile))
-        .layer(CorsLayer::new().allow_origin(Any).allow_headers(Any).allow_methods(Any))
+        .layer(bridge_cors_layer())
         .layer(middleware::map_response(add_private_network_access_header))
         .layer(TraceLayer::new_for_http())
         .with_state(state);

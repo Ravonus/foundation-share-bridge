@@ -18,6 +18,7 @@ use crate::{
         pin::types::{PinCidResult, PinLsResponse},
         system::KuboRepoStat,
     },
+    util::file::sanitize_file_name,
 };
 
 // Large-enough bound to capture most dependency-probe inputs (HTML, JSON, SVG,
@@ -247,7 +248,15 @@ pub async fn download_ipfs_path_recursive(
             continue;
         }
 
-        let child_destination = destination_dir.join(name);
+        let Some(safe_name) = sanitize_file_name(name) else {
+            tracing::warn!("skipping IPFS entry with unsafe name: {}", name);
+            continue;
+        };
+        let child_destination = destination_dir.join(&safe_name);
+        if !child_destination.starts_with(destination_dir) {
+            tracing::warn!("refusing to write outside sync dir: {}", child_destination.display());
+            continue;
+        }
         let child_ipfs_path = format!("{}/{}", ipfs_path.trim_end_matches('/'), name);
         let link_type = link.get("Type").and_then(serde_json::Value::as_i64).unwrap_or(0);
 

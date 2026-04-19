@@ -10,13 +10,31 @@ use std::{
 
 use anyhow::Context;
 use chrono::Utc;
-use tokio::fs;
+use tokio::{fs, io::AsyncWriteExt};
 
 use super::types::{
     BridgeConfig, BridgeConfigResponse, BridgePersistentState, UpdateBridgeConfigRequest,
     bridge_config_uses_yaml, default_bridge_config, legacy_bridge_json_path, parse_bridge_config,
 };
 use crate::{AppError, AppState};
+
+/// Write a file with 0o600 permissions on Unix so config + state can't be
+/// read by other local users. On Windows the default ACLs apply.
+async fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .await
+        .with_context(|| format!("Unable to open {} for write", path.display()))?;
+    file.write_all(bytes).await.with_context(|| format!("Unable to write {}", path.display()))?;
+    file.flush().await.ok();
+    Ok(())
+}
 
 pub async fn load_persistent_state(path: &Path) -> anyhow::Result<BridgePersistentState> {
     match fs::read_to_string(path).await {
@@ -98,7 +116,7 @@ pub async fn persist_bridge_state(state: &AppState) -> anyhow::Result<()> {
     }
 
     let json = serde_json::to_vec_pretty(&snapshot).context("Unable to encode bridge state")?;
-    fs::write(&state.state_file, json).await.with_context(|| {
+    write_private_file(&state.state_file, &json).await.with_context(|| {
         format!("Unable to write persistent bridge state to {}", state.state_file.display())
     })?;
 
@@ -117,13 +135,13 @@ pub async fn persist_bridge_config(state: &AppState) -> anyhow::Result<()> {
     if bridge_config_uses_yaml(&state.config_file) {
         let yaml =
             serde_yaml::to_string(&snapshot).context("Unable to encode bridge config as YAML")?;
-        fs::write(&state.config_file, yaml).await.with_context(|| {
+        write_private_file(&state.config_file, yaml.as_bytes()).await.with_context(|| {
             format!("Unable to write bridge config to {}", state.config_file.display())
         })?;
     } else {
         let json =
             serde_json::to_vec_pretty(&snapshot).context("Unable to encode bridge config")?;
-        fs::write(&state.config_file, json).await.with_context(|| {
+        write_private_file(&state.config_file, &json).await.with_context(|| {
             format!("Unable to write bridge config to {}", state.config_file.display())
         })?;
     }
