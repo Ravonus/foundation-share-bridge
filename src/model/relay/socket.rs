@@ -117,6 +117,15 @@ async fn run_relay_socket_session(state: &AppState) -> anyhow::Result<()> {
                                 serde_json::to_string(&serde_json::json!({ "pins": pins }))
                                     .map_err(anyhow::Error::from)
                             }
+                            "UPDATE_CONFIG" => {
+                                let input = serde_json::from_str::<
+                                    crate::model::config::UpdateBridgeConfigRequest,
+                                >(&payload.payload)?;
+                                crate::model::config::service::apply_config_update(state, input)
+                                    .await
+                                    .map_err(|error| anyhow!(error.message))?;
+                                Ok("{\"ok\":true}".to_string())
+                            }
                             other => Err(anyhow!("Unsupported relay job kind: {other}")),
                         };
 

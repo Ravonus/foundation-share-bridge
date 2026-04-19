@@ -7,7 +7,7 @@ use super::core::pin_and_watch_cid;
 use crate::{
     AppError, AppState,
     model::{
-        config::types::BridgeConfig,
+        config::{service::effective_public_gateway_base_url, types::BridgeConfig},
         pin::{
             client::{
                 discovery::{
@@ -105,6 +105,7 @@ pub async fn resolve_work_display(
     token_id: Option<&str>,
 ) -> ResolvedWorkDisplay {
     let mut display = ResolvedWorkDisplay::default();
+    let public_base = effective_public_gateway_base_url(config);
 
     let metadata = if let Some(metadata_cid) = metadata_cid.filter(|value| !value.trim().is_empty())
     {
@@ -125,32 +126,28 @@ pub async fn resolve_work_display(
     if let Some(raw) = media_raw.as_deref().filter(|value| !value.trim().is_empty()) {
         display.local_open_url =
             Some(normalize_asset_url_for_gateway(raw, &config.local_gateway_base_url));
-        display.public_open_url =
-            Some(normalize_asset_url_for_gateway(raw, &config.public_gateway_base_url));
+        display.public_open_url = Some(normalize_asset_url_for_gateway(raw, &public_base));
     } else if let Some(media_cid) = media_cid.filter(|value| !value.trim().is_empty()) {
         if let Some(child) = resolve_single_child_path(state, media_cid, &[]).await {
             display.local_open_url =
                 Some(build_gateway_asset_url(&config.local_gateway_base_url, media_cid, &child));
             display.public_open_url =
-                Some(build_gateway_asset_url(&config.public_gateway_base_url, media_cid, &child));
+                Some(build_gateway_asset_url(&public_base, media_cid, &child));
         } else {
             display.local_open_url =
                 Some(build_gateway_url(&config.local_gateway_base_url, media_cid));
-            display.public_open_url =
-                Some(build_gateway_url(&config.public_gateway_base_url, media_cid));
+            display.public_open_url = Some(build_gateway_url(&public_base, media_cid));
         }
     } else if let Some(metadata_cid) = metadata_cid.filter(|value| !value.trim().is_empty()) {
         display.local_open_url =
             Some(build_gateway_url(&config.local_gateway_base_url, metadata_cid));
-        display.public_open_url =
-            Some(build_gateway_url(&config.public_gateway_base_url, metadata_cid));
+        display.public_open_url = Some(build_gateway_url(&public_base, metadata_cid));
     }
 
     if let Some(raw) = image_raw.as_deref().filter(|value| !value.trim().is_empty()) {
         display.preview_local_url =
             Some(normalize_asset_url_for_gateway(raw, &config.local_gateway_base_url));
-        display.preview_public_url =
-            Some(normalize_asset_url_for_gateway(raw, &config.public_gateway_base_url));
+        display.preview_public_url = Some(normalize_asset_url_for_gateway(raw, &public_base));
     }
 
     display.media_kind = detect_media_kind_for_url(
@@ -257,7 +254,7 @@ pub async fn build_work_inventory_item(
         public_gateway_url: display
             .public_open_url
             .clone()
-            .or_else(|| Some(build_gateway_url(&config.public_gateway_base_url, &primary_cid))),
+            .or_else(|| Some(build_gateway_url(&effective_public_gateway_base_url(config), &primary_cid))),
         preview_local_gateway_url: display.preview_local_url.clone(),
         preview_public_gateway_url: display.preview_public_url.clone(),
         media_kind: display.media_kind.clone(),

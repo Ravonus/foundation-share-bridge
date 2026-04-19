@@ -88,6 +88,25 @@ pub async fn load_bridge_config(path: &Path, state_file: &Path) -> anyhow::Resul
     }
 }
 
+/// Return the public gateway base URL the bridge should hand out in share
+/// responses and inventory previews. When the Cloudflare tunnel is enabled
+/// and has been provisioned, it takes precedence over the manually
+/// configured gateway URL — outgoing share links point at the tunnel
+/// automatically.
+pub fn effective_public_gateway_base_url(config: &BridgeConfig) -> String {
+    if config.tunnel_enabled {
+        if let Some(host) = config
+            .tunnel_hostname
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return format!("https://{host}");
+        }
+    }
+    config.public_gateway_base_url.clone()
+}
+
 fn apply_config_defaults(config: &mut BridgeConfig, defaults: &BridgeConfig) {
     if config.download_root_dir.trim().is_empty() {
         config.download_root_dir.clone_from(&defaults.download_root_dir);
