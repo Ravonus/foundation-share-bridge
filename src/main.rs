@@ -1285,6 +1285,7 @@ async fn persist_bridge_config(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn escape_notification_text(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -1292,6 +1293,7 @@ fn escape_notification_text(value: &str) -> String {
         .replace('\n', " ")
 }
 
+#[cfg(target_os = "windows")]
 fn escape_xml_text(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -2035,6 +2037,32 @@ async fn settings_page(
     let relay_status_class = if relay_connected { "pill ok" } else { "pill" };
     let sync_checked = if config.sync_enabled { "checked" } else { "" };
     let relay_checked = if config.relay_enabled { "checked" } else { "" };
+    let remote_pinning_checked = if config.remote_pinning_enabled { "checked" } else { "" };
+    let storage_quota_display = config
+        .storage_quota_gb
+        .map(|value| format!("{value}"))
+        .unwrap_or_default();
+    let max_retry_attempts_display = config
+        .max_retry_attempts
+        .map(|value| format!("{value}"))
+        .unwrap_or_default();
+    let remote_pinning_service_name_display = config
+        .remote_pinning_service_name
+        .clone()
+        .unwrap_or_default();
+    let remote_pinning_service_url_display = config
+        .remote_pinning_service_url
+        .clone()
+        .unwrap_or_default();
+    let remote_token_state = match config
+        .remote_pinning_access_token
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        true => "Access token is saved. Leave blank to keep current value, or enter a new token to replace.".to_string(),
+        false => "No access token saved yet.".to_string(),
+    };
 
     let flash_block = if query.saved.as_deref() == Some("1") {
         r#"<div class="flash ok">Settings saved. The helper updated its YAML config file for you.</div>"#
@@ -2173,6 +2201,43 @@ async fn settings_page(
               <small>Turn this on if you want the helper to write rescued media into your download folder too.</small>
             </span>
           </label>
+          <label class="field">
+            <span>Storage quota (GB)</span>
+            <input type="number" step="0.1" min="0" name="storage_quota_gb" value="{storage_quota_gb}" placeholder="50" />
+            <small class="field-help">Optional. The dashboard shows how close the IPFS repo is to this limit. Leave blank for no quota.</small>
+          </label>
+          <label class="field">
+            <span>Max retry attempts per pin</span>
+            <input type="number" step="1" min="1" max="20" name="max_retry_attempts" value="{max_retry_attempts}" placeholder="10" />
+            <small class="field-help">When a pin fails this many times in a row, the bridge escalates to the remote pinning service (if configured).</small>
+          </label>
+        </div>
+
+        <div class="settings-block">
+          <p class="eyebrow">Remote pinning</p>
+          <h2>Failover to a pinning service</h2>
+          <p class="muted settings-copy">When a local pin ultimately fails, send the CID to an IPFS Pinning Service API (Pinata, web3.storage gateway, filebase) so the work does not vanish. Any service that speaks the standard pinning-service HTTP API will work.</p>
+          <label class="checkbox-row">
+            <input type="checkbox" name="remote_pinning_enabled" value="1" {remote_pinning_checked} />
+            <span>
+              <strong>Enable remote pin fallback</strong>
+              <small>Only triggers after the local repair loop has exhausted its retry budget.</small>
+            </span>
+          </label>
+          <label class="field">
+            <span>Service name (label)</span>
+            <input type="text" name="remote_pinning_service_name" value="{remote_pinning_service_name}" placeholder="Pinata" />
+          </label>
+          <label class="field">
+            <span>Service API base URL</span>
+            <input type="url" name="remote_pinning_service_url" value="{remote_pinning_service_url}" placeholder="https://api.pinata.cloud/psa" />
+            <small class="field-help">The bridge POSTs to <code>{{base}}/pins</code>. Use the Pinning Services API endpoint, not a dashboard URL.</small>
+          </label>
+          <label class="field">
+            <span>Access token</span>
+            <input type="password" name="remote_pinning_access_token" value="{remote_pinning_access_token_display}" placeholder="••••••••••" autocomplete="off" />
+            <small class="field-help">Stored in <code>bridge-config.yaml</code>. {remote_token_state}</small>
+          </label>
         </div>
 
         <div class="settings-block">
@@ -2251,6 +2316,13 @@ async fn settings_page(
         relay_note = relay_note,
         download_root_dir = escape_html(&config.download_root_dir),
         sync_checked = sync_checked,
+        storage_quota_gb = escape_html(&storage_quota_display),
+        max_retry_attempts = escape_html(&max_retry_attempts_display),
+        remote_pinning_checked = remote_pinning_checked,
+        remote_pinning_service_name = escape_html(&remote_pinning_service_name_display),
+        remote_pinning_service_url = escape_html(&remote_pinning_service_url_display),
+        remote_pinning_access_token_display = "",
+        remote_token_state = escape_html(&remote_token_state),
         local_gateway_base_url = escape_html(&config.local_gateway_base_url),
         public_gateway_base_url = escape_html(&config.public_gateway_base_url),
         relay_checked = relay_checked,
@@ -2845,25 +2917,6 @@ fn unique_trimmed_strings(values: Vec<String>) -> Vec<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty() && seen.insert(value.clone()))
         .collect()
-}
-
-fn build_pins_page_response(
-    response: PinsResponse,
-    cursor: usize,
-    limit: usize,
-) -> PinsPageResponse {
-    let total = response.total;
-    let start = cursor.min(total);
-    let end = start.saturating_add(limit).min(total);
-    let items = response.items[start..end].to_vec();
-
-    PinsPageResponse {
-        total,
-        pinned_count: response.pinned_count,
-        managed_count: response.managed_count,
-        next_cursor: (end < total).then(|| end.to_string()),
-        items,
-    }
 }
 
 fn collect_inventory_descriptors(
@@ -8279,6 +8332,55 @@ const INVENTORY_BROWSER_SCRIPT: &str = r####"
     `;
   };
 
+  const buildProviderBadge = (item) => {
+    const count = typeof item.providerCount === "number" ? item.providerCount : null;
+    if (count == null) return "";
+    if (count === 0) {
+      return `<span class="pill err" title="No peers know about this CID">0 peers</span>`;
+    }
+    if (count <= 2) {
+      return `<span class="pill warn" title="Thinly replicated">${count} peer${count === 1 ? "" : "s"}</span>`;
+    }
+    return `<span class="pill ok" title="Well-seeded">${count} peers</span>`;
+  };
+
+  const buildRetryBadge = (item) => {
+    const attempts = Number(item.retryAttempts) || 0;
+    if (attempts <= 0) return "";
+    const when = item.nextRetryAt ? ` (next ${formatTimestamp(item.nextRetryAt)})` : "";
+    return `<span class="pill warn" title="Attempts so far">Retry ${attempts}${when}</span>`;
+  };
+
+  const buildRemoteBadge = (item) => {
+    if (!item.remotePinned) return "";
+    const label = item.remotePinService ? `Remote · ${escapeHtml(item.remotePinService)}` : "Remote backup";
+    return `<span class="pill ok" title="Mirrored on a remote pinning service">${label}</span>`;
+  };
+
+  const buildTagsRow = (item) => {
+    const tags = Array.isArray(item.customTags) ? item.customTags.filter(Boolean) : [];
+    if (tags.length === 0) return "";
+    return `<div class="btn-row" style="gap:6px;">${
+      tags.map((t) => `<span class="pill" title="Tag">${escapeHtml(t)}</span>`).join("")
+    }</div>`;
+  };
+
+  const buildErrorHintHtml = (item) => {
+    if (!item.errorCategory) return "";
+    const labels = {
+      daemon_unreachable: "IPFS daemon unreachable",
+      timeout: "Network timeout",
+      no_providers: "No peers have this CID",
+      not_pinned: "Not pinned locally",
+      invalid_cid: "Invalid CID",
+      unauthorized: "IPFS API rejected the request",
+      disk_full: "Datastore is full",
+      unknown: "Unknown error",
+    };
+    const label = labels[item.errorCategory] || item.errorCategory;
+    return `<p class="pin-note" data-error-category="${escapeHtml(item.errorCategory)}"><strong>${escapeHtml(label)}</strong></p>`;
+  };
+
   const renderCard = (item) => {
     const title = item.title || item.label || "Local IPFS pin";
     const statusLabel = item.pinned ? (item.pinType || "pinned") : "repair needed";
@@ -8290,6 +8392,11 @@ const INVENTORY_BROWSER_SCRIPT: &str = r####"
     const syncedValue = item.syncPath
       ? escapeHtml(item.syncPath)
       : "Not synced to disk";
+    const providerBadge = buildProviderBadge(item);
+    const retryBadge = buildRetryBadge(item);
+    const remoteBadge = buildRemoteBadge(item);
+    const tagsRow = buildTagsRow(item);
+    const hintBlock = buildErrorHintHtml(item);
 
     return `
       <article class="pin-card" data-cid="${escapeHtml(item.cid)}" data-related-cids="${escapeHtml(relatedCids.join(","))}">
@@ -8302,10 +8409,17 @@ const INVENTORY_BROWSER_SCRIPT: &str = r####"
               <p class="pin-title">${escapeHtml(title)}</p>
               <p class="cid">${escapeHtml(item.cid)}</p>
             </div>
-            <span class="pill ${statusClass}">${escapeHtml(statusLabel)}</span>
+            <div class="btn-row" style="justify-content:flex-end; gap:6px; margin:0;">
+              <span class="pill ${statusClass}">${escapeHtml(statusLabel)}</span>
+              ${providerBadge}
+              ${retryBadge}
+              ${remoteBadge}
+            </div>
           </div>
 
           <p class="pin-context">${buildContextHtml(item)}</p>
+
+          ${tagsRow}
 
           <div class="pin-meta">
             <div class="pin-meta-line">
@@ -8326,10 +8440,15 @@ const INVENTORY_BROWSER_SCRIPT: &str = r####"
             </div>
           </div>
 
+          ${hintBlock}
           ${buildNoteHtml(item)}
 
           <div class="pin-actions">
             <button type="button" class="btn ghost" data-verify-cids="${escapeHtml(relatedCids.join(","))}">Test on network</button>
+            <button type="button" class="btn ghost" data-diagnose-cid="${escapeHtml(item.cid)}">Diagnose</button>
+            <button type="button" class="btn ghost" data-retry-cid="${escapeHtml(item.cid)}">Retry now</button>
+            ${item.lastSyncError ? `<button type="button" class="btn ghost" data-retry-sync-cid="${escapeHtml(item.cid)}">Retry sync</button>` : ""}
+            <button type="button" class="btn ghost" data-tag-cid="${escapeHtml(item.cid)}">Tags</button>
             <button type="button" class="btn ghost" data-unwatch-cids="${escapeHtml(relatedCids.join(","))}">Stop repairing</button>
             ${pinnedUrl ? `<a class="btn" href="${escapeHtml(pinnedUrl)}" target="_blank" rel="noreferrer">Open pinned</a>` : ""}
             ${publicUrl ? `<a class="btn ghost" href="${escapeHtml(publicUrl)}" target="_blank" rel="noreferrer">Open public</a>` : ""}
@@ -8546,6 +8665,113 @@ const INVENTORY_BROWSER_SCRIPT: &str = r####"
       return;
     }
 
+    const diagnoseButton = event.target.closest("[data-diagnose-cid]");
+    if (diagnoseButton) {
+      const cid = diagnoseButton.getAttribute("data-diagnose-cid");
+      const card = diagnoseButton.closest(".pin-card");
+      const resultNode = card ? card.querySelector(".pin-test-status") : null;
+      if (!cid || !resultNode) return;
+      diagnoseButton.setAttribute("disabled", "disabled");
+      resultNode.textContent = "Diagnosing…";
+      try {
+        const response = await fetch(`/pins/item/${encodeURIComponent(cid)}/diagnose`, {
+          method: "POST",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) throw new Error(`Diagnose failed (${response.status})`);
+        const data = await response.json();
+        const parts = [];
+        parts.push(data.pinnedLocally ? "Pinned locally." : "Not pinned locally.");
+        parts.push(`${data.providerCount} peer${data.providerCount === 1 ? "" : "s"} on DHT.`);
+        if (data.gatewayLocalOk != null) parts.push(`Local gateway ${data.gatewayLocalOk ? "reachable" : "unreachable"}.`);
+        if (data.gatewayPublicOk != null) parts.push(`External gateway ${data.gatewayPublicOk ? "reachable" : "unreachable"}.`);
+        if (data.errorHint) parts.push(data.errorHint);
+        resultNode.textContent = parts.join(" ");
+      } catch (error) {
+        resultNode.textContent = error instanceof Error ? error.message : "Diagnose failed.";
+      } finally {
+        diagnoseButton.removeAttribute("disabled");
+      }
+      return;
+    }
+
+    const retryButton = event.target.closest("[data-retry-cid]");
+    if (retryButton) {
+      const cid = retryButton.getAttribute("data-retry-cid");
+      const card = retryButton.closest(".pin-card");
+      const resultNode = card ? card.querySelector(".pin-test-status") : null;
+      if (!cid || !resultNode) return;
+      retryButton.setAttribute("disabled", "disabled");
+      resultNode.textContent = "Retrying now…";
+      try {
+        const response = await fetch(`/pins/item/${encodeURIComponent(cid)}/retry`, {
+          method: "POST",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) throw new Error(`Retry failed (${response.status})`);
+        const data = await response.json();
+        resultNode.textContent = data.message || (data.pinned ? "Re-pinned." : "Retry did not succeed.");
+      } catch (error) {
+        resultNode.textContent = error instanceof Error ? error.message : "Retry failed.";
+      } finally {
+        retryButton.removeAttribute("disabled");
+      }
+      return;
+    }
+
+    const retrySyncButton = event.target.closest("[data-retry-sync-cid]");
+    if (retrySyncButton) {
+      const cid = retrySyncButton.getAttribute("data-retry-sync-cid");
+      const card = retrySyncButton.closest(".pin-card");
+      const resultNode = card ? card.querySelector(".pin-test-status") : null;
+      if (!cid || !resultNode) return;
+      retrySyncButton.setAttribute("disabled", "disabled");
+      resultNode.textContent = "Re-syncing to disk…";
+      try {
+        const response = await fetch(`/pins/item/${encodeURIComponent(cid)}/retry-sync`, {
+          method: "POST",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) throw new Error(`Retry-sync failed (${response.status})`);
+        const data = await response.json();
+        resultNode.textContent = data.synced ? `Synced to ${data.path}` : (data.error || "Retry sync did not succeed.");
+      } catch (error) {
+        resultNode.textContent = error instanceof Error ? error.message : "Retry sync failed.";
+      } finally {
+        retrySyncButton.removeAttribute("disabled");
+      }
+      return;
+    }
+
+    const tagButton = event.target.closest("[data-tag-cid]");
+    if (tagButton) {
+      const cid = tagButton.getAttribute("data-tag-cid");
+      const card = tagButton.closest(".pin-card");
+      const resultNode = card ? card.querySelector(".pin-test-status") : null;
+      if (!cid || !resultNode) return;
+      const current = Array.from(card.querySelectorAll('[data-tag-chip]')).map((n) => n.textContent || "").join(", ");
+      const input = window.prompt("Comma-separated tags (leave empty to clear):", current);
+      if (input == null) return;
+      const tags = input.split(",").map((t) => t.trim()).filter(Boolean);
+      tagButton.setAttribute("disabled", "disabled");
+      resultNode.textContent = "Saving tags…";
+      try {
+        const response = await fetch(`/pins/item/${encodeURIComponent(cid)}/tags`, {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({ tags }),
+        });
+        if (!response.ok) throw new Error(`Tag save failed (${response.status})`);
+        const data = await response.json();
+        resultNode.textContent = `Tags updated · ${data.tags.join(", ") || "none"}`;
+      } catch (error) {
+        resultNode.textContent = error instanceof Error ? error.message : "Tag save failed.";
+      } finally {
+        tagButton.removeAttribute("disabled");
+      }
+      return;
+    }
+
     const button = event.target.closest("[data-verify-cids]");
     if (!button) return;
 
@@ -8625,18 +8851,41 @@ const ROOT_AUTOLINK_SCRIPT: &str = r####"
   const status = document.getElementById("autolink-status");
   if (!form) return;
 
-  window.setTimeout(() => {
+  const countdownSeconds = 6;
+  let remaining = countdownSeconds;
+  let submitted = false;
+
+  const submit = () => {
+    if (submitted) return;
+    submitted = true;
     if (status) {
       status.textContent = "Confirming with the archive site now…";
     }
-
     if (typeof form.requestSubmit === "function") {
       form.requestSubmit();
+    } else {
+      form.submit();
+    }
+  };
+
+  const tick = () => {
+    if (submitted) return;
+    if (remaining <= 0) {
+      submit();
       return;
     }
+    if (status) {
+      status.textContent = `Confirming pairing automatically in ${remaining} second${remaining === 1 ? "" : "s"}… press the button to do it now.`;
+    }
+    remaining -= 1;
+    window.setTimeout(tick, 1000);
+  };
 
-    form.submit();
-  }, 400);
+  form.addEventListener("submit", () => {
+    submitted = true;
+  });
+
+  tick();
 })();
 "####;
 
