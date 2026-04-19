@@ -4,6 +4,7 @@
 //! unchanged from callers.
 
 pub mod core;
+pub mod handler;
 pub mod inventory;
 pub mod lifecycle;
 pub mod work;

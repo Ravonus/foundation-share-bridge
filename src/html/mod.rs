@@ -2,6 +2,7 @@
 //! the pure render functions that assemble those pieces into HTML fragments.
 
 pub mod assets;
+pub mod handler;
 pub mod render;
 pub mod scripts;
 pub mod styles;
