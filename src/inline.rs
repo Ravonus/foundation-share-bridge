@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::{
-    app::{AppError, AppState, OperationStatus},
+    AppError, AppState, OperationStatus,
     html::{
         assets::LOGO_MARK_SVG,
         scripts::{
@@ -27,6 +27,37 @@ use crate::{
             settings::{SETTINGS_CONTROLS_SCRIPT, SETTINGS_GATEWAY_HELPER_SCRIPT},
         },
         styles::{page::PAGE_STYLE, settings::SETTINGS_PAGE_STYLE},
+    },
+    model::{
+        config::{
+            BridgeConfig, BridgeConfigResponse, BridgePersistentState, RootPageQuery,
+            SettingsPageQuery, ShareWorkViewQuery, UpdateBridgeConfigFormRequest,
+            UpdateBridgeConfigRequest,
+        },
+        pin::{
+            AddFilesResult, AddedFileEntry, DiscoveredDependency, ExportQuery,
+            InventoryEntryDescriptor, InventorySourcePin, PinCidRequest, PinCidResult,
+            PinInventoryItem, PinLsResponse, PinMetadataField, PinMetadataView, PinVerification,
+            PinsPageQuery, PinsPageResponse, PinsResponse, RepairCycleOutcome, RepairNowResponse,
+            ResolvedWorkDisplay, RetryPinResponse, RetrySyncResponse, SetPinTagsRequest,
+            SetPinTagsResponse, SyncNowResponse, SyncOutcome, UnwatchPinsRequest,
+            UnwatchPinsResponse, VerifyPinsRequest, VerifyPinsResponse, WatchPinInput, WatchedPin,
+        },
+        relay::{
+            PairingDeepLink, RelayForceDisconnectMessage, RelayInventoryMessage, RelayJobMessage,
+            RelayJobResultMessage, RelayLinkFormRequest, RelayLinkRequest, RelayLinkResponse,
+            RelayRequestInventoryMessage, RelayShareWorkPayload, RelayUnlinkResponse,
+            RelayWelcomeMessage, ShareProfileRequest, ShareProfileResponse, ShareWorkRequest,
+            ShareWorkResponse,
+        },
+        session::{
+            BridgeSession, ConnectSessionRequest, ConnectSessionResponse, DisconnectSessionRequest,
+            DisconnectSessionResponse, SessionSummary,
+        },
+        system::{
+            ArtistEntry, ArtistSummary, DiagnoseResponse, GatewayHealthResponse, HealthResponse,
+            KuboRepoStat, StorageSnapshot,
+        },
     },
     util::{
         data::{
@@ -63,7 +94,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt, stream};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::time::sleep;
 use tokio::{
     fs,
@@ -92,603 +123,12 @@ const MAX_DEPENDENCY_DISCOVERY_DEPTH: usize = 2;
 const MAX_DEPENDENCY_SCAN_CIDS: usize = 24;
 const MAX_UPLOAD_BYTES: usize = 5 * 1024 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct BridgeSession {
-    session_id: String,
-    session_secret: String,
-    website_origin: String,
-    account_address: Option<String>,
-    profile_username: Option<String>,
-    client_name: Option<String>,
-    connected_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WatchedPin {
-    cid: String,
-    label: Option<String>,
-    #[serde(default)]
-    preferred_file_name: Option<String>,
-    source_kind: String,
-    title: Option<String>,
-    contract_address: Option<String>,
-    token_id: Option<String>,
-    foundation_url: Option<String>,
-    artist_username: Option<String>,
-    account_address: Option<String>,
-    username: Option<String>,
-    added_at: DateTime<Utc>,
-    last_verified_at: Option<DateTime<Utc>>,
-    last_repaired_at: Option<DateTime<Utc>>,
-    last_error: Option<String>,
-    pin_reference: Option<String>,
-    #[serde(default)]
-    verify_count: u64,
-    #[serde(default)]
-    repair_count: u64,
-    sync_path: Option<String>,
-    local_gateway_url: Option<String>,
-    public_gateway_url: Option<String>,
-    last_synced_at: Option<DateTime<Utc>>,
-    last_sync_error: Option<String>,
-    #[serde(default)]
-    sync_count: u64,
-    #[serde(default)]
-    retry_attempts: u32,
-    #[serde(default)]
-    next_retry_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    error_category: Option<String>,
-    #[serde(default)]
-    provider_count: Option<usize>,
-    #[serde(default)]
-    provider_checked_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    custom_tags: Vec<String>,
-    #[serde(default)]
-    remote_pinned: bool,
-    #[serde(default)]
-    remote_pin_service: Option<String>,
-    #[serde(default)]
-    remote_pin_last_attempt_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    remote_pin_last_error: Option<String>,
-    #[serde(default)]
-    final_failure_reported_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub(crate) struct BridgePersistentState {
-    watched_pins: HashMap<String, WatchedPin>,
-    updated_at: Option<DateTime<Utc>>,
-    last_repair_cycle_at: Option<DateTime<Utc>>,
-    repair_cycle_count: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct BridgeConfig {
-    download_root_dir: String,
-    sync_enabled: bool,
-    local_gateway_base_url: String,
-    public_gateway_base_url: String,
-    relay_enabled: bool,
-    relay_server_url: String,
-    relay_device_name: String,
-    relay_device_id: Option<String>,
-    relay_device_label: Option<String>,
-    relay_device_token: Option<String>,
-    relay_last_connected_at: Option<DateTime<Utc>>,
-    relay_last_error: Option<String>,
-    #[serde(default)]
-    storage_quota_gb: Option<f64>,
-    #[serde(default)]
-    max_retry_attempts: Option<u32>,
-    #[serde(default)]
-    remote_pinning_enabled: bool,
-    #[serde(default)]
-    remote_pinning_service_name: Option<String>,
-    #[serde(default)]
-    remote_pinning_service_url: Option<String>,
-    #[serde(default)]
-    remote_pinning_access_token: Option<String>,
-    #[serde(default)]
-    onboarded_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HealthResponse {
-    status: &'static str,
-    service: &'static str,
-    ipfs_api_url: String,
-    state_file: String,
-    config_file: String,
-    active_sessions: usize,
-    watched_pin_count: usize,
-    repair_interval_seconds: u64,
-    last_repair_cycle_at: Option<DateTime<Utc>>,
-    download_root_dir: String,
-    sync_enabled: bool,
-    local_gateway_base_url: String,
-    public_gateway_base_url: String,
-    relay_enabled: bool,
-    relay_server_url: String,
-    relay_device_name: String,
-    relay_device_id: Option<String>,
-    relay_device_label: Option<String>,
-    relay_last_connected_at: Option<DateTime<Utc>>,
-    relay_last_error: Option<String>,
-    now: DateTime<Utc>,
-    storage: StorageSnapshot,
-    operation: OperationStatus,
-    remote_pinning_enabled: bool,
-    onboarded: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StorageSnapshot {
-    repo_size_bytes: Option<u64>,
-    storage_max_bytes: Option<u64>,
-    num_objects: Option<u64>,
-    synced_bytes_on_disk: u64,
-    quota_gb: Option<f64>,
-    quota_used_fraction: Option<f64>,
-    ipfs_daemon_reachable: bool,
-    checked_at: DateTime<Utc>,
-}
-
 async fn add_private_network_access_header(mut response: Response) -> Response {
     response.headers_mut().insert(
         HeaderName::from_static("access-control-allow-private-network"),
         HeaderValue::from_static("true"),
     );
     response
-}
-
-#[derive(Debug, Deserialize)]
-struct ConnectSessionRequest {
-    website_origin: String,
-    account_address: Option<String>,
-    profile_username: Option<String>,
-    client_name: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ConnectSessionResponse {
-    session: BridgeSession,
-    message: &'static str,
-}
-
-#[derive(Debug, Deserialize)]
-struct DisconnectSessionRequest {
-    session_secret: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DisconnectSessionResponse {
-    disconnected: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct PinCidRequest {
-    session_secret: Option<String>,
-    cid: String,
-    label: Option<String>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct PinCidResult {
-    cid: String,
-    label: Option<String>,
-    pinned: bool,
-    provider: &'static str,
-    pin_reference: String,
-    requested_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct AddedFileEntry {
-    name: String,
-    cid: String,
-    size: u64,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct AddFilesResult {
-    root_cid: String,
-    label: Option<String>,
-    pinned: bool,
-    provider: &'static str,
-    pin_reference: String,
-    requested_at: DateTime<Utc>,
-    file_count: usize,
-    total_bytes: u64,
-    wrapped: bool,
-    entries: Vec<AddedFileEntry>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ShareWorkRequest {
-    session_secret: String,
-    title: String,
-    contract_address: String,
-    token_id: String,
-    foundation_url: Option<String>,
-    metadata_cid: Option<String>,
-    media_cid: Option<String>,
-    artist_username: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RelayShareWorkPayload {
-    title: String,
-    contract_address: String,
-    token_id: String,
-    foundation_url: Option<String>,
-    metadata_cid: Option<String>,
-    media_cid: Option<String>,
-    artist_username: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ShareWorkResponse {
-    share_id: String,
-    title: String,
-    contract_address: String,
-    token_id: String,
-    foundation_url: Option<String>,
-    artist_username: Option<String>,
-    pins: Vec<PinCidResult>,
-    message: &'static str,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ShareProfileRequest {
-    session_secret: String,
-    account_address: String,
-    username: Option<String>,
-    label: Option<String>,
-    cids: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ShareProfileResponse {
-    share_id: String,
-    account_address: String,
-    username: Option<String>,
-    label: Option<String>,
-    pinned_count: usize,
-    pins: Vec<PinCidResult>,
-    message: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct SessionSummary {
-    session_id: String,
-    website_origin: String,
-    account_address: Option<String>,
-    profile_username: Option<String>,
-    client_name: Option<String>,
-    connected_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
-struct PinsResponse {
-    total: usize,
-    #[serde(rename = "pinnedCount")]
-    pinned_count: usize,
-    #[serde(rename = "managedCount")]
-    managed_count: usize,
-    last_repair_cycle_at: Option<DateTime<Utc>>,
-    items: Vec<PinInventoryItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PinsPageQuery {
-    cursor: Option<String>,
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PinsPageResponse {
-    total: usize,
-    pinned_count: usize,
-    managed_count: usize,
-    next_cursor: Option<String>,
-    items: Vec<PinInventoryItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PinMetadataField {
-    label: String,
-    value: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PinMetadataView {
-    description: Option<String>,
-    fields: Vec<PinMetadataField>,
-    attributes: Vec<PinMetadataField>,
-    raw_json: String,
-    raw_json_truncated: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PinInventoryItem {
-    cid: String,
-    pinned: bool,
-    pin_type: Option<String>,
-    managed: bool,
-    label: Option<String>,
-    source_kind: Option<String>,
-    title: Option<String>,
-    contract_address: Option<String>,
-    token_id: Option<String>,
-    foundation_url: Option<String>,
-    artist_username: Option<String>,
-    account_address: Option<String>,
-    username: Option<String>,
-    added_at: Option<DateTime<Utc>>,
-    last_verified_at: Option<DateTime<Utc>>,
-    last_repaired_at: Option<DateTime<Utc>>,
-    last_error: Option<String>,
-    pin_reference: Option<String>,
-    verify_count: u64,
-    repair_count: u64,
-    sync_path: Option<String>,
-    local_gateway_url: Option<String>,
-    public_gateway_url: Option<String>,
-    preview_local_gateway_url: Option<String>,
-    preview_public_gateway_url: Option<String>,
-    media_kind: Option<String>,
-    metadata_view: Option<PinMetadataView>,
-    metadata_cid: Option<String>,
-    media_cid: Option<String>,
-    #[serde(default)]
-    related_cids: Vec<String>,
-    last_synced_at: Option<DateTime<Utc>>,
-    last_sync_error: Option<String>,
-    sync_count: u64,
-    #[serde(default)]
-    retry_attempts: u32,
-    #[serde(default)]
-    next_retry_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    error_category: Option<String>,
-    #[serde(default)]
-    provider_count: Option<usize>,
-    #[serde(default)]
-    provider_checked_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    custom_tags: Vec<String>,
-    #[serde(default)]
-    remote_pinned: bool,
-    #[serde(default)]
-    remote_pin_service: Option<String>,
-    #[serde(default)]
-    remote_pin_last_error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct RepairNowResponse {
-    repaired: usize,
-    healthy: usize,
-    failed: usize,
-    message: &'static str,
-}
-
-#[derive(Debug, Deserialize)]
-struct VerifyPinsRequest {
-    #[serde(default)]
-    cids: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UnwatchPinsRequest {
-    cids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PinVerification {
-    cid: String,
-    reachable: bool,
-    provider_count: usize,
-    checked_at: DateTime<Utc>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct VerifyPinsResponse {
-    checked_at: DateTime<Utc>,
-    results: Vec<PinVerification>,
-}
-
-#[derive(Debug, Serialize)]
-struct UnwatchPinsResponse {
-    removed: usize,
-    missing: usize,
-    message: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct SyncNowResponse {
-    synced: usize,
-    failed: usize,
-    skipped: usize,
-    message: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BridgeConfigResponse {
-    download_root_dir: String,
-    sync_enabled: bool,
-    local_gateway_base_url: String,
-    public_gateway_base_url: String,
-    relay_enabled: bool,
-    relay_server_url: String,
-    relay_device_name: String,
-    relay_device_id: Option<String>,
-    relay_device_label: Option<String>,
-    relay_last_connected_at: Option<DateTime<Utc>>,
-    relay_last_error: Option<String>,
-    config_file: String,
-    storage_quota_gb: Option<f64>,
-    max_retry_attempts: Option<u32>,
-    remote_pinning_enabled: bool,
-    remote_pinning_service_name: Option<String>,
-    remote_pinning_service_url: Option<String>,
-    remote_pinning_access_token_configured: bool,
-    onboarded_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateBridgeConfigRequest {
-    download_root_dir: Option<String>,
-    sync_enabled: Option<bool>,
-    local_gateway_base_url: Option<String>,
-    public_gateway_base_url: Option<String>,
-    relay_enabled: Option<bool>,
-    relay_server_url: Option<String>,
-    relay_device_name: Option<String>,
-    #[serde(default)]
-    storage_quota_gb: Option<Option<f64>>,
-    #[serde(default)]
-    max_retry_attempts: Option<Option<u32>>,
-    #[serde(default)]
-    remote_pinning_enabled: Option<bool>,
-    #[serde(default)]
-    remote_pinning_service_name: Option<Option<String>>,
-    #[serde(default)]
-    remote_pinning_service_url: Option<Option<String>>,
-    #[serde(default)]
-    remote_pinning_access_token: Option<Option<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateBridgeConfigFormRequest {
-    download_root_dir: String,
-    sync_enabled: Option<String>,
-    local_gateway_base_url: String,
-    public_gateway_base_url: String,
-    relay_enabled: Option<String>,
-    relay_server_url: String,
-    relay_device_name: String,
-    #[serde(default)]
-    storage_quota_gb: Option<String>,
-    #[serde(default)]
-    max_retry_attempts: Option<String>,
-    #[serde(default)]
-    remote_pinning_enabled: Option<String>,
-    #[serde(default)]
-    remote_pinning_service_name: Option<String>,
-    #[serde(default)]
-    remote_pinning_service_url: Option<String>,
-    #[serde(default)]
-    remote_pinning_access_token: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RelayLinkRequest {
-    relay_server_url: Option<String>,
-    pairing_code: String,
-    device_name: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct RelayLinkResponse {
-    relay_enabled: bool,
-    relay_server_url: String,
-    relay_device_name: String,
-    relay_device_id: String,
-    relay_device_label: String,
-    linked_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
-struct RelayUnlinkResponse {
-    unlinked: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct RootPageQuery {
-    session_id: Option<String>,
-    relay_server_url: Option<String>,
-    pairing_code: Option<String>,
-    device_name: Option<String>,
-    autolink: Option<String>,
-    linked: Option<String>,
-    unlinked: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SettingsPageQuery {
-    saved: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShareWorkViewQuery {
-    session_secret: String,
-    title: String,
-    contract_address: String,
-    token_id: String,
-    foundation_url: Option<String>,
-    metadata_cid: Option<String>,
-    media_cid: Option<String>,
-    artist_username: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct RepairCycleOutcome {
-    repaired: usize,
-    healthy: usize,
-    failed: usize,
-}
-
-#[derive(Debug, Default)]
-struct SyncOutcome {
-    synced: usize,
-    failed: usize,
-    skipped: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct RelayLinkFormRequest {
-    relay_server_url: String,
-    pairing_code: String,
-    device_name: Option<String>,
-}
-
-#[derive(Debug)]
-struct PairingDeepLink {
-    relay_server_url: String,
-    pairing_code: String,
-    device_name: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct RelayInventoryMessage {
-    r#type: &'static str,
-    items: Vec<PinInventoryItem>,
-}
-
-#[derive(Debug, Serialize)]
-struct RelayJobResultMessage {
-    r#type: &'static str,
-    job_id: String,
-    status: &'static str,
-    result_payload: Option<String>,
-    error_message: Option<String>,
 }
 
 fn bridge_origin_from_env() -> String {
@@ -780,51 +220,6 @@ async fn handle_deep_link_command(raw: &str) -> anyhow::Result<()> {
 
     info!("desktop pairing deep link forwarded successfully");
     Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct RelayWelcomeMessage {
-    #[serde(rename = "type")]
-    _type: String,
-    device_id: Option<String>,
-    device_label: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RelayRequestInventoryMessage {
-    #[serde(rename = "type")]
-    _type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RelayForceDisconnectMessage {
-    #[serde(rename = "type")]
-    _type: String,
-    reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RelayJobMessage {
-    #[serde(rename = "type")]
-    _type: String,
-    job_id: String,
-    kind: String,
-    payload: String,
-}
-
-#[derive(Debug, Clone)]
-struct WatchPinInput {
-    cid: String,
-    label: Option<String>,
-    preferred_file_name: Option<String>,
-    source_kind: String,
-    title: Option<String>,
-    contract_address: Option<String>,
-    token_id: Option<String>,
-    foundation_url: Option<String>,
-    artist_username: Option<String>,
-    account_address: Option<String>,
-    username: Option<String>,
 }
 
 /// Start the HTTP server. Invoked from `src/main.rs` after tracing init.
@@ -3569,18 +2964,6 @@ async fn detect_public_ipv4(state: &AppState) -> Option<String> {
     Some(parsed.to_string())
 }
 
-#[derive(Debug, Deserialize)]
-struct PinLsEntry {
-    #[serde(rename = "Type")]
-    kind: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PinLsResponse {
-    #[serde(rename = "Keys")]
-    keys: Option<HashMap<String, PinLsEntry>>,
-}
-
 async fn list_kubo_pinset(state: &AppState) -> anyhow::Result<HashMap<String, String>> {
     let endpoint = format!("{}/api/v0/pin/ls", state.ipfs_api_url.trim_end_matches('/'));
 
@@ -3603,48 +2986,6 @@ async fn list_kubo_pinset(state: &AppState) -> anyhow::Result<HashMap<String, St
     }
 
     Ok(pins)
-}
-
-#[derive(Debug, Clone)]
-struct InventorySourcePin {
-    cid: String,
-    pinned: bool,
-    pin_type: Option<String>,
-    watched: WatchedPin,
-}
-
-#[derive(Debug, Clone)]
-enum InventoryEntryDescriptor {
-    Single(InventorySourcePin),
-    Work(Vec<InventorySourcePin>),
-}
-
-impl InventoryEntryDescriptor {
-    fn added_at(&self) -> DateTime<Utc> {
-        match self {
-            Self::Single(source) => source.watched.added_at,
-            Self::Work(members) => {
-                members.iter().map(|member| member.watched.added_at).max().unwrap_or_else(Utc::now)
-            }
-        }
-    }
-
-    fn pinned(&self) -> bool {
-        match self {
-            Self::Single(source) => source.pinned,
-            Self::Work(members) => members.iter().all(|member| member.pinned),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct ResolvedWorkDisplay {
-    local_open_url: Option<String>,
-    public_open_url: Option<String>,
-    preview_local_url: Option<String>,
-    preview_public_url: Option<String>,
-    media_kind: Option<String>,
-    metadata_view: Option<PinMetadataView>,
 }
 
 fn inventory_work_group_key(pin: &WatchedPin) -> Option<String> {
@@ -3686,12 +3027,6 @@ fn inventory_work_group_key(pin: &WatchedPin) -> Option<String> {
 fn related_cids_from_members(members: &[InventorySourcePin]) -> Vec<String> {
     let mut seen = HashSet::new();
     members.iter().map(|member| member.cid.clone()).filter(|cid| seen.insert(cid.clone())).collect()
-}
-
-#[derive(Debug, Clone)]
-struct DiscoveredDependency {
-    cid: String,
-    preferred_file_name: Option<String>,
 }
 
 fn parse_discovered_dependency(raw: &str) -> Option<DiscoveredDependency> {
@@ -5463,18 +4798,6 @@ async fn pin_single_cid(
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct KuboRepoStat {
-    #[serde(rename = "RepoSize")]
-    repo_size: Option<u64>,
-    #[serde(rename = "StorageMax")]
-    storage_max: Option<u64>,
-    #[serde(rename = "NumObjects")]
-    num_objects: Option<u64>,
-    #[serde(rename = "RepoPath")]
-    repo_path: Option<String>,
-}
-
 async fn fetch_kubo_repo_stat(state: &AppState) -> anyhow::Result<KuboRepoStat> {
     let endpoint = format!("{}/api/v0/repo/stat", state.ipfs_api_url.trim_end_matches('/'));
     let mut request = state.http.post(endpoint).timeout(Duration::from_secs(8));
@@ -5614,22 +4937,6 @@ async fn compute_next_retry_at(state: &AppState, attempt: u32) -> DateTime<Utc> 
     Utc::now() + chrono::Duration::seconds(capped as i64)
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DiagnoseResponse {
-    cid: String,
-    pinned_locally: bool,
-    provider_count: usize,
-    reachable_on_dht: bool,
-    error_category: Option<String>,
-    error_hint: Option<String>,
-    last_error: Option<String>,
-    raw_error: Option<String>,
-    checked_at: DateTime<Utc>,
-    gateway_local_ok: Option<bool>,
-    gateway_public_ok: Option<bool>,
-}
-
 async fn probe_gateway(client: &Client, url: &str) -> Option<bool> {
     let response = client.head(url).timeout(Duration::from_secs(5)).send().await.ok()?;
     Some(response.status().is_success() || response.status().is_redirection())
@@ -5682,18 +4989,6 @@ async fn diagnose_pin(state: &AppState, cid: &str) -> DiagnoseResponse {
         gateway_local_ok,
         gateway_public_ok,
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GatewayHealthResponse {
-    local_gateway_base_url: String,
-    public_gateway_base_url: String,
-    utility_gateway_base_url: &'static str,
-    local_ok: Option<bool>,
-    public_ok: Option<bool>,
-    utility_ok: Option<bool>,
-    checked_at: DateTime<Utc>,
 }
 
 async fn gateway_health_probe(state: &AppState) -> GatewayHealthResponse {
@@ -5843,15 +5138,6 @@ async fn diagnose_single_pin(
     Ok(Json(diagnose_pin(&state, trimmed).await))
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RetryPinResponse {
-    cid: String,
-    pinned: bool,
-    used_remote_service: Option<String>,
-    message: String,
-}
-
 async fn retry_pin_now(
     AxumPath(cid): AxumPath<String>,
     State(state): State<AppState>,
@@ -5958,15 +5244,6 @@ async fn retry_pin_now(
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RetrySyncResponse {
-    cid: String,
-    synced: bool,
-    path: Option<String>,
-    error: Option<String>,
-}
-
 async fn retry_sync_single(
     AxumPath(cid): AxumPath<String>,
     State(state): State<AppState>,
@@ -5993,19 +5270,6 @@ async fn retry_sync_single(
             error: Some(error.to_string()),
         })),
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SetPinTagsRequest {
-    tags: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SetPinTagsResponse {
-    cid: String,
-    tags: Vec<String>,
 }
 
 async fn set_pin_tags(
@@ -6053,11 +5317,6 @@ async fn storage_stats_handler(State(state): State<AppState>) -> Json<StorageSna
 
 async fn live_status_handler(State(state): State<AppState>) -> Json<OperationStatus> {
     Json(state.operation.read().await.clone())
-}
-
-#[derive(Debug, Deserialize)]
-struct ExportQuery {
-    format: Option<String>,
 }
 
 async fn export_pins_handler(
@@ -6132,23 +5391,6 @@ async fn export_pins_handler(
                 .into_response())
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ArtistSummary {
-    total_works_managed: usize,
-    works_by_you: usize,
-    artists_tracked: usize,
-    top_artists: Vec<ArtistEntry>,
-    total_copies_pinned: usize,
-}
-
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct ArtistEntry {
-    artist_username: String,
-    works: usize,
 }
 
 async fn artist_summary_handler(State(state): State<AppState>) -> Json<ArtistSummary> {
