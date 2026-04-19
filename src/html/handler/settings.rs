@@ -35,7 +35,27 @@ pub async fn settings_page(
     let relay_status_class = if relay_connected { "pill ok" } else { "pill" };
     let sync_checked = if config.sync_enabled { "checked" } else { "" };
     let relay_checked = if config.relay_enabled { "checked" } else { "" };
+    let tunnel_checked = if config.tunnel_enabled { "checked" } else { "" };
     let remote_pinning_checked = if config.remote_pinning_enabled { "checked" } else { "" };
+    let tunnel_hostname_line = config
+        .tunnel_hostname
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|host| {
+            format!(
+                r#"<div class="settings-field-note"><strong>Public URL:</strong> <a href="https://{host}" target="_blank" rel="noreferrer">https://{host}</a></div>"#,
+                host = escape_html(host)
+            )
+        })
+        .unwrap_or_default();
+    let tunnel_error_line = config
+        .tunnel_last_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|message| format!(r#"<div class="flash warn">{}</div>"#, escape_html(message)))
+        .unwrap_or_default();
     let storage_quota_display =
         config.storage_quota_gb.map(|value| format!("{value}")).unwrap_or_default();
     let max_retry_attempts_display =
@@ -207,6 +227,22 @@ pub async fn settings_page(
       </section>
 
       <section class="settings-card">
+        <h2>Public gateway (Cloudflare tunnel)</h2>
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <strong>Enable public gateway</strong>
+            <span>Publishes this desktop&apos;s IPFS gateway at a unique HTTPS subdomain via Cloudflare Tunnel.</span>
+          </div>
+          <label class="toggle" aria-label="Enable public gateway">
+            <input type="checkbox" name="tunnel_enabled" value="1" {tunnel_checked} />
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          </label>
+        </div>
+        {tunnel_hostname_line}
+        {tunnel_error_line}
+      </section>
+
+      <section class="settings-card">
         <h2>Archive relay</h2>
         <div class="settings-row">
           <div class="settings-row-text">
@@ -258,6 +294,9 @@ pub async fn settings_page(
         relay_checked = relay_checked,
         relay_server_url = escape_html(&config.relay_server_url),
         relay_device_name = escape_html(&config.relay_device_name),
+        tunnel_checked = tunnel_checked,
+        tunnel_hostname_line = tunnel_hostname_line,
+        tunnel_error_line = tunnel_error_line,
         gateway_helper = gateway_helper,
         settings_css = SETTINGS_PAGE_STYLE,
         settings_gateway_script = SETTINGS_GATEWAY_HELPER_SCRIPT,

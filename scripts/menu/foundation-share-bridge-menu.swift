@@ -16,6 +16,17 @@ private struct BridgeHealthResponse: Decodable {
     let relay_device_label: String?
     let relay_last_connected_at: String?
     let relay_last_error: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case relay_enabled = "relayEnabled"
+        case relay_server_url = "relayServerUrl"
+        case relay_device_name = "relayDeviceName"
+        case relay_device_id = "relayDeviceId"
+        case relay_device_label = "relayDeviceLabel"
+        case relay_last_connected_at = "relayLastConnectedAt"
+        case relay_last_error = "relayLastError"
+    }
 }
 
 private struct BridgeConfigResponse: Decodable {
@@ -30,7 +41,28 @@ private struct BridgeConfigResponse: Decodable {
     let relay_device_label: String?
     let relay_last_connected_at: String?
     let relay_last_error: String?
+    let tunnel_enabled: Bool?
+    let tunnel_hostname: String?
+    let tunnel_last_error: String?
     let config_file: String
+
+    private enum CodingKeys: String, CodingKey {
+        case download_root_dir = "downloadRootDir"
+        case sync_enabled = "syncEnabled"
+        case local_gateway_base_url = "localGatewayBaseUrl"
+        case public_gateway_base_url = "publicGatewayBaseUrl"
+        case relay_enabled = "relayEnabled"
+        case relay_server_url = "relayServerUrl"
+        case relay_device_name = "relayDeviceName"
+        case relay_device_id = "relayDeviceId"
+        case relay_device_label = "relayDeviceLabel"
+        case relay_last_connected_at = "relayLastConnectedAt"
+        case relay_last_error = "relayLastError"
+        case tunnel_enabled = "tunnelEnabled"
+        case tunnel_hostname = "tunnelHostname"
+        case tunnel_last_error = "tunnelLastError"
+        case config_file = "configFile"
+    }
 }
 
 private struct RuntimeEnvironment {
@@ -100,6 +132,9 @@ final class BridgeMenuApp: NSObject, NSApplicationDelegate {
 
     private let bridgeStatusItem = NSMenuItem(title: "Bridge: Checking…", action: nil, keyEquivalent: "")
     private let relayStatusItem = NSMenuItem(title: "Relay: Checking…", action: nil, keyEquivalent: "")
+    private let tunnelToggleItem = NSMenuItem(title: "Public Gateway: Off", action: nil, keyEquivalent: "")
+    private let tunnelOpenItem = NSMenuItem(title: "Open Public Gateway", action: nil, keyEquivalent: "")
+    private let tunnelCopyItem = NSMenuItem(title: "Copy Public Gateway URL", action: nil, keyEquivalent: "")
 
     private var refreshTimer: Timer?
     private var lastHealth: BridgeHealthResponse?
@@ -142,8 +177,18 @@ final class BridgeMenuApp: NSObject, NSApplicationDelegate {
         bridgeStatusItem.isEnabled = false
         relayStatusItem.isEnabled = false
 
+        tunnelToggleItem.target = self
+        tunnelToggleItem.action = #selector(toggleTunnel)
+        tunnelOpenItem.target = self
+        tunnelOpenItem.action = #selector(openTunnel)
+        tunnelCopyItem.target = self
+        tunnelCopyItem.action = #selector(copyTunnelURL)
+
         menu.addItem(bridgeStatusItem)
         menu.addItem(relayStatusItem)
+        menu.addItem(tunnelToggleItem)
+        menu.addItem(tunnelOpenItem)
+        menu.addItem(tunnelCopyItem)
         menu.addItem(.separator())
         menu.addItem(item(title: "Open Local UI", action: #selector(openLocalUI)))
         menu.addItem(item(title: "Open Archive Desktop", action: #selector(openArchiveDesktop)))
@@ -480,9 +525,73 @@ final class BridgeMenuApp: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 if case let .success(config) = result {
                     self.lastConfig = config
+                    self.updateTunnelUI(from: config)
                 }
             }
         }
+    }
+
+    private func updateTunnelUI(from config: BridgeConfigResponse) {
+        let enabled = config.tunnel_enabled ?? false
+        let hostname = config.tunnel_hostname?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lastError = config.tunnel_last_error?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let message = lastError, !message.isEmpty {
+            tunnelToggleItem.title = "Public Gateway: \(message)"
+        } else if enabled, let host = hostname, !host.isEmpty {
+            tunnelToggleItem.title = "Public Gateway: \(host) ✓"
+        } else if enabled {
+            tunnelToggleItem.title = "Public Gateway: Starting…"
+        } else {
+            tunnelToggleItem.title = "Public Gateway: Off"
+        }
+        tunnelToggleItem.state = enabled ? .on : .off
+
+        let hasHostname = (hostname?.isEmpty == false)
+        tunnelOpenItem.isHidden = !hasHostname
+        tunnelCopyItem.isHidden = !hasHostname
+    }
+
+    private func currentTunnelURL() -> URL? {
+        guard let host = lastConfig?.tunnel_hostname?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !host.isEmpty
+        else { return nil }
+        return URL(string: "https://\(host)")
+    }
+
+    @objc private func toggleTunnel() {
+        let current = lastConfig?.tunnel_enabled ?? false
+        let body = try? JSONSerialization.data(withJSONObject: ["tunnel_enabled": !current])
+        requestJSON(
+            path: "config",
+            method: "POST",
+            body: body
+        ) { (result: Result<BridgeConfigResponse, Error>) in
+            DispatchQueue.main.async {
+                switch result {
+                case let .success(config):
+                    self.lastConfig = config
+                    self.updateTunnelUI(from: config)
+                case let .failure(error):
+                    self.showMessage(
+                        title: "Public Gateway",
+                        text: "Unable to toggle the public gateway: \(error.localizedDescription)"
+                    )
+                }
+            }
+        }
+    }
+
+    @objc private func openTunnel() {
+        guard let url = currentTunnelURL() else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func copyTunnelURL() {
+        guard let url = currentTunnelURL() else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.absoluteString, forType: .string)
     }
 
     @objc private func openLocalUI() {

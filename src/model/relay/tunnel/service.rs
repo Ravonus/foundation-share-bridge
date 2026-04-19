@@ -3,7 +3,11 @@
 //! device.
 #![allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::pedantic, clippy::nursery)]
 
-use std::{path::{Path, PathBuf}, process::Stdio, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+};
 
 use anyhow::{Context, anyhow};
 use chrono::Utc;
@@ -18,7 +22,9 @@ use tracing::{info, warn};
 
 use crate::{
     AppState,
-    model::{config::service::persist_bridge_config, tunnel::install::ensure_cloudflared_binary},
+    model::{
+        config::service::persist_bridge_config, relay::tunnel::install::ensure_cloudflared_binary,
+    },
 };
 
 #[derive(Debug, Serialize)]
@@ -217,21 +223,26 @@ async fn provision_tunnel(
         .with_context(|| format!("Unable to POST {url}"))?;
 
     let status = response.status();
-    let payload: serde_json::Value = response
-        .json()
-        .await
-        .with_context(|| format!("Unable to decode tunnel provision response ({status})"))?;
+    let body_text = response.text().await.unwrap_or_default();
 
     if !status.is_success() {
-        let message = payload
-            .get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or("tunnel provisioning failed");
+        let message = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|value| value.get("error").and_then(|e| e.as_str().map(String::from)))
+            .unwrap_or_else(|| {
+                if status.as_u16() == 404 {
+                    format!(
+                        "{relay_server_url} is missing the tunnel provisioning routes (404). Deploy the latest backend or point relay_server_url at a dev build that has /api/relay/bridge/tunnel/*."
+                    )
+                } else {
+                    format!("tunnel provisioning failed ({status})")
+                }
+            });
         return Err(anyhow!("{message}"));
     }
 
     let parsed: ProvisionResponse =
-        serde_json::from_value(payload).context("Unable to parse tunnel provisioning payload")?;
+        serde_json::from_str(&body_text).context("Unable to parse tunnel provisioning payload")?;
 
     Ok(ProvisionedTunnel {
         hostname: parsed.hostname,
@@ -310,9 +321,5 @@ async fn clear_tunnel_error_in_config(state: &AppState) {
 }
 
 fn cloudflared_cache_dir(state: &AppState) -> PathBuf {
-    state
-        .state_file
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
-        .join("tools")
+    state.state_file.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf).join("tools")
 }
