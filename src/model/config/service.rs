@@ -3,7 +3,10 @@
 //! `/config` handlers funnel through so validation + persistence stay in one
 //! place.
 
-use std::path::Path;
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 use chrono::Utc;
@@ -228,4 +231,44 @@ pub async fn apply_config_update(
 
     let config = state.config.read().await;
     Ok(crate::model::system::service::build_config_response(state, &config))
+}
+
+pub fn bridge_state_file_from_env() -> anyhow::Result<PathBuf> {
+    if let Some(value) = env::var("BRIDGE_STATE_FILE").ok().filter(|value| !value.trim().is_empty())
+    {
+        return Ok(PathBuf::from(value));
+    }
+
+    let cwd = env::current_dir().context("Unable to determine current directory")?;
+    Ok(cwd.join("bridge-state.json"))
+}
+
+pub fn bridge_config_file_from_env(state_file: &Path) -> anyhow::Result<PathBuf> {
+    if let Some(value) =
+        env::var("BRIDGE_CONFIG_FILE").ok().filter(|value| !value.trim().is_empty())
+    {
+        return Ok(PathBuf::from(value));
+    }
+
+    if let Some(parent) = state_file.parent() {
+        let yaml_path = parent.join("bridge-config.yaml");
+        if yaml_path.exists() {
+            return Ok(yaml_path);
+        }
+
+        let yml_path = parent.join("bridge-config.yml");
+        if yml_path.exists() {
+            return Ok(yml_path);
+        }
+
+        let json_path = parent.join("bridge-config.json");
+        if json_path.exists() {
+            return Ok(json_path);
+        }
+
+        return Ok(yaml_path);
+    }
+
+    let cwd = env::current_dir().context("Unable to determine current directory")?;
+    Ok(cwd.join("bridge-config.yaml"))
 }

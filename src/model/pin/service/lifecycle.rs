@@ -3,7 +3,8 @@
 
 use anyhow::anyhow;
 use chrono::Utc;
-use tracing::warn;
+use tokio::time::{Duration, interval};
+use tracing::{error, warn};
 
 use super::core::{record_pin_failure, record_pin_repaired, remember_watched_pin};
 use crate::{
@@ -153,4 +154,18 @@ pub async fn sync_all_watched_pins(state: &AppState, force: bool) -> anyhow::Res
     }
 
     Ok(outcome)
+}
+
+pub fn spawn_repair_loop(state: AppState) {
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(state.repair_interval_seconds));
+
+        loop {
+            ticker.tick().await;
+
+            if let Err(error) = repair_watched_pins(&state).await {
+                error!("self-repair cycle failed: {error}");
+            }
+        }
+    });
 }

@@ -3,13 +3,19 @@
 //! flow through the WebSocket channel.
 
 use std::collections::HashMap;
+use std::env;
 
 use anyhow::{Context, anyhow};
 use chrono::Utc;
 use futures_util::SinkExt;
+use reqwest::Client;
+use tokio::time::{Duration, sleep};
 use tokio_tungstenite::tungstenite::Message;
+use tracing::info;
+use url::Url;
 use uuid::Uuid;
 
+use super::PairingDeepLink;
 use super::types::{
     RelayInventoryMessage, RelayLinkRequest, RelayLinkResponse, RelayShareWorkPayload,
     ShareProfileRequest, ShareProfileResponse, ShareWorkRequest, ShareWorkResponse,
@@ -344,4 +350,98 @@ pub async fn share_profile_inner(
         pins,
         message: "Profile share accepted. The bridge pinned these CIDs and added them to the forever-watch list.",
     })
+}
+
+pub fn bridge_origin_from_env() -> String {
+    let host = env::var("BRIDGE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = env::var("BRIDGE_PORT").unwrap_or_else(|_| "43128".to_string());
+    format!("http://{host}:{port}")
+}
+
+pub fn parse_pairing_deep_link(raw: &str) -> anyhow::Result<PairingDeepLink> {
+    let url = Url::parse(raw).with_context(|| format!("Unable to parse deep link: {raw}"))?;
+    let scheme = url.scheme().to_ascii_lowercase();
+    if scheme != "foundationsharebridge" && scheme != "foundation-share-bridge" {
+        anyhow::bail!("Unsupported deep link scheme: {}", url.scheme());
+    }
+
+    let action = url.host_str().unwrap_or_default();
+    if action != "pair" && url.path().trim_matches('/') != "pair" {
+        anyhow::bail!("Unsupported deep link action. Expected pair.");
+    }
+
+    let mut relay_server_url = None;
+    let mut pairing_code = None;
+    let mut device_name = None;
+
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "relay_server_url" => relay_server_url = Some(value.into_owned()),
+            "pairing_code" => pairing_code = Some(value.into_owned()),
+            "device_name" => device_name = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+
+    let relay_server_url = relay_server_url
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("relay_server_url is required"))?;
+    let pairing_code = pairing_code
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("pairing_code is required"))?;
+    let device_name =
+        device_name.map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
+
+    Ok(PairingDeepLink { relay_server_url, pairing_code, device_name })
+}
+
+pub async fn wait_for_local_bridge_ready(
+    client: &Client,
+    bridge_origin: &str,
+) -> anyhow::Result<()> {
+    let health_url = format!("{}/health", trim_trailing_slash(bridge_origin));
+
+    for _ in 0..40 {
+        if let Ok(response) = client.get(&health_url).send().await
+            && response.status().is_success()
+        {
+            return Ok(());
+        }
+
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    Err(anyhow!("The local bridge did not come online at {health_url} in time."))
+}
+
+pub async fn handle_deep_link_command(raw: &str) -> anyhow::Result<()> {
+    let deep_link = parse_pairing_deep_link(raw)?;
+    let bridge_origin = bridge_origin_from_env();
+    let client = Client::builder()
+        .user_agent("foundation-share-bridge/0.1 deeplink")
+        .build()
+        .context("Unable to build HTTP client for deep link handling")?;
+
+    wait_for_local_bridge_ready(&client, &bridge_origin).await?;
+
+    let response = client
+        .post(format!("{}/relay/link", trim_trailing_slash(&bridge_origin)))
+        .json(&serde_json::json!({
+            "relay_server_url": deep_link.relay_server_url,
+            "pairing_code": deep_link.pairing_code,
+            "device_name": deep_link.device_name,
+        }))
+        .send()
+        .await
+        .context("Unable to send deep link pairing request to the local bridge")?;
+
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Deep link pairing failed: {body}");
+    }
+
+    info!("desktop pairing deep link forwarded successfully");
+    Ok(())
 }
