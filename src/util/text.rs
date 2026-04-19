@@ -19,6 +19,16 @@ pub fn csv_escape(value: &str) -> String {
     }
 }
 
+/// Validate that a string looks like a CID: non-empty, reasonable length,
+/// alphanumeric only. Stricter than multibase (which allows a few symbols),
+/// but that's fine — every CID produced by modern Kubo matches this.
+pub fn is_valid_cid(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 128
+        && trimmed.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 pub fn sanitize_custom_tag(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > 48 {

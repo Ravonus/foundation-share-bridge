@@ -379,7 +379,9 @@ pub fn parse_pairing_deep_link(raw: &str) -> anyhow::Result<PairingDeepLink> {
             "relay_server_url" => relay_server_url = Some(value.into_owned()),
             "pairing_code" => pairing_code = Some(value.into_owned()),
             "device_name" => device_name = Some(value.into_owned()),
-            _ => {}
+            other => {
+                tracing::warn!("ignoring unknown deep-link query parameter: {} = {}", other, value,);
+            }
         }
     }
 
@@ -387,6 +389,18 @@ pub fn parse_pairing_deep_link(raw: &str) -> anyhow::Result<PairingDeepLink> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("relay_server_url is required"))?;
+    let parsed = Url::parse(&relay_server_url)
+        .with_context(|| format!("Invalid relay_server_url: {relay_server_url}"))?;
+    let scheme_ok = parsed.scheme() == "https"
+        || (parsed.scheme() == "http"
+            && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1")));
+    if !scheme_ok {
+        anyhow::bail!(
+            "Deep-link relay_server_url must use https (got scheme {}, host {})",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or("<none>"),
+        );
+    }
     let pairing_code = pairing_code
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())

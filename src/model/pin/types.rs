@@ -326,6 +326,7 @@ pub struct SetPinTagsResponse {
 #[derive(Debug, Deserialize)]
 pub struct ExportQuery {
     pub format: Option<String>,
+    pub session_secret: String,
 }
 
 #[derive(Debug, Deserialize)]

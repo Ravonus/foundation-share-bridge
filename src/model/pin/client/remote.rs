@@ -30,6 +30,11 @@ pub async fn submit_to_remote_pinning_service(
     let service_url = service_url
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("Remote pinning is enabled but service URL is empty"))?;
+    let parsed = url::Url::parse(&service_url)
+        .with_context(|| format!("Invalid remote_pinning_service_url: {service_url}"))?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("remote_pinning_service_url must use https (got {})", parsed.scheme(),);
+    }
     let token = token
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("Remote pinning is enabled but access token is empty"))?;

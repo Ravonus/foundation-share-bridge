@@ -41,7 +41,10 @@ use crate::{
         session::service::validate_session,
         system::DiagnoseResponse,
     },
-    util::{data::unique_trimmed_strings, text::sanitize_custom_tag},
+    util::{
+        data::unique_trimmed_strings,
+        text::{is_valid_cid, sanitize_custom_tag},
+    },
 };
 
 const VERIFY_CONCURRENCY: usize = 6;
@@ -137,6 +140,9 @@ pub async fn verify_single_pin(
     AxumPath(cid): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<PinVerification>, AppError> {
+    if !is_valid_cid(&cid) {
+        return Err(AppError::bad_request("Invalid CID"));
+    }
     let result = check_cid_network_providers(&state, &cid).await;
     remember_pin_verification(&state, &result).await?;
     Ok(Json(result))
@@ -162,6 +168,10 @@ pub async fn pin_cid(
         .as_deref()
         .ok_or_else(|| AppError::unauthorized("session_secret is required to pin a CID"))?;
     validate_session(&state, secret).await?;
+
+    if !is_valid_cid(&input.cid) {
+        return Err(AppError::bad_request("Invalid CID"));
+    }
 
     let result = pin_and_watch_cid(
         &state,
@@ -399,6 +409,9 @@ pub async fn diagnose_single_pin(
     if trimmed.is_empty() {
         return Err(AppError::bad_request("CID is required"));
     }
+    if !is_valid_cid(trimmed) {
+        return Err(AppError::bad_request("Invalid CID"));
+    }
     Ok(Json(diagnose_pin(&state, trimmed).await))
 }
 
@@ -409,6 +422,9 @@ pub async fn retry_pin_now(
     let trimmed = cid.trim().to_string();
     if trimmed.is_empty() {
         return Err(AppError::bad_request("CID is required"));
+    }
+    if !is_valid_cid(&trimmed) {
+        return Err(AppError::bad_request("Invalid CID"));
     }
 
     {
@@ -516,6 +532,9 @@ pub async fn retry_sync_single(
     if trimmed.is_empty() {
         return Err(AppError::bad_request("CID is required"));
     }
+    if !is_valid_cid(&trimmed) {
+        return Err(AppError::bad_request("Invalid CID"));
+    }
     let exists = state.persistent.read().await.watched_pins.contains_key(&trimmed);
     if !exists {
         return Err(AppError::bad_request("CID is not watched by this bridge"));
@@ -544,6 +563,9 @@ pub async fn set_pin_tags(
     let trimmed = cid.trim().to_string();
     if trimmed.is_empty() {
         return Err(AppError::bad_request("CID is required"));
+    }
+    if !is_valid_cid(&trimmed) {
+        return Err(AppError::bad_request("Invalid CID"));
     }
     let cleaned: Vec<String> = {
         let mut seen = HashSet::new();

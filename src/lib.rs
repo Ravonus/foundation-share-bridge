@@ -65,6 +65,7 @@ use crate::{
             },
             service::handle_deep_link_command,
             socket::spawn_relay_socket_loop,
+            tunnel::spawn_tunnel_loop,
         },
         session::{
             BridgeSession,
@@ -74,7 +75,6 @@ use crate::{
             add_private_network_access_header, artist_summary_handler, export_pins_handler,
             gateway_health_handler, health, live_status_handler, storage_stats_handler,
         },
-        tunnel::spawn_tunnel_loop,
     },
 };
 

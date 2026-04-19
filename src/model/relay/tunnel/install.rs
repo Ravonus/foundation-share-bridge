@@ -15,8 +15,7 @@ use anyhow::{Context, anyhow};
 use tokio::{fs, process::Command};
 use tracing::{info, warn};
 
-const DOWNLOAD_BASE: &str =
-    "https://github.com/cloudflare/cloudflared/releases/latest/download";
+const DOWNLOAD_BASE: &str = "https://github.com/cloudflare/cloudflared/releases/latest/download";
 
 /// Resolve the cloudflared binary path. Returns a path to an executable that
 /// is known to launch (version check succeeded) by the time this returns.
@@ -90,9 +89,7 @@ async fn download_and_install(cache_dir: &Path) -> anyhow::Result<PathBuf> {
 
     let asset = asset_name()?;
     let url = format!("{DOWNLOAD_BASE}/{asset}");
-    let response = reqwest::get(&url)
-        .await
-        .with_context(|| format!("Unable to download {url}"))?;
+    let response = reqwest::get(&url).await.with_context(|| format!("Unable to download {url}"))?;
 
     if !response.status().is_success() {
         return Err(anyhow!("cloudflared download failed: {}", response.status()));

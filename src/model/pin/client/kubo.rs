@@ -18,7 +18,7 @@ use crate::{
         pin::types::{PinCidResult, PinLsResponse},
         system::KuboRepoStat,
     },
-    util::file::sanitize_file_name,
+    util::{file::sanitize_file_name, text::is_valid_cid},
 };
 
 // Large-enough bound to capture most dependency-probe inputs (HTML, JSON, SVG,
@@ -300,6 +300,9 @@ pub async fn pin_single_cid(
     let trimmed = cid.trim();
     if trimmed.is_empty() {
         return Err(AppError::bad_request("CID is required"));
+    }
+    if !is_valid_cid(trimmed) {
+        return Err(AppError::bad_request("Invalid CID"));
     }
 
     let endpoint =

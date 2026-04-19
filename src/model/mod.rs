@@ -1,6 +1,7 @@
 //! Domain modules for the bridge — each child groups the DTOs, service-layer
 //! logic, and HTTP handlers for one concern (config, pin, relay, session,
-//! system).
+//! system). The cloudflared tunnel integration lives under `relay/tunnel`
+//! since it shares the archive-backend coordination surface.
 //!
 //! Persistence note: many types under these modules back on-disk files
 //! (`bridge-state.json`, the config file) or the relay WebSocket protocol.
@@ -14,4 +15,3 @@ pub mod pin;
 pub mod relay;
 pub mod session;
 pub mod system;
-pub mod tunnel;

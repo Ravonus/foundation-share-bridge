@@ -7,6 +7,7 @@ use crate::{
     AppError, AppState, OperationStatus,
     model::{
         pin::{ExportQuery, inventory::inventory_work_group_key},
+        session::service::validate_session,
         system::{
             ArtistEntry, ArtistSummary, GatewayHealthResponse, HealthResponse, StorageSnapshot,
             probe::gateway_health_probe, service::build_storage_snapshot,
@@ -121,6 +122,7 @@ pub async fn export_pins_handler(
     State(state): State<AppState>,
     Query(query): Query<ExportQuery>,
 ) -> Result<Response, AppError> {
+    validate_session(&state, &query.session_secret).await?;
     let snapshot = state.persistent.read().await.clone();
     let format = query
         .format

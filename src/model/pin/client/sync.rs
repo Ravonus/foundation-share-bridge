@@ -16,6 +16,7 @@ use crate::{
     model::pin::metadata::detect_media_kind_from_text,
     util::{
         file::{ensure_leaf_file_extension, leaf_name_from_ipfs_path, sniff_leaf_file_extension},
+        text::is_valid_cid,
         url::{build_gateway_url, parse_ipfs_path},
     },
 };
@@ -63,6 +64,9 @@ pub async fn measure_synced_bytes_on_disk(state: &AppState) -> u64 {
 }
 
 pub async fn sync_cid_to_download_dir(state: &AppState, cid: &str) -> anyhow::Result<PathBuf> {
+    if !is_valid_cid(cid) {
+        anyhow::bail!("Invalid CID: {cid}");
+    }
     let config = { state.config.read().await.clone() };
     let root_dir = PathBuf::from(config.download_root_dir.clone()).join(cid.trim());
 
