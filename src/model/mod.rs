@@ -14,3 +14,4 @@ pub mod pin;
 pub mod relay;
 pub mod session;
 pub mod system;
+pub mod tunnel;

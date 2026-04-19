@@ -52,6 +52,18 @@ pub struct BridgeConfig {
     pub relay_last_connected_at: Option<DateTime<Utc>>,
     pub relay_last_error: Option<String>,
     #[serde(default)]
+    pub tunnel_enabled: bool,
+    #[serde(default)]
+    pub tunnel_hostname: Option<String>,
+    #[serde(default)]
+    pub tunnel_subdomain: Option<String>,
+    #[serde(default)]
+    pub tunnel_token: Option<String>,
+    #[serde(default)]
+    pub tunnel_provisioned_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub tunnel_last_error: Option<String>,
+    #[serde(default)]
     pub storage_quota_gb: Option<f64>,
     #[serde(default)]
     pub max_retry_attempts: Option<u32>,
@@ -81,6 +93,10 @@ pub struct BridgeConfigResponse {
     pub relay_device_label: Option<String>,
     pub relay_last_connected_at: Option<DateTime<Utc>>,
     pub relay_last_error: Option<String>,
+    pub tunnel_enabled: bool,
+    pub tunnel_hostname: Option<String>,
+    pub tunnel_last_error: Option<String>,
+    pub tunnel_provisioned_at: Option<DateTime<Utc>>,
     pub config_file: String,
     pub storage_quota_gb: Option<f64>,
     pub max_retry_attempts: Option<u32>,
@@ -100,6 +116,8 @@ pub struct UpdateBridgeConfigRequest {
     pub relay_enabled: Option<bool>,
     pub relay_server_url: Option<String>,
     pub relay_device_name: Option<String>,
+    #[serde(default)]
+    pub tunnel_enabled: Option<bool>,
     #[serde(default)]
     pub storage_quota_gb: Option<Option<f64>>,
     #[serde(default)]
@@ -123,6 +141,8 @@ pub struct UpdateBridgeConfigFormRequest {
     pub relay_enabled: Option<String>,
     pub relay_server_url: String,
     pub relay_device_name: String,
+    #[serde(default)]
+    pub tunnel_enabled: Option<String>,
     #[serde(default)]
     pub storage_quota_gb: Option<String>,
     #[serde(default)]
@@ -213,6 +233,12 @@ pub fn default_bridge_config(state_file: &Path) -> BridgeConfig {
         relay_device_token: None,
         relay_last_connected_at: None,
         relay_last_error: None,
+        tunnel_enabled: false,
+        tunnel_hostname: None,
+        tunnel_subdomain: None,
+        tunnel_token: None,
+        tunnel_provisioned_at: None,
+        tunnel_last_error: None,
         storage_quota_gb: env::var("BRIDGE_STORAGE_QUOTA_GB")
             .ok()
             .and_then(|value| value.trim().parse::<f64>().ok())

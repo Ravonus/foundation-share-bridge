@@ -74,6 +74,7 @@ use crate::{
             add_private_network_access_header, artist_summary_handler, export_pins_handler,
             gateway_health_handler, health, live_status_handler, storage_stats_handler,
         },
+        tunnel::spawn_tunnel_loop,
     },
 };
 
@@ -170,7 +171,11 @@ impl IntoResponse for AppError {
     }
 }
 
-const MAX_UPLOAD_BYTES: usize = 5 * 1024 * 1024 * 1024;
+/// Per-request upload cap. Kept modest because the current upload handler
+/// buffers the whole multipart body in memory before forwarding it to Kubo;
+/// full streaming is a v0.2 item. Reducing the cap contains the memory-DoS
+/// blast radius without touching `add_files`.
+const MAX_UPLOAD_BYTES: usize = 500 * 1024 * 1024;
 
 /// Extract the deep-link URL from argv if the binary was invoked as
 /// `handle-url <url>` / `open-url <url>`. Kept separate from `run()` so the
@@ -191,6 +196,7 @@ fn bridge_cors_layer() -> CorsLayer {
     let allowlist = AllowOrigin::predicate(|origin: &HeaderValue, _request_head| {
         let Ok(origin_str) = origin.to_str() else { return false };
         origin_str == "https://foundation.agorix.io"
+            || origin_str.ends_with(".agorix.io")
             || origin_str.starts_with("http://127.0.0.1:")
             || origin_str.starts_with("http://localhost:")
     });
@@ -262,6 +268,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     spawn_repair_loop(state.clone());
     spawn_relay_socket_loop(state.clone());
+    spawn_tunnel_loop(state.clone());
 
     let app = Router::new()
         .route("/", get(root_page))

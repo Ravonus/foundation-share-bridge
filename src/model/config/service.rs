@@ -151,7 +151,7 @@ pub async fn persist_bridge_config(state: &AppState) -> anyhow::Result<()> {
 
 // Wide patch shape: each optional field drives one independent branch. Not
 // genuinely convoluted; the cognitive score reflects breadth, not depth.
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 pub async fn apply_config_update(
     state: &AppState,
     input: UpdateBridgeConfigRequest,
@@ -214,6 +214,17 @@ pub async fn apply_config_update(
                 return Err(AppError::bad_request("relay_device_name cannot be empty"));
             }
             config.relay_device_name = trimmed.to_string();
+        }
+
+        if let Some(tunnel_enabled) = input.tunnel_enabled
+            && tunnel_enabled != config.tunnel_enabled
+        {
+            config.tunnel_enabled = tunnel_enabled;
+            if !tunnel_enabled {
+                // Clear stale error on toggle-off; the tunnel loop handles
+                // the actual revoke + stopping cloudflared.
+                config.tunnel_last_error = None;
+            }
         }
 
         if let Some(quota) = input.storage_quota_gb {

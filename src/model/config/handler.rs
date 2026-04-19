@@ -70,6 +70,7 @@ pub async fn update_config_form(
         relay_enabled: Some(input.relay_enabled.is_some()),
         relay_server_url: Some(input.relay_server_url),
         relay_device_name: Some(input.relay_device_name),
+        tunnel_enabled: Some(input.tunnel_enabled.is_some()),
         storage_quota_gb: quota,
         max_retry_attempts: retries,
         remote_pinning_enabled: Some(input.remote_pinning_enabled.is_some()),
