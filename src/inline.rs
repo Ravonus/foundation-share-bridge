@@ -19,6 +19,23 @@ use std::{
 use crate::{
     app::{AppState, OperationStatus},
     error::AppError,
+    util::{
+        data::{
+            first_present_error, first_present_string, json_display_value, json_string,
+            max_timestamp_by, nested_json_value, unique_trimmed_strings,
+        },
+        file::{
+            ensure_leaf_file_extension, leaf_name_from_ipfs_path,
+            preferred_file_name_from_relative_path, sniff_leaf_file_extension,
+        },
+        format::{format_bytes_human, format_timestamp},
+        text::{csv_escape, escape_html, sanitize_custom_tag},
+        url::{
+            PUBLIC_UTILITY_GATEWAY_BASE_URL, build_direct_ip_gateway_base_url, build_gateway_url,
+            build_public_utility_gateway_url, encode_query_component, parse_ipfs_path,
+            parse_ipfs_reference, trim_trailing_slash,
+        },
+    },
 };
 
 use anyhow::{Context, anyhow};
@@ -60,7 +77,6 @@ const FOUNDATION_SITE_HOSTNAME: &str = "foundation.agorix.io";
 const FOUNDATION_SOCKET_HOSTNAME: &str = "socket-foundation.agorix.io";
 const INVENTORY_PAGE_SIZE: usize = 12;
 const INVENTORY_MAX_PAGE_SIZE: usize = 24;
-const PUBLIC_UTILITY_GATEWAY_BASE_URL: &str = "https://dweb.link";
 const VERIFY_CONCURRENCY: usize = 6;
 const MAX_DISCOVERY_TEXT_BYTES: usize = 512 * 1024;
 const MAX_DEPENDENCY_DISCOVERY_DEPTH: usize = 2;
@@ -1188,21 +1204,6 @@ async fn persist_bridge_config(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn escape_notification_text(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")
-}
-
-#[cfg(target_os = "windows")]
-fn escape_xml_text(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 async fn show_backup_notification(body: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -1210,7 +1211,7 @@ async fn show_backup_notification(body: &str) -> anyhow::Result<()> {
             .arg("-e")
             .arg(format!(
                 "display notification \"{}\" with title \"Foundation Share Bridge\" subtitle \"Backup saved\"",
-                escape_notification_text(body)
+                crate::util::text::escape_notification_text(body)
             ))
             .status()
             .await
@@ -1261,7 +1262,7 @@ $xml.LoadXml($template)
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Foundation Share Bridge").Show($toast)
 "#,
-            escape_xml_text(body)
+            crate::util::text::escape_xml_text(body)
         );
 
         let status = TokioCommand::new("powershell")
@@ -2648,15 +2649,6 @@ fn resolve_inventory_page_size(raw: Option<usize>) -> usize {
     raw.unwrap_or(INVENTORY_PAGE_SIZE).clamp(1, INVENTORY_MAX_PAGE_SIZE)
 }
 
-fn unique_trimmed_strings(values: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    values
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty() && seen.insert(value.clone()))
-        .collect()
-}
-
 fn collect_inventory_descriptors(
     pinset: &HashMap<String, String>,
     persistent: &BridgePersistentState,
@@ -3545,22 +3537,6 @@ async fn mark_pin_sync_failed(state: &AppState, cid: &str, message: String) -> a
     persist_bridge_state(state).await
 }
 
-fn trim_trailing_slash(value: &str) -> String {
-    value.trim().trim_end_matches('/').to_string()
-}
-
-fn build_gateway_url(base: &str, cid: &str) -> String {
-    format!("{}/ipfs/{}", trim_trailing_slash(base), cid.trim())
-}
-
-fn build_public_utility_gateway_url(cid: &str) -> String {
-    build_gateway_url(PUBLIC_UTILITY_GATEWAY_BASE_URL, cid)
-}
-
-fn build_direct_ip_gateway_base_url(ip: &str) -> String {
-    format!("http://{}:8080", ip.trim())
-}
-
 async fn detect_public_ipv4(state: &AppState) -> Option<String> {
     #[derive(Debug, Deserialize)]
     struct IpifyResponse {
@@ -3582,19 +3558,6 @@ async fn detect_public_ipv4(state: &AppState) -> Option<String> {
     let payload = response.json::<IpifyResponse>().await.ok()?;
     let parsed = payload.ip.parse::<Ipv4Addr>().ok()?;
     Some(parsed.to_string())
-}
-
-fn encode_query_component(value: &str) -> String {
-    value
-        .bytes()
-        .flat_map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                vec![byte as char]
-            }
-            b' ' => vec!['+'],
-            _ => format!("%{:02X}", byte).chars().collect(),
-        })
-        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3711,27 +3674,6 @@ fn inventory_work_group_key(pin: &WatchedPin) -> Option<String> {
     None
 }
 
-fn first_present_string<I>(values: I) -> Option<String>
-where
-    I: IntoIterator<Item = Option<String>>,
-{
-    values.into_iter().flatten().find(|value| !value.trim().is_empty())
-}
-
-fn max_timestamp_by<F>(members: &[InventorySourcePin], accessor: F) -> Option<DateTime<Utc>>
-where
-    F: Fn(&InventorySourcePin) -> Option<DateTime<Utc>>,
-{
-    members.iter().filter_map(accessor).max()
-}
-
-fn first_present_error<F>(members: &[InventorySourcePin], accessor: F) -> Option<String>
-where
-    F: Fn(&InventorySourcePin) -> Option<&String>,
-{
-    members.iter().filter_map(accessor).find(|value| !value.trim().is_empty()).cloned()
-}
-
 fn related_cids_from_members(members: &[InventorySourcePin]) -> Vec<String> {
     let mut seen = HashSet::new();
     members.iter().map(|member| member.cid.clone()).filter(|cid| seen.insert(cid.clone())).collect()
@@ -3741,24 +3683,6 @@ fn related_cids_from_members(members: &[InventorySourcePin]) -> Vec<String> {
 struct DiscoveredDependency {
     cid: String,
     preferred_file_name: Option<String>,
-}
-
-fn sanitize_file_name(raw: &str) -> Option<String> {
-    let trimmed = raw.trim().trim_matches('/');
-    let file_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
-    let cleaned = file_name
-        .chars()
-        .map(|character| match character {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            value => value,
-        })
-        .collect::<String>();
-    let sanitized = cleaned.trim().trim_matches('.').to_string();
-    (!sanitized.is_empty()).then_some(sanitized)
-}
-
-fn preferred_file_name_from_relative_path(relative_path: &str) -> Option<String> {
-    sanitize_file_name(relative_path)
 }
 
 fn parse_discovered_dependency(raw: &str) -> Option<DiscoveredDependency> {
@@ -4119,49 +4043,6 @@ async fn discover_work_dependency_inputs(
         .collect()
 }
 
-fn parse_ipfs_path(raw: &str) -> Option<(String, String)> {
-    let trimmed = raw.trim().trim_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let normalized = trimmed.strip_prefix("ipfs/").unwrap_or(trimmed);
-    let mut parts = normalized.splitn(2, '/');
-    let cid = parts.next()?.trim();
-    if cid.is_empty() {
-        return None;
-    }
-
-    let relative_path = parts.next().unwrap_or("").trim_matches('/').to_string();
-    Some((cid.to_string(), relative_path))
-}
-
-fn parse_ipfs_reference(raw: &str) -> Option<(String, String)> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if let Some(rest) = trimmed.strip_prefix("ipfs://") {
-        return parse_ipfs_path(rest);
-    }
-
-    if let Some(rest) = trimmed.strip_prefix("/ipfs/") {
-        return parse_ipfs_path(rest);
-    }
-
-    let url = Url::parse(trimmed).ok()?;
-    if let Some(host) = url.host_str()
-        && let Some((cid, _)) = host.split_once(".ipfs.")
-    {
-        return Some((cid.to_string(), url.path().trim_matches('/').to_string()));
-    }
-
-    let path = url.path();
-    let index = path.find("/ipfs/")?;
-    parse_ipfs_path(&path[(index + "/ipfs/".len())..])
-}
-
 fn build_gateway_asset_url(base: &str, cid: &str, relative_path: &str) -> String {
     let cleaned = relative_path.trim().trim_matches('/');
     if cleaned.is_empty() {
@@ -4177,25 +4058,6 @@ fn normalize_asset_url_for_gateway(raw: &str, gateway_base: &str) -> String {
     }
 
     raw.to_string()
-}
-
-fn json_string(value: Option<&serde_json::Value>) -> Option<String> {
-    value
-        .and_then(|entry| entry.as_str())
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn nested_json_value<'a>(
-    value: &'a serde_json::Value,
-    path: &[&str],
-) -> Option<&'a serde_json::Value> {
-    let mut current = value;
-    for segment in path {
-        current = current.as_object()?.get(*segment)?;
-    }
-    Some(current)
 }
 
 fn collect_url_candidates(value: Option<&serde_json::Value>) -> Vec<String> {
@@ -4272,28 +4134,6 @@ fn metadata_primary_media_url(metadata: &serde_json::Value) -> Option<String> {
         json_string(nested_json_value(metadata, &["content", "uri"])),
         json_string(nested_json_value(metadata, &["content", "url"])),
     ])
-}
-
-fn json_display_value(value: Option<&serde_json::Value>) -> Option<String> {
-    match value? {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(text) => {
-            let trimmed = text.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        }
-        serde_json::Value::Number(number) => Some(number.to_string()),
-        serde_json::Value::Bool(boolean) => Some(boolean.to_string()),
-        serde_json::Value::Array(values) => {
-            let joined = values
-                .iter()
-                .filter_map(|entry| json_display_value(Some(entry)))
-                .collect::<Vec<_>>();
-            (!joined.is_empty()).then(|| joined.join(", "))
-        }
-        serde_json::Value::Object(record) => {
-            serde_json::to_string(record).ok().filter(|value| !value.is_empty())
-        }
-    }
 }
 
 fn metadata_description(metadata: &serde_json::Value) -> Option<String> {
@@ -4932,52 +4772,6 @@ async fn sync_cid_to_download_dir(state: &AppState, cid: &str) -> anyhow::Result
     }
 
     sync_result
-}
-
-fn sniff_leaf_file_extension(bytes: &[u8]) -> Option<&'static str> {
-    let lower_prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).to_ascii_lowercase();
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("png")
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some("jpg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("gif")
-    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        Some("webp")
-    } else if bytes.starts_with(b"OggS") {
-        Some("ogg")
-    } else if bytes.starts_with(b"ID3") {
-        Some("mp3")
-    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
-        Some("wav")
-    } else if bytes.get(4..8) == Some(b"ftyp") {
-        Some("mp4")
-    } else if bytes.starts_with(b"glTF") {
-        Some("glb")
-    } else if lower_prefix.contains("<svg") {
-        Some("svg")
-    } else if lower_prefix.contains("<html") || lower_prefix.contains("<!doctype html") {
-        Some("html")
-    } else if lower_prefix.trim_start().starts_with('{')
-        || lower_prefix.trim_start().starts_with('[')
-    {
-        Some("json")
-    } else {
-        None
-    }
-}
-
-fn ensure_leaf_file_extension(file_name: &str, extension: &str) -> String {
-    if Path::new(file_name).extension().is_some() {
-        file_name.to_string()
-    } else {
-        format!("{}.{}", file_name.trim_end_matches('.'), extension)
-    }
-}
-
-fn leaf_name_from_ipfs_path(ipfs_path: &str) -> Option<String> {
-    let (_, relative_path) = parse_ipfs_path(ipfs_path)?;
-    preferred_file_name_from_relative_path(&relative_path)
 }
 
 async fn resolve_sync_leaf_file_name(state: &AppState, ipfs_path: &str, bytes: &[u8]) -> String {
@@ -6029,42 +5823,6 @@ async fn send_relay_pin_failure(
     }
 }
 
-fn sanitize_custom_tag(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.len() > 48 {
-        return None;
-    }
-    let cleaned: String = trimmed.chars().filter(|c| !c.is_control()).collect();
-    if cleaned.is_empty() { None } else { Some(cleaned) }
-}
-
-fn csv_escape(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
-    }
-}
-
-fn format_bytes_human(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-    const TB: f64 = GB * 1024.0;
-    let v = bytes as f64;
-    if v >= TB {
-        format!("{:.2} TB", v / TB)
-    } else if v >= GB {
-        format!("{:.2} GB", v / GB)
-    } else if v >= MB {
-        format!("{:.1} MB", v / MB)
-    } else if v >= KB {
-        format!("{:.1} KB", v / KB)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
 async fn diagnose_single_pin(
     AxumPath(cid): AxumPath<String>,
     State(state): State<AppState>,
@@ -6425,15 +6183,6 @@ async fn artist_summary_handler(State(state): State<AppState>) -> Json<ArtistSum
         top_artists,
         total_copies_pinned: total_copies,
     })
-}
-
-fn escape_html(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 const PAGE_STYLE: &str = r#"
@@ -8721,8 +8470,4 @@ fn render_page(title: &str, body_html: &str) -> String {
     );
     out.push_str("</div>\n</body>\n</html>");
     out
-}
-
-fn format_timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }

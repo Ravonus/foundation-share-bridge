@@ -15,5 +15,6 @@
 pub(crate) mod app;
 pub(crate) mod error;
 pub(crate) mod inline;
+pub(crate) mod util;
 
 pub use inline::run;
