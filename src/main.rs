@@ -2054,14 +2054,21 @@ async fn settings_page(
         .remote_pinning_service_url
         .clone()
         .unwrap_or_default();
-    let remote_token_state = match config
+    let token_saved = config
         .remote_pinning_access_token
         .as_deref()
         .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-    {
-        true => "Access token is saved. Leave blank to keep current value, or enter a new token to replace.".to_string(),
-        false => "No access token saved yet.".to_string(),
+        .unwrap_or(false);
+    let (token_badge, token_placeholder) = if token_saved {
+        (
+            r#"<span class="token-badge saved" title="A token is saved">saved</span>"#,
+            "•••••••• leave blank to keep",
+        )
+    } else {
+        (
+            r#"<span class="token-badge empty" title="No token saved">empty</span>"#,
+            "Paste token",
+        )
     };
 
     let flash_block = if query.saved.as_deref() == Some("1") {
@@ -2099,217 +2106,168 @@ async fn settings_page(
     let current_external_gateway = escape_html(&config.public_gateway_base_url);
 
     let gateway_helper = {
-        let hostname_help = match detected_public_ipv4.as_deref() {
-            Some(ip) => format!(
-                "If you own a hostname, point an A record like <code>ipfs.example.com</code> at <code>{}</code>, then click \"Use hostname\".",
-                escape_html(ip)
-            ),
-            None => "Type a DDNS or custom hostname here, then click \"Use hostname\" to fill the gateway URL below.".to_string(),
-        };
-
-        let ip_action = detected_public_ipv4
+        let detected_ip_line = detected_public_ipv4
             .as_deref()
             .map(|ip| {
                 format!(
-                    r#"<button type="button" class="btn ghost" id="gateway_fill_ip" data-gateway-url="{}">Use detected IP</button>"#,
-                    escape_html(&build_direct_ip_gateway_base_url(ip))
+                    r#"<div class="gw-detected">Detected public IP <code>{ip}</code> · <button type="button" class="gw-link" id="gateway_fill_ip" data-gateway-url="{url}">Use IP directly</button></div>"#,
+                    ip = escape_html(ip),
+                    url = escape_html(&build_direct_ip_gateway_base_url(ip)),
                 )
             })
-            .unwrap_or_else(|| {
-                r#"<span class="muted gateway-helper-note">Public IPv4 detection is unavailable right now. You can still type a hostname or edit the full URL manually.</span>"#.to_string()
-            });
+            .unwrap_or_else(|| r#"<div class="gw-detected muted">Public IPv4 not detected.</div>"#.to_string());
 
         format!(
-            r#"<div class="gateway-helper">
-  <p class="eyebrow">Quick fill</p>
-  <h3>Hostname first, IP if needed</h3>
-  <p class="muted settings-copy">Use a hostname if you have one. If not, you can fill the external gateway with your detected public IP and adjust the full URL below if your gateway uses a different port or protocol.</p>
-  <label class="field">
-    <span>Gateway hostname</span>
-    <input type="text" id="gateway_hostname_input" placeholder="ipfs.example.com or studio.ddns.net" />
-    <small class="field-help">{hostname_help}</small>
-  </label>
-  <div class="btn-row gateway-helper-actions">
-    <button type="button" class="btn ghost" id="gateway_fill_hostname">Use hostname</button>
-    {ip_action}
+            r#"<details class="gw-helper">
+  <summary>Help me build this URL</summary>
+  <div class="gw-helper-body">
+    <div class="gw-row">
+      <input type="text" id="gateway_hostname_input" placeholder="ipfs.example.com" />
+      <button type="button" class="btn ghost" id="gateway_fill_hostname">Use hostname</button>
+    </div>
+    {detected_ip_line}
+    <div class="gw-preview">Preview · <code id="gateway_helper_preview_value">{current_external_gateway}</code></div>
   </div>
-  <p class="muted gateway-helper-preview">Next pinned gateway base: <code id="gateway_helper_preview_value">{current_external_gateway}</code></p>
-</div>"#,
-            hostname_help = hostname_help,
-            ip_action = ip_action,
+</details>"#,
+            detected_ip_line = detected_ip_line,
             current_external_gateway = current_external_gateway,
         )
     };
 
-    let gateway_dns_card = match detected_public_ipv4.as_deref() {
-        Some(ip) => {
-            let direct_ip_gateway = build_direct_ip_gateway_base_url(ip);
-            format!(
-                r#"<section class="card">
-          <p class="eyebrow">Gateway DNS</p>
-          <h2>Point a hostname at this helper</h2>
-          <p class="muted settings-copy">If you want cleaner pinned links, create an A record for something like <code>ipfs.example.com</code> and point it at your public IP. If you do not have a hostname yet, the detected IP button above fills a direct gateway URL for you.</p>
-          <dl class="kv" style="margin-top: 16px;">
-            <dt>Detected public IP</dt><dd><code>{ip}</code></dd>
-            <dt>Example A record</dt><dd><code>ipfs.example.com → {ip}</code></dd>
-            <dt>Direct IP fallback</dt><dd><code>{direct_ip_gateway}</code></dd>
-          </dl>
-        </section>"#,
-                ip = escape_html(ip),
-                direct_ip_gateway = escape_html(&direct_ip_gateway),
-            )
-        }
-        None => r#"<section class="card">
-          <p class="eyebrow">Gateway DNS</p>
-          <h2>Hostname or direct IP</h2>
-          <p class="muted settings-copy">We could not detect a public IPv4 address right now, but the quick-fill controls still help: type a hostname you control to build the external gateway URL automatically, or edit the full URL manually if you already know your public IP.</p>
-        </section>"#
-            .to_string(),
-    };
+    let _ = (linked_device, linked_at, yaml_path);
 
     let body = format!(
-        r#"<main class="shell">
+        r#"<main class="shell narrow settings-shell">
   <div class="stack">
-    <section class="section-head">
-      <p class="eyebrow">Bridge settings</p>
-      <h1>Configure how this helper saves, tests, and opens pinned media.</h1>
-      <p class="lead">These inputs edit the bridge&apos;s YAML config file behind the scenes. People should use this page, not hand-edit YAML, unless they want the advanced path.</p>
-      <div class="btn-row">
-        <a class="btn ghost" href="/">Back to dashboard</a>
-        <span class="{relay_class}">{relay_label}</span>
+    <header class="settings-head">
+      <div>
+        <p class="eyebrow">Settings</p>
+        <h1>Bridge preferences</h1>
       </div>
-    </section>
+      <div class="settings-head-meta">
+        <span class="{relay_class}">{relay_label}</span>
+        <a class="btn ghost" href="/">← Back</a>
+      </div>
+    </header>
 
     {flash}
     {relay_note}
 
-    <section class="settings-layout">
-      <form action="/settings/form" method="post" class="card settings-form">
-        <div class="settings-block">
-          <p class="eyebrow">Storage</p>
-          <h2>Saved copies on disk</h2>
-          <p class="muted settings-copy">Choose where synced copies live and whether the helper should maintain an on-disk mirror in addition to the IPFS pin.</p>
-          <label class="field">
-            <span>Download folder</span>
-            <input type="text" name="download_root_dir" value="{download_root_dir}" placeholder="/Users/you/Archive Pins" />
-            <small class="field-help">When sync is enabled, each watched CID is mirrored into this folder.</small>
-          </label>
-          <label class="checkbox-row">
+    <form action="/settings/form" method="post" class="settings-form-v2" id="settings-form-v2">
+      <section class="settings-card">
+        <h2>Storage</h2>
+        <div class="settings-field">
+          <label for="field_download_root_dir">Download folder</label>
+          <input type="text" id="field_download_root_dir" name="download_root_dir" value="{download_root_dir}" placeholder="/Users/you/Archive Pins" spellcheck="false" />
+        </div>
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <strong>Keep synced copies on disk</strong>
+            <span>Mirror each pin into the download folder.</span>
+          </div>
+          <label class="toggle" aria-label="Keep synced copies on disk">
             <input type="checkbox" name="sync_enabled" value="1" {sync_checked} />
-            <span>
-              <strong>Keep synced copies on disk</strong>
-              <small>Turn this on if you want the helper to write rescued media into your download folder too.</small>
-            </span>
-          </label>
-          <label class="field">
-            <span>Storage quota (GB)</span>
-            <input type="number" step="0.1" min="0" name="storage_quota_gb" value="{storage_quota_gb}" placeholder="50" />
-            <small class="field-help">Optional. The dashboard shows how close the IPFS repo is to this limit. Leave blank for no quota.</small>
-          </label>
-          <label class="field">
-            <span>Max retry attempts per pin</span>
-            <input type="number" step="1" min="1" max="20" name="max_retry_attempts" value="{max_retry_attempts}" placeholder="10" />
-            <small class="field-help">When a pin fails this many times in a row, the bridge escalates to the remote pinning service (if configured).</small>
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
           </label>
         </div>
+        <div class="settings-pair">
+          <div class="settings-field">
+            <label for="field_storage_quota_gb">Quota (GB)</label>
+            <div class="num-stepper">
+              <button type="button" data-step="-1" aria-label="Decrease">−</button>
+              <input type="number" id="field_storage_quota_gb" step="0.1" min="0" name="storage_quota_gb" value="{storage_quota_gb}" placeholder="none" inputmode="decimal" />
+              <button type="button" data-step="1" aria-label="Increase">+</button>
+            </div>
+          </div>
+          <div class="settings-field">
+            <label for="field_max_retry_attempts">Max retries</label>
+            <div class="num-stepper">
+              <button type="button" data-step="-1" aria-label="Decrease">−</button>
+              <input type="number" id="field_max_retry_attempts" step="1" min="1" max="20" name="max_retry_attempts" value="{max_retry_attempts}" placeholder="10" inputmode="numeric" />
+              <button type="button" data-step="1" aria-label="Increase">+</button>
+            </div>
+          </div>
+        </div>
+      </section>
 
-        <div class="settings-block">
-          <p class="eyebrow">Remote pinning</p>
-          <h2>Failover to a pinning service</h2>
-          <p class="muted settings-copy">When a local pin ultimately fails, send the CID to an IPFS Pinning Service API (Pinata, web3.storage gateway, filebase) so the work does not vanish. Any service that speaks the standard pinning-service HTTP API will work.</p>
-          <label class="checkbox-row">
+      <section class="settings-card">
+        <h2>Gateways</h2>
+        <div class="settings-field">
+          <label for="field_local_gateway_base_url">Local gateway</label>
+          <input type="url" id="field_local_gateway_base_url" name="local_gateway_base_url" value="{local_gateway_base_url}" placeholder="http://127.0.0.1:8080" spellcheck="false" />
+        </div>
+        <div class="settings-field">
+          <label for="public_gateway_base_url">External gateway</label>
+          <input type="url" id="public_gateway_base_url" name="public_gateway_base_url" value="{public_gateway_base_url}" placeholder="https://ipfs.example.com" spellcheck="false" />
+        </div>
+        {gateway_helper}
+      </section>
+
+      <section class="settings-card">
+        <h2>Remote pin fallback</h2>
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <strong>Enable remote fallback</strong>
+            <span>Used only after local retries are exhausted.</span>
+          </div>
+          <label class="toggle" aria-label="Enable remote pin fallback">
             <input type="checkbox" name="remote_pinning_enabled" value="1" {remote_pinning_checked} />
-            <span>
-              <strong>Enable remote pin fallback</strong>
-              <small>Only triggers after the local repair loop has exhausted its retry budget.</small>
-            </span>
-          </label>
-          <label class="field">
-            <span>Service name (label)</span>
-            <input type="text" name="remote_pinning_service_name" value="{remote_pinning_service_name}" placeholder="Pinata" />
-          </label>
-          <label class="field">
-            <span>Service API base URL</span>
-            <input type="url" name="remote_pinning_service_url" value="{remote_pinning_service_url}" placeholder="https://api.pinata.cloud/psa" />
-            <small class="field-help">The bridge POSTs to <code>{{base}}/pins</code>. Use the Pinning Services API endpoint, not a dashboard URL.</small>
-          </label>
-          <label class="field">
-            <span>Access token</span>
-            <input type="password" name="remote_pinning_access_token" value="{remote_pinning_access_token_display}" placeholder="••••••••••" autocomplete="off" />
-            <small class="field-help">Stored in <code>bridge-config.yaml</code>. {remote_token_state}</small>
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
           </label>
         </div>
-
-        <div class="settings-block">
-          <p class="eyebrow">Gateways</p>
-          <h2>Preview and share links</h2>
-          <p class="muted settings-copy">The helper uses the local gateway for on-machine previews and the external gateway for the "Open pinned" button. Inventory cards also show a separate public IPFS link for quick sharing.</p>
-          <label class="field">
-            <span>Local gateway base URL</span>
-            <input type="url" name="local_gateway_base_url" value="{local_gateway_base_url}" placeholder="http://127.0.0.1:8080" />
-            <small class="field-help">Used by the local browser UI when it can reach your own gateway.</small>
-          </label>
-          <label class="field">
-            <span>External pinned gateway URL</span>
-            <input type="url" id="public_gateway_base_url" name="public_gateway_base_url" value="{public_gateway_base_url}" placeholder="https://ipfs.io" />
-            <small class="field-help">Point this at your own hostname, DDNS name, reverse proxy, or direct public IP gateway so "Open pinned" uses your route.</small>
-          </label>
-          {gateway_helper}
+        <div class="settings-pair">
+          <div class="settings-field">
+            <label for="field_remote_pinning_service_name">Service name</label>
+            <input type="text" id="field_remote_pinning_service_name" name="remote_pinning_service_name" value="{remote_pinning_service_name}" placeholder="Pinata" spellcheck="false" />
+          </div>
+          <div class="settings-field">
+            <label for="field_remote_pinning_service_url">API base URL</label>
+            <input type="url" id="field_remote_pinning_service_url" name="remote_pinning_service_url" value="{remote_pinning_service_url}" placeholder="https://api.pinata.cloud/psa" spellcheck="false" />
+          </div>
         </div>
+        <div class="settings-field">
+          <label for="field_remote_pinning_access_token">Access token {token_badge}</label>
+          <div class="password-field">
+            <input type="password" id="field_remote_pinning_access_token" name="remote_pinning_access_token" value="" placeholder="{token_placeholder}" autocomplete="off" spellcheck="false" />
+            <button type="button" class="password-reveal" data-reveal>Show</button>
+          </div>
+        </div>
+      </section>
 
-        <div class="settings-block">
-          <p class="eyebrow">Relay</p>
-          <h2>Archive connection</h2>
-          <p class="muted settings-copy">These settings control how this helper pairs with the archive site and how it identifies itself when linked.</p>
-          <label class="checkbox-row">
+      <section class="settings-card">
+        <h2>Archive relay</h2>
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <strong>Enable relay link</strong>
+            <span>Lets the archive site hand work to this helper.</span>
+          </div>
+          <label class="toggle" aria-label="Enable archive relay link">
             <input type="checkbox" name="relay_enabled" value="1" {relay_checked} />
-            <span>
-              <strong>Enable archive relay link</strong>
-              <small>Leave this on for normal use so archive pages can hand work to this helper.</small>
-            </span>
-          </label>
-          <label class="field">
-            <span>Archive server URL</span>
-            <input type="url" name="relay_server_url" value="{relay_server_url}" placeholder="https://foundation.agorix.io" />
-            <small class="field-help">Changing this resets the current relay pairing so the helper can link to the new server cleanly.</small>
-          </label>
-          <label class="field">
-            <span>Desktop name</span>
-            <input type="text" name="relay_device_name" value="{relay_device_name}" placeholder="Studio MacBook" />
-            <small class="field-help">This is what the archive site shows when choosing where to send saved works.</small>
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
           </label>
         </div>
-
-        <div class="btn-row settings-actions">
-          <button type="submit" class="btn">Save settings</button>
-          <a class="btn ghost" href="/">Cancel</a>
+        <div class="settings-pair">
+          <div class="settings-field">
+            <label for="field_relay_server_url">Archive server URL</label>
+            <input type="url" id="field_relay_server_url" name="relay_server_url" value="{relay_server_url}" placeholder="https://foundation.agorix.io" spellcheck="false" />
+          </div>
+          <div class="settings-field">
+            <label for="field_relay_device_name">Desktop name</label>
+            <input type="text" id="field_relay_device_name" name="relay_device_name" value="{relay_device_name}" placeholder="Studio MacBook" />
+          </div>
         </div>
-      </form>
+      </section>
 
-      <aside class="settings-side">
-        <section class="card">
-          <p class="eyebrow">Saved backend</p>
-          <h2>Still YAML underneath</h2>
-          <p class="muted settings-copy">The helper still stores everything in <code>bridge-config.yaml</code>. This page simply edits that file for the user.</p>
-          <dl class="kv" style="margin-top: 16px;">
-            <dt>Config file</dt><dd><code>{yaml_path}</code></dd>
-            <dt>Relay status</dt><dd>{relay_label}</dd>
-            <dt>Linked device</dt><dd>{linked_device}</dd>
-            <dt>Last linked</dt><dd>{linked_at}</dd>
-          </dl>
-        </section>
-
-        <section class="card">
-          <p class="eyebrow">External URLs</p>
-          <h2>Friendly pinned links</h2>
-          <p class="muted settings-copy">If you want the helper to open media through your own hostname, point DNS at this machine and use that hostname for the external gateway. If you do not have a hostname yet, the helper can fill a direct external-IP URL instead. The inventory UI keeps that route separate from the public IPFS fallback link.</p>
-        </section>
-        {gateway_dns_card}
-      </aside>
-    </section>
+      <div class="settings-save-bar" id="settings-save-bar">
+        <span class="settings-save-hint" id="settings-save-hint">All changes saved.</span>
+        <button type="submit" class="btn">Save settings</button>
+      </div>
+    </form>
   </div>
 </main>
-<script>{settings_gateway_script}</script>"#,
+<style>{settings_css}</style>
+<script>{settings_gateway_script}</script>
+<script>{settings_controls_script}</script>"#,
         relay_class = relay_status_class,
         relay_label = escape_html(relay_status_label),
         flash = flash_block,
@@ -2321,19 +2279,17 @@ async fn settings_page(
         remote_pinning_checked = remote_pinning_checked,
         remote_pinning_service_name = escape_html(&remote_pinning_service_name_display),
         remote_pinning_service_url = escape_html(&remote_pinning_service_url_display),
-        remote_pinning_access_token_display = "",
-        remote_token_state = escape_html(&remote_token_state),
+        token_badge = token_badge,
+        token_placeholder = token_placeholder,
         local_gateway_base_url = escape_html(&config.local_gateway_base_url),
         public_gateway_base_url = escape_html(&config.public_gateway_base_url),
         relay_checked = relay_checked,
         relay_server_url = escape_html(&config.relay_server_url),
         relay_device_name = escape_html(&config.relay_device_name),
-        yaml_path = escape_html(&yaml_path),
-        linked_device = escape_html(linked_device),
-        linked_at = escape_html(&linked_at),
         gateway_helper = gateway_helper,
-        gateway_dns_card = gateway_dns_card,
+        settings_css = SETTINGS_PAGE_STYLE,
         settings_gateway_script = SETTINGS_GATEWAY_HELPER_SCRIPT,
+        settings_controls_script = SETTINGS_CONTROLS_SCRIPT,
     );
 
     Ok(Html(render_page("Bridge settings", &body)))
@@ -8886,6 +8842,134 @@ const ROOT_AUTOLINK_SCRIPT: &str = r####"
   });
 
   tick();
+})();
+"####;
+
+const SETTINGS_PAGE_STYLE: &str = r####"
+.settings-shell { padding-top: 32px; padding-bottom: 80px; max-width: 720px; }
+.settings-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 28px; padding-bottom: 20px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.settings-head h1 { font-size: clamp(1.75rem, 3vw, 2.1rem); margin-top: 4px; }
+.settings-head-meta { display: inline-flex; gap: 10px; align-items: center; }
+.settings-form-v2 { display: grid; gap: 18px; }
+.settings-card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 22px 24px; display: grid; gap: 18px; }
+.settings-card h2 { font-size: 1.1rem; font-family: var(--font-fraunces), ui-serif, Georgia, serif; font-weight: 500; color: var(--ink); letter-spacing: -0.01em; padding-bottom: 8px; border-bottom: 1px solid var(--line); margin: 0; }
+.settings-field { display: grid; gap: 6px; }
+.settings-field label { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.68rem; letter-spacing: 0.22em; text-transform: uppercase; color: var(--muted); }
+.settings-field input[type="text"],
+.settings-field input[type="url"],
+.settings-field input[type="number"],
+.settings-field input[type="password"] { width: 100%; padding: 11px 13px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--surface-quiet); color: var(--ink); font: inherit; font-size: 0.92rem; transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease; }
+.settings-field input[type="text"]:focus,
+.settings-field input[type="url"]:focus,
+.settings-field input[type="number"]:focus,
+.settings-field input[type="password"]:focus { outline: none; border-color: var(--brand-green); background: var(--surface); box-shadow: 0 0 0 3px color-mix(in oklab, var(--brand-green) 22%, transparent); }
+.settings-pair { display: grid; gap: 14px; grid-template-columns: 1fr; }
+@media (min-width: 620px) { .settings-pair { grid-template-columns: 1fr 1fr; } }
+.settings-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 6px 0; border-top: 1px solid var(--line); padding-top: 16px; }
+.settings-row:first-of-type { border-top: 0; padding-top: 0; }
+.settings-row-text strong { display: block; color: var(--ink); font-size: 0.96rem; font-weight: 500; }
+.settings-row-text span { display: block; color: var(--muted); font-size: 0.82rem; margin-top: 2px; }
+.toggle { position: relative; display: inline-flex; flex: 0 0 auto; cursor: pointer; user-select: none; }
+.toggle input { position: absolute; opacity: 0; pointer-events: none; width: 0; height: 0; }
+.toggle-track { display: inline-block; width: 46px; height: 26px; background: var(--line-strong); border-radius: 999px; position: relative; transition: background 180ms ease; }
+.toggle-thumb { position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; background: var(--surface); border-radius: 999px; box-shadow: 0 1px 3px rgba(0,0,0,0.22); transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1); }
+.toggle input:checked + .toggle-track { background: var(--brand-green); }
+.toggle input:checked + .toggle-track .toggle-thumb { transform: translateX(20px); }
+.toggle input:focus-visible + .toggle-track { box-shadow: 0 0 0 3px color-mix(in oklab, var(--brand-green) 30%, transparent); }
+.num-stepper { display: grid; grid-template-columns: 40px 1fr 40px; align-items: stretch; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-quiet); overflow: hidden; transition: border-color 140ms ease, box-shadow 140ms ease; }
+.num-stepper:focus-within { border-color: var(--brand-green); box-shadow: 0 0 0 3px color-mix(in oklab, var(--brand-green) 22%, transparent); }
+.num-stepper input { border: 0; background: transparent; text-align: center; padding: 11px 4px; font-variant-numeric: tabular-nums; appearance: textfield; -moz-appearance: textfield; }
+.num-stepper input:focus { outline: none; box-shadow: none; border: 0; background: transparent; }
+.num-stepper input::-webkit-outer-spin-button,
+.num-stepper input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.num-stepper button { background: transparent; border: 0; color: var(--muted); font-size: 1.05rem; cursor: pointer; font-weight: 500; transition: color 140ms ease, background 140ms ease; }
+.num-stepper button:hover { color: var(--ink); background: color-mix(in oklab, var(--ink) 6%, transparent); }
+.num-stepper button:first-child { border-right: 1px solid var(--line); }
+.num-stepper button:last-child { border-left: 1px solid var(--line); }
+.password-field { position: relative; }
+.password-field input { padding-right: 68px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; letter-spacing: 0.12em; }
+.password-reveal { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); background: transparent; border: 0; color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.68rem; letter-spacing: 0.16em; text-transform: uppercase; cursor: pointer; padding: 6px 10px; border-radius: 5px; transition: color 140ms ease, background 140ms ease; }
+.password-reveal:hover { color: var(--ink); background: color-mix(in oklab, var(--ink) 6%, transparent); }
+.token-badge { display: inline-flex; padding: 2px 7px; border-radius: 999px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.58rem; letter-spacing: 0.2em; text-transform: uppercase; vertical-align: middle; margin-left: 8px; }
+.token-badge.saved { background: var(--tint-ok); color: var(--ok); }
+.token-badge.empty { background: var(--tint-warn); color: var(--warn); }
+.gw-helper { border: 1px dashed var(--line-strong); border-radius: 10px; padding: 0; background: var(--surface-quiet); overflow: hidden; }
+.gw-helper > summary { cursor: pointer; list-style: none; color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.72rem; letter-spacing: 0.18em; text-transform: uppercase; padding: 12px 16px; display: flex; align-items: center; gap: 10px; }
+.gw-helper > summary::-webkit-details-marker { display: none; }
+.gw-helper > summary::before { content: "+"; display: inline-flex; width: 18px; height: 18px; align-items: center; justify-content: center; border-radius: 999px; background: color-mix(in oklab, var(--ink) 8%, transparent); color: var(--ink); font-family: ui-monospace; transition: transform 180ms ease; }
+.gw-helper[open] > summary::before { content: "−"; }
+.gw-helper[open] > summary { color: var(--ink); border-bottom: 1px solid var(--line); }
+.gw-helper-body { display: grid; gap: 12px; padding: 14px 16px; }
+.gw-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; }
+.gw-row input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink); font: inherit; font-size: 0.9rem; }
+.gw-row input:focus { outline: none; border-color: var(--brand-green); box-shadow: 0 0 0 3px color-mix(in oklab, var(--brand-green) 22%, transparent); }
+.gw-detected { font-size: 0.84rem; color: var(--body); }
+.gw-link { background: transparent; border: 0; padding: 0; color: var(--brand-green); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; font: inherit; font-size: inherit; }
+.gw-link:hover { color: var(--brand-green-bright); }
+.gw-preview { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.74rem; letter-spacing: 0.08em; color: var(--muted); border-top: 1px dashed var(--line); padding-top: 10px; }
+.gw-preview code { word-break: break-all; }
+.settings-save-bar { display: flex; align-items: center; justify-content: flex-end; gap: 14px; padding: 12px 0 4px; position: sticky; bottom: 14px; background: color-mix(in oklab, var(--bg) 88%, transparent); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); border-radius: 10px; padding-left: 16px; padding-right: 16px; border: 1px solid transparent; transition: border-color 180ms ease, box-shadow 180ms ease; }
+.settings-save-bar.is-dirty { border-color: var(--line-strong); box-shadow: 0 10px 28px rgba(0,0,0,0.08); }
+.settings-save-hint { color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.72rem; letter-spacing: 0.16em; text-transform: uppercase; }
+.settings-save-bar.is-dirty .settings-save-hint { color: var(--warn); }
+.settings-save-bar .btn { min-width: 160px; justify-content: center; }
+"####;
+
+const SETTINGS_CONTROLS_SCRIPT: &str = r####"
+(() => {
+  // Number steppers
+  document.querySelectorAll(".num-stepper").forEach((wrap) => {
+    const input = wrap.querySelector("input[type=number]");
+    if (!input) return;
+    wrap.querySelectorAll("button[data-step]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const step = Number(btn.getAttribute("data-step")) || 0;
+        const rawStep = Number(input.getAttribute("step")) || 1;
+        const min = input.getAttribute("min") !== null ? Number(input.getAttribute("min")) : -Infinity;
+        const max = input.getAttribute("max") !== null ? Number(input.getAttribute("max")) : Infinity;
+        const current = input.value.trim() === "" ? (step > 0 ? min === -Infinity ? 0 : min : 0) : Number(input.value);
+        let next = current + step * rawStep;
+        if (next < min) next = min;
+        if (next > max) next = max;
+        const decimals = rawStep < 1 ? (String(rawStep).split(".")[1] || "").length : 0;
+        input.value = decimals > 0 ? next.toFixed(decimals) : String(Math.round(next));
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    });
+  });
+
+  // Password reveal
+  document.querySelectorAll("[data-reveal]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const field = btn.closest(".password-field");
+      if (!field) return;
+      const input = field.querySelector("input");
+      if (!input) return;
+      const showing = input.getAttribute("type") === "text";
+      input.setAttribute("type", showing ? "password" : "text");
+      btn.textContent = showing ? "Show" : "Hide";
+    });
+  });
+
+  // Dirty-form tracker
+  const form = document.getElementById("settings-form-v2");
+  const bar = document.getElementById("settings-save-bar");
+  const hint = document.getElementById("settings-save-hint");
+  if (form && bar && hint) {
+    const initial = new FormData(form);
+    const initialEntries = Array.from(initial.entries()).map(([k, v]) => `${k}=${v}`).sort().join("|");
+    const measure = () => {
+      const current = new FormData(form);
+      const currentEntries = Array.from(current.entries()).map(([k, v]) => `${k}=${v}`).sort().join("|");
+      const dirty = currentEntries !== initialEntries;
+      bar.classList.toggle("is-dirty", dirty);
+      hint.textContent = dirty ? "Unsaved changes" : "All changes saved.";
+    };
+    form.addEventListener("input", measure);
+    form.addEventListener("change", measure);
+    measure();
+  }
 })();
 "####;
 
