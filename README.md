@@ -1,5 +1,8 @@
 # foundation-share-bridge
 
+[![CI](https://github.com/Ravonus/foundation-share-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/Ravonus/foundation-share-bridge/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
+
 Small cross-platform Rust service for handing website-triggered Foundation rescue shares to a local IPFS node.
 
 This repo is the public source home for the desktop bridge. GitHub releases are
@@ -103,37 +106,37 @@ Nothing is installed on a machine until someone explicitly runs an installer.
 ### macOS and Linux
 
 ```bash
-./scripts/install.sh
+./scripts/install/install.sh
 ```
 
 Remove it later:
 
 ```bash
-./scripts/uninstall.sh
+./scripts/uninstall/uninstall.sh
 ```
 
 Delete the local watched-pin state and bundled Kubo repo too:
 
 ```bash
-./scripts/uninstall.sh --purge-data
+./scripts/uninstall/uninstall.sh --purge-data
 ```
 
 ### Windows
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\install\install.ps1
 ```
 
 Remove it later:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\uninstall\uninstall.ps1
 ```
 
 Delete the local watched-pin state and bundled Kubo repo too:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1 --purge-data
+powershell -ExecutionPolicy Bypass -File .\scripts\uninstall\uninstall.ps1 --purge-data
 ```
 
 ## What each installer sets up
@@ -188,7 +191,7 @@ loginctl enable-linger "$USER"
 ### macOS command bundle
 
 ```bash
-./scripts/package-macos-installer.sh
+./scripts/package/package-macos-installer.sh
 ```
 
 That creates:
@@ -199,7 +202,7 @@ That creates:
 ### macOS pkg flow
 
 ```bash
-./scripts/package-macos-pkg.sh
+./scripts/package/package-macos-pkg.sh
 ```
 
 That creates:
@@ -210,7 +213,7 @@ If you also want a signed pkg, provide a signing identity first:
 
 ```bash
 MACOS_INSTALLER_SIGNING_IDENTITY="Developer ID Installer: Your Name (TEAMID)" \
-  ./scripts/package-macos-pkg.sh
+  ./scripts/package/package-macos-pkg.sh
 ```
 
 That additionally creates:
@@ -229,8 +232,8 @@ and tries to auto-run the per-user background install for the currently logged-i
 Run this on Linux, or provide a prebuilt Linux binary:
 
 ```bash
-./scripts/package-linux-bundle.sh
-./scripts/package-linux-bundle.sh --binary /path/to/foundation-share-bridge
+./scripts/package/package-linux-bundle.sh
+./scripts/package/package-linux-bundle.sh --binary /path/to/foundation-share-bridge
 ```
 
 That creates:
@@ -243,7 +246,7 @@ That creates:
 Run this on Windows, or provide a prebuilt Windows binary:
 
 ```bash
-./scripts/package-windows-bundle.sh --binary /path/to/foundation-share-bridge.exe
+./scripts/package/package-windows-bundle.sh --binary /path/to/foundation-share-bridge.exe
 ```
 
 That creates:
@@ -254,7 +257,7 @@ That creates:
 ### Build everything you can from one command
 
 ```bash
-./scripts/package-release-bundles.sh
+./scripts/package/package-release-bundles.sh
 ```
 
 On the current host OS it builds native artifacts automatically. You can also
@@ -263,7 +266,7 @@ feed in prebuilt foreign binaries:
 ```bash
 FOUNDATION_SHARE_BRIDGE_BINARY_LINUX=/path/to/foundation-share-bridge \
 FOUNDATION_SHARE_BRIDGE_BINARY_WINDOWS=/path/to/foundation-share-bridge.exe \
-./scripts/package-release-bundles.sh
+./scripts/package/package-release-bundles.sh
 ```
 
 If you want to cross-compile foreign binaries instead of providing prebuilt ones,
@@ -368,3 +371,32 @@ curl -X POST http://127.0.0.1:43128/share/profile \
     ]
   }'
 ```
+
+## Development
+
+```sh
+cargo build
+cargo run
+```
+
+### Lint before committing
+
+```sh
+bash scripts/lint/run-all.sh
+```
+
+Runs `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, `cargo deny check` (if installed), plus repo-level guards for file size (<=600 lines), folder fanout (<=6 children), and monolith heuristic.
+
+### Code conventions (enforced by CI)
+
+- Files: no `.rs` over 600 lines (warn at 400)
+- Functions: no function over 80 lines
+- Arguments: no function with more than 4 parameters
+- Folders: no directory under `src/` or `scripts/` with more than 6 direct children
+- No `unwrap` / `panic!` / `dbg!` / `unsafe`; `expect` warn-only with an invariant comment
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full guide.
+
+## License
+
+Apache-2.0 — see [LICENSE](./LICENSE).

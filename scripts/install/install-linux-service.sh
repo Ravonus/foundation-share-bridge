@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PAYLOAD_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PAYLOAD_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SERVICE_NAME="Foundation Share Bridge"
 SERVICE_ID="foundation-share-bridge"
 RUNTIME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/foundation-share-bridge"
@@ -81,11 +81,25 @@ build_or_resolve_binary() {
   printf '%s\n' "$source_root/target/release/foundation-share-bridge"
 }
 
+resolve_scripts_asset() {
+  local source_root="$1"
+  local subfolder="$2"
+  local file_name="$3"
+  local nested="$source_root/scripts/$subfolder/$file_name"
+  local flat="$source_root/scripts/$file_name"
+
+  if [ -f "$nested" ]; then
+    printf '%s\n' "$nested"
+  else
+    printf '%s\n' "$flat"
+  fi
+}
+
 SOURCE_ROOT="$(resolve_source_root)"
 BINARY_SOURCE="$(build_or_resolve_binary "$SOURCE_ROOT")"
 COMPOSE_SOURCE="$SOURCE_ROOT/docker-compose.yml"
-RUN_SCRIPT_SOURCE="$SOURCE_ROOT/scripts/run-bridge-stack-linux.sh"
-DEEP_LINK_SCRIPT_SOURCE="$SOURCE_ROOT/scripts/handle-deep-link.sh"
+RUN_SCRIPT_SOURCE="$(resolve_scripts_asset "$SOURCE_ROOT" "runtime" "run-bridge-stack-linux.sh")"
+DEEP_LINK_SCRIPT_SOURCE="$(resolve_scripts_asset "$SOURCE_ROOT" "runtime" "handle-deep-link.sh")"
 
 if [ ! -x "$BINARY_SOURCE" ]; then
   echo "Bridge binary was not found at $BINARY_SOURCE" >&2

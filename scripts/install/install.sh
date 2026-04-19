@@ -13,10 +13,10 @@ case "$OS_NAME" in
     ;;
   *)
     cat >&2 <<EOF
-Unsupported platform for scripts/install.sh: $OS_NAME
+Unsupported platform for scripts/install/install.sh: $OS_NAME
 
 On Windows, run:
-  powershell -ExecutionPolicy Bypass -File .\\scripts\\install.ps1
+  powershell -ExecutionPolicy Bypass -File .\\scripts\\install\\install.ps1
 EOF
     exit 1
     ;;

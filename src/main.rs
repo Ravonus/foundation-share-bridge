@@ -1,3 +1,14 @@
+//! Foundation Share Bridge — desktop IPFS pinning companion.
+//!
+//! This file is being split into ~25 focused modules over refactor stages 1–10;
+//! the transitional allows below are removed in stage 11 once the monolith is gone.
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::cognitive_complexity)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::pedantic)]
+#![allow(clippy::nursery)]
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
@@ -747,34 +758,26 @@ fn parse_pairing_deep_link(raw: &str) -> anyhow::Result<PairingDeepLink> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("pairing_code is required"))?;
-    let device_name = device_name
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let device_name =
+        device_name.map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
 
-    Ok(PairingDeepLink {
-        relay_server_url,
-        pairing_code,
-        device_name,
-    })
+    Ok(PairingDeepLink { relay_server_url, pairing_code, device_name })
 }
 
 async fn wait_for_local_bridge_ready(client: &Client, bridge_origin: &str) -> anyhow::Result<()> {
     let health_url = format!("{}/health", trim_trailing_slash(bridge_origin));
 
     for _ in 0..40 {
-        if let Ok(response) = client.get(&health_url).send().await {
-            if response.status().is_success() {
-                return Ok(());
-            }
+        if let Ok(response) = client.get(&health_url).send().await
+            && response.status().is_success()
+        {
+            return Ok(());
         }
 
         sleep(Duration::from_millis(500)).await;
     }
 
-    Err(anyhow!(
-        "The local bridge did not come online at {} in time.",
-        health_url
-    ))
+    Err(anyhow!("The local bridge did not come online at {} in time.", health_url))
 }
 
 async fn handle_deep_link_command(raw: &str) -> anyhow::Result<()> {
@@ -788,10 +791,7 @@ async fn handle_deep_link_command(raw: &str) -> anyhow::Result<()> {
     wait_for_local_bridge_ready(&client, &bridge_origin).await?;
 
     let response = client
-        .post(format!(
-            "{}/relay/link",
-            trim_trailing_slash(&bridge_origin)
-        ))
+        .post(format!("{}/relay/link", trim_trailing_slash(&bridge_origin)))
         .json(&serde_json::json!({
             "relay_server_url": deep_link.relay_server_url,
             "pairing_code": deep_link.pairing_code,
@@ -857,24 +857,15 @@ struct WatchPinInput {
 
 impl AppError {
     fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-        }
+        Self { status: StatusCode::BAD_REQUEST, message: message.into() }
     }
 
     fn unauthorized(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: message.into(),
-        }
+        Self { status: StatusCode::UNAUTHORIZED, message: message.into() }
     }
 
     fn internal(error: anyhow::Error) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: error.to_string(),
-        }
+        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: error.to_string() }
     }
 }
 
@@ -900,13 +891,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut args = env::args().skip(1);
-    if let Some(command) = args.next() {
-        if command == "handle-url" || command == "open-url" {
-            let raw_url = args
-                .next()
-                .ok_or_else(|| anyhow!("Usage: foundation-share-bridge handle-url <app-url>"))?;
-            return handle_deep_link_command(&raw_url).await;
-        }
+    if let Some(command) = args.next()
+        && (command == "handle-url" || command == "open-url")
+    {
+        let raw_url = args
+            .next()
+            .ok_or_else(|| anyhow!("Usage: foundation-share-bridge handle-url <app-url>"))?;
+        return handle_deep_link_command(&raw_url).await;
     }
 
     let host = env::var("BRIDGE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -984,20 +975,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/artists/summary", get(artist_summary_handler))
         .route("/sync/run", post(sync_now))
         .route("/ipfs/pin", post(pin_cid))
-        .route(
-            "/ipfs/add",
-            post(add_files).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
-        )
+        .route("/ipfs/add", post(add_files).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)))
         .route("/share/work", post(share_work))
         .route("/share/work/view", get(share_work_view))
         .route("/share/work/form", post(share_work_form))
         .route("/share/profile", post(share_profile))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_headers(Any)
-                .allow_methods(Any),
-        )
+        .layer(CorsLayer::new().allow_origin(Any).allow_headers(Any).allow_methods(Any))
         .layer(middleware::map_response(add_private_network_access_header))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -1007,17 +990,13 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("Unable to bind bridge listener on {address}"))?;
 
     info!("foundation-share-bridge listening on http://{address}");
-    axum::serve(listener, app)
-        .await
-        .context("Bridge server stopped unexpectedly")?;
+    axum::serve(listener, app).await.context("Bridge server stopped unexpectedly")?;
 
     Ok(())
 }
 
 fn bridge_state_file_from_env() -> anyhow::Result<PathBuf> {
-    if let Some(value) = env::var("BRIDGE_STATE_FILE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    if let Some(value) = env::var("BRIDGE_STATE_FILE").ok().filter(|value| !value.trim().is_empty())
     {
         return Ok(PathBuf::from(value));
     }
@@ -1027,9 +1006,8 @@ fn bridge_state_file_from_env() -> anyhow::Result<PathBuf> {
 }
 
 fn bridge_config_file_from_env(state_file: &Path) -> anyhow::Result<PathBuf> {
-    if let Some(value) = env::var("BRIDGE_CONFIG_FILE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    if let Some(value) =
+        env::var("BRIDGE_CONFIG_FILE").ok().filter(|value| !value.trim().is_empty())
     {
         return Ok(PathBuf::from(value));
     }
@@ -1061,20 +1039,14 @@ async fn load_persistent_state(path: &Path) -> anyhow::Result<BridgePersistentSt
     match fs::read_to_string(path).await {
         Ok(contents) => {
             serde_json::from_str::<BridgePersistentState>(&contents).with_context(|| {
-                format!(
-                    "Unable to parse persistent bridge state from {}",
-                    path.display()
-                )
+                format!("Unable to parse persistent bridge state from {}", path.display())
             })
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(BridgePersistentState::default())
         }
         Err(error) => Err(error).with_context(|| {
-            format!(
-                "Unable to read persistent bridge state at {}",
-                path.display()
-            )
+            format!("Unable to read persistent bridge state at {}", path.display())
         }),
     }
 }
@@ -1097,10 +1069,7 @@ fn default_bridge_config(state_file: &Path) -> BridgeConfig {
         sync_enabled: env::var("BRIDGE_SYNC_ENABLED")
             .ok()
             .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
+                matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
             })
             .unwrap_or(false),
         local_gateway_base_url: env::var("LOCAL_IPFS_GATEWAY_BASE_URL")
@@ -1114,10 +1083,7 @@ fn default_bridge_config(state_file: &Path) -> BridgeConfig {
         relay_enabled: env::var("BRIDGE_RELAY_ENABLED")
             .ok()
             .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
+                matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
             })
             .unwrap_or(false),
         relay_server_url: env::var("BRIDGE_RELAY_SERVER_URL")
@@ -1143,10 +1109,7 @@ fn default_bridge_config(state_file: &Path) -> BridgeConfig {
         remote_pinning_enabled: env::var("BRIDGE_REMOTE_PINNING_ENABLED")
             .ok()
             .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
+                matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
             })
             .unwrap_or(false),
         remote_pinning_service_name: env::var("BRIDGE_REMOTE_PINNING_SERVICE_NAME")
@@ -1163,10 +1126,7 @@ fn default_bridge_config(state_file: &Path) -> BridgeConfig {
 }
 
 fn bridge_config_uses_yaml(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|value| value.to_str()),
-        Some("yaml" | "yml")
-    )
+    matches!(path.extension().and_then(|value| value.to_str()), Some("yaml" | "yml"))
 }
 
 fn parse_bridge_config(contents: &str, path: &Path) -> anyhow::Result<BridgeConfig> {
@@ -1270,10 +1230,7 @@ async fn persist_bridge_state(state: &AppState) -> anyhow::Result<()> {
 
     let json = serde_json::to_vec_pretty(&snapshot).context("Unable to encode bridge state")?;
     fs::write(&state.state_file, json).await.with_context(|| {
-        format!(
-            "Unable to write persistent bridge state to {}",
-            state.state_file.display()
-        )
+        format!("Unable to write persistent bridge state to {}", state.state_file.display())
     })?;
 
     Ok(())
@@ -1292,19 +1249,13 @@ async fn persist_bridge_config(state: &AppState) -> anyhow::Result<()> {
         let yaml =
             serde_yaml::to_string(&snapshot).context("Unable to encode bridge config as YAML")?;
         fs::write(&state.config_file, yaml).await.with_context(|| {
-            format!(
-                "Unable to write bridge config to {}",
-                state.config_file.display()
-            )
+            format!("Unable to write bridge config to {}", state.config_file.display())
         })?;
     } else {
         let json =
             serde_json::to_vec_pretty(&snapshot).context("Unable to encode bridge config")?;
         fs::write(&state.config_file, json).await.with_context(|| {
-            format!(
-                "Unable to write bridge config to {}",
-                state.config_file.display()
-            )
+            format!("Unable to write bridge config to {}", state.config_file.display())
         })?;
     }
 
@@ -1313,10 +1264,7 @@ async fn persist_bridge_config(state: &AppState) -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn escape_notification_text(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', " ")
+    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")
 }
 
 #[cfg(target_os = "windows")]
@@ -1346,7 +1294,7 @@ async fn show_backup_notification(body: &str) -> anyhow::Result<()> {
             return Err(anyhow!("macOS notification command exited unsuccessfully"));
         }
 
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -1400,9 +1348,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             .context("Unable to launch Windows notification command")?;
 
         if !status.success() {
-            return Err(anyhow!(
-                "Windows notification command exited unsuccessfully"
-            ));
+            return Err(anyhow!("Windows notification command exited unsuccessfully"));
         }
 
         return Ok(());
@@ -1459,12 +1405,7 @@ fn spawn_relay_socket_loop(state: AppState) {
 
             if !config.relay_enabled
                 || config.relay_server_url.trim().is_empty()
-                || config
-                    .relay_device_token
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or("")
-                    .is_empty()
+                || config.relay_device_token.as_deref().map(str::trim).unwrap_or("").is_empty()
             {
                 sleep(Duration::from_secs(2)).await;
                 backoff_seconds = 2;
@@ -1493,11 +1434,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let (active_sessions, watched_pin_count, last_repair_cycle_at) = {
         let sessions = state.sessions.read().await;
         let persistent = state.persistent.read().await;
-        (
-            sessions.len(),
-            persistent.watched_pins.len(),
-            persistent.last_repair_cycle_at,
-        )
+        (sessions.len(), persistent.watched_pins.len(), persistent.last_repair_cycle_at)
     };
     let (
         download_root_dir,
@@ -1565,18 +1502,8 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
 fn relay_is_connected(config: &BridgeConfig) -> bool {
     config.relay_enabled
-        && config
-            .relay_last_error
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-        && !config
-            .relay_device_token
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
+        && config.relay_last_error.as_deref().map(str::trim).unwrap_or("").is_empty()
+        && !config.relay_device_token.as_deref().map(str::trim).unwrap_or("").is_empty()
 }
 
 fn build_config_response(state: &AppState, config: &BridgeConfig) -> BridgeConfigResponse {
@@ -1708,21 +1635,14 @@ async fn root_page(
     let config = state.config.read().await.clone();
 
     let selected_session = query.session_id.as_deref().and_then(|session_id| {
-        sessions
-            .values()
-            .find(|session| session.session_id == session_id)
-            .cloned()
+        sessions.values().find(|session| session.session_id == session_id).cloned()
     });
 
-    let inventory = list_local_pin_inventory(&state)
-        .await
-        .map_err(AppError::internal)?;
+    let inventory = list_local_pin_inventory(&state).await.map_err(AppError::internal)?;
 
     let relay_connected = relay_is_connected(&config);
-    let relay_server_value = query
-        .relay_server_url
-        .as_deref()
-        .unwrap_or(config.relay_server_url.as_str());
+    let relay_server_value =
+        query.relay_server_url.as_deref().unwrap_or(config.relay_server_url.as_str());
     let pairing_code_value = query.pairing_code.as_deref().unwrap_or("");
     let device_name_value = query
         .device_name
@@ -1849,11 +1769,7 @@ async fn root_page(
         })
         .unwrap_or_default();
 
-    let connection_status = if relay_connected {
-        "Live"
-    } else {
-        "Not linked"
-    };
+    let connection_status = if relay_connected { "Live" } else { "Not linked" };
     let connection_pill_class = if relay_connected { "pill ok" } else { "pill" };
 
     let inventory_body = if inventory.items.is_empty() {
@@ -1894,15 +1810,10 @@ async fn root_page(
         Some(bytes) => format_bytes_human(bytes),
         None => "—".to_string(),
     };
-    let disk_body = match (
-        storage_snapshot.quota_gb,
-        storage_snapshot.quota_used_fraction,
-    ) {
-        (Some(gb), Some(fraction)) => format!(
-            "Quota {:.1} GB · {}% used",
-            gb,
-            (fraction * 100.0).round() as i64
-        ),
+    let disk_body = match (storage_snapshot.quota_gb, storage_snapshot.quota_used_fraction) {
+        (Some(gb), Some(fraction)) => {
+            format!("Quota {:.1} GB · {}% used", gb, (fraction * 100.0).round() as i64)
+        }
         _ => {
             if storage_snapshot.ipfs_daemon_reachable {
                 "Reported by the Kubo repo/stat API.".to_string()
@@ -1912,11 +1823,8 @@ async fn root_page(
         }
     };
 
-    let pending_failures = persistent
-        .watched_pins
-        .values()
-        .filter(|pin| pin.last_error.is_some())
-        .count();
+    let pending_failures =
+        persistent.watched_pins.values().filter(|pin| pin.last_error.is_some()).count();
     let final_failures = persistent
         .watched_pins
         .values()
@@ -1925,11 +1833,7 @@ async fn root_page(
     let failure_banner = if pending_failures == 0 {
         String::new()
     } else {
-        let cls = if final_failures > 0 {
-            "flash err"
-        } else {
-            "flash warn"
-        };
+        let cls = if final_failures > 0 { "flash err" } else { "flash warn" };
         let copy = if final_failures > 0 {
             format!(
                 "{pending_failures} pin{} report errors right now, and {final_failures} have exhausted their retry budget. Open a card to diagnose or retry sooner.",
@@ -2064,22 +1968,14 @@ async fn settings_page(
     let sync_checked = if config.sync_enabled { "checked" } else { "" };
     let relay_checked = if config.relay_enabled { "checked" } else { "" };
     let remote_pinning_checked = if config.remote_pinning_enabled { "checked" } else { "" };
-    let storage_quota_display = config
-        .storage_quota_gb
-        .map(|value| format!("{value}"))
-        .unwrap_or_default();
-    let max_retry_attempts_display = config
-        .max_retry_attempts
-        .map(|value| format!("{value}"))
-        .unwrap_or_default();
-    let remote_pinning_service_name_display = config
-        .remote_pinning_service_name
-        .clone()
-        .unwrap_or_default();
-    let remote_pinning_service_url_display = config
-        .remote_pinning_service_url
-        .clone()
-        .unwrap_or_default();
+    let storage_quota_display =
+        config.storage_quota_gb.map(|value| format!("{value}")).unwrap_or_default();
+    let max_retry_attempts_display =
+        config.max_retry_attempts.map(|value| format!("{value}")).unwrap_or_default();
+    let remote_pinning_service_name_display =
+        config.remote_pinning_service_name.clone().unwrap_or_default();
+    let remote_pinning_service_url_display =
+        config.remote_pinning_service_url.clone().unwrap_or_default();
     let token_saved = config
         .remote_pinning_access_token
         .as_deref()
@@ -2091,10 +1987,7 @@ async fn settings_page(
             "•••••••• leave blank to keep",
         )
     } else {
-        (
-            r#"<span class="token-badge empty" title="No token saved">empty</span>"#,
-            "Paste token",
-        )
+        (r#"<span class="token-badge empty" title="No token saved">empty</span>"#, "Paste token")
     };
 
     let flash_block = if query.saved.as_deref() == Some("1") {
@@ -2111,10 +2004,7 @@ async fn settings_page(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(|message| {
-            format!(
-                r#"<div class="flash warn">Relay note: {}</div>"#,
-                escape_html(message)
-            )
+            format!(r#"<div class="flash warn">Relay note: {}</div>"#, escape_html(message))
         })
         .unwrap_or_default();
 
@@ -2388,38 +2278,22 @@ async fn update_config_form(
 
     let retries = input.max_retry_attempts.as_deref().map(|raw| {
         let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            trimmed.parse::<u32>().ok()
-        }
+        if trimmed.is_empty() { None } else { trimmed.parse::<u32>().ok() }
     });
 
     let name = input.remote_pinning_service_name.as_deref().map(|raw| {
         let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
+        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
     });
 
     let url = input.remote_pinning_service_url.as_deref().map(|raw| {
         let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
+        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
     });
 
     let token = input.remote_pinning_access_token.as_deref().map(|raw| {
         let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
+        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
     });
 
     let request = UpdateBridgeConfigRequest {
@@ -2440,10 +2314,9 @@ async fn update_config_form(
 
     match apply_config_update(&state, request).await {
         Ok(_) => Ok(Redirect::to("/settings?saved=1")),
-        Err(error) => Ok(Redirect::to(&format!(
-            "/settings?error={}",
-            encode_query_component(&error.message)
-        ))),
+        Err(error) => {
+            Ok(Redirect::to(&format!("/settings?error={}", encode_query_component(&error.message))))
+        }
     }
 }
 
@@ -2469,9 +2342,7 @@ async fn apply_config_update(
         if let Some(local_gateway_base_url) = input.local_gateway_base_url {
             let trimmed = local_gateway_base_url.trim();
             if trimmed.is_empty() {
-                return Err(AppError::bad_request(
-                    "local_gateway_base_url cannot be empty",
-                ));
+                return Err(AppError::bad_request("local_gateway_base_url cannot be empty"));
             }
             config.local_gateway_base_url = trimmed.to_string();
         }
@@ -2479,9 +2350,7 @@ async fn apply_config_update(
         if let Some(public_gateway_base_url) = input.public_gateway_base_url {
             let trimmed = public_gateway_base_url.trim();
             if trimmed.is_empty() {
-                return Err(AppError::bad_request(
-                    "public_gateway_base_url cannot be empty",
-                ));
+                return Err(AppError::bad_request("public_gateway_base_url cannot be empty"));
             }
             config.public_gateway_base_url = trimmed.to_string();
         }
@@ -2544,9 +2413,7 @@ async fn apply_config_update(
         }
     }
 
-    persist_bridge_config(state)
-        .await
-        .map_err(AppError::internal)?;
+    persist_bridge_config(state).await.map_err(AppError::internal)?;
 
     let config = state.config.read().await;
     Ok(build_config_response(state, &config))
@@ -2622,10 +2489,7 @@ async fn perform_relay_link(
         return Err(AppError::bad_request("relay_server_url is required"));
     }
 
-    let endpoint = format!(
-        "{}/api/relay/bridge/claim",
-        trim_trailing_slash(&relay_server_url)
-    );
+    let endpoint = format!("{}/api/relay/bridge/claim", trim_trailing_slash(&relay_server_url));
 
     let response = state
         .http
@@ -2640,33 +2504,23 @@ async fn perform_relay_link(
 
     if !response.status().is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(AppError::internal(anyhow!(
-            "Relay pairing claim failed: {}",
-            body
-        )));
+        return Err(AppError::internal(anyhow!("Relay pairing claim failed: {}", body)));
     }
 
-    let payload = response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| {
-            AppError::internal(anyhow!("Unable to parse relay pairing response: {error}"))
-        })?;
+    let payload = response.json::<serde_json::Value>().await.map_err(|error| {
+        AppError::internal(anyhow!("Unable to parse relay pairing response: {error}"))
+    })?;
 
     let device_id = payload
         .get("deviceId")
         .and_then(|value| value.as_str())
         .ok_or_else(|| AppError::internal(anyhow!("Relay response did not include a deviceId")))?;
-    let device_label = payload
-        .get("deviceLabel")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
+    let device_label =
+        payload.get("deviceLabel").and_then(|value| value.as_str()).ok_or_else(|| {
             AppError::internal(anyhow!("Relay response did not include a deviceLabel"))
         })?;
-    let device_token = payload
-        .get("deviceToken")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
+    let device_token =
+        payload.get("deviceToken").and_then(|value| value.as_str()).ok_or_else(|| {
             AppError::internal(anyhow!("Relay response did not include a deviceToken"))
         })?;
     let linked_at = Utc::now();
@@ -2683,9 +2537,7 @@ async fn perform_relay_link(
         config.relay_last_error = None;
     }
 
-    persist_bridge_config(&state)
-        .await
-        .map_err(AppError::internal)?;
+    persist_bridge_config(state).await.map_err(AppError::internal)?;
 
     Ok(RelayLinkResponse {
         relay_enabled: true,
@@ -2706,17 +2558,13 @@ async fn perform_relay_link(
 async fn unlink_relay_device(
     State(state): State<AppState>,
 ) -> Result<Json<RelayUnlinkResponse>, AppError> {
-    perform_relay_unlink(&state, true)
-        .await
-        .map_err(AppError::internal)?;
+    perform_relay_unlink(&state, true).await.map_err(AppError::internal)?;
 
     Ok(Json(RelayUnlinkResponse { unlinked: true }))
 }
 
 async fn unlink_relay_device_form(State(state): State<AppState>) -> Result<Redirect, AppError> {
-    perform_relay_unlink(&state, true)
-        .await
-        .map_err(AppError::internal)?;
+    perform_relay_unlink(&state, true).await.map_err(AppError::internal)?;
 
     Ok(Redirect::to("/?unlinked=1"))
 }
@@ -2733,12 +2581,8 @@ async fn connect_session(
         session_id: Uuid::new_v4().to_string(),
         session_secret: Uuid::new_v4().to_string(),
         website_origin: input.website_origin.trim().to_string(),
-        account_address: input
-            .account_address
-            .filter(|value| !value.trim().is_empty()),
-        profile_username: input
-            .profile_username
-            .filter(|value| !value.trim().is_empty()),
+        account_address: input.account_address.filter(|value| !value.trim().is_empty()),
+        profile_username: input.profile_username.filter(|value| !value.trim().is_empty()),
         client_name: input.client_name.filter(|value| !value.trim().is_empty()),
         connected_at: Utc::now(),
     };
@@ -2759,15 +2603,11 @@ async fn disconnect_session(
     let mut sessions = state.sessions.write().await;
     let removed = sessions.remove(&input.session_secret).is_some();
 
-    Ok(Json(DisconnectSessionResponse {
-        disconnected: removed,
-    }))
+    Ok(Json(DisconnectSessionResponse { disconnected: removed }))
 }
 
 async fn list_pins(State(state): State<AppState>) -> Result<Json<PinsResponse>, AppError> {
-    let response = list_local_pin_inventory(&state)
-        .await
-        .map_err(AppError::internal)?;
+    let response = list_local_pin_inventory(&state).await.map_err(AppError::internal)?;
     Ok(Json(response))
 }
 
@@ -2777,16 +2617,13 @@ async fn list_pins_page(
 ) -> Result<Json<PinsPageResponse>, AppError> {
     let cursor = parse_inventory_cursor(query.cursor.as_deref());
     let limit = resolve_inventory_page_size(query.limit);
-    let response = list_local_pin_inventory_page(&state, cursor, limit)
-        .await
-        .map_err(AppError::internal)?;
+    let response =
+        list_local_pin_inventory_page(&state, cursor, limit).await.map_err(AppError::internal)?;
     Ok(Json(response))
 }
 
 async fn repair_now(State(state): State<AppState>) -> Result<Json<RepairNowResponse>, AppError> {
-    let outcome = repair_watched_pins(&state)
-        .await
-        .map_err(AppError::internal)?;
+    let outcome = repair_watched_pins(&state).await.map_err(AppError::internal)?;
 
     Ok(Json(RepairNowResponse {
         repaired: outcome.repaired,
@@ -2816,10 +2653,7 @@ async fn verify_pins(
         ordered_results.push(result);
     }
 
-    Ok(Json(VerifyPinsResponse {
-        checked_at: Utc::now(),
-        results: ordered_results,
-    }))
+    Ok(Json(VerifyPinsResponse { checked_at: Utc::now(), results: ordered_results }))
 }
 
 async fn unwatch_pins(
@@ -2848,9 +2682,7 @@ async fn unwatch_pins(
         }
     }
 
-    persist_bridge_state(&state)
-        .await
-        .map_err(AppError::internal)?;
+    persist_bridge_state(&state).await.map_err(AppError::internal)?;
 
     Ok(Json(UnwatchPinsResponse {
         removed,
@@ -2883,13 +2715,11 @@ async fn resolve_verify_targets(state: &AppState, requested: Option<&[String]>) 
 }
 
 fn parse_inventory_cursor(raw: Option<&str>) -> usize {
-    raw.and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+    raw.and_then(|value| value.trim().parse::<usize>().ok()).unwrap_or(0)
 }
 
 fn resolve_inventory_page_size(raw: Option<usize>) -> usize {
-    raw.unwrap_or(INVENTORY_PAGE_SIZE)
-        .clamp(1, INVENTORY_MAX_PAGE_SIZE)
+    raw.unwrap_or(INVENTORY_PAGE_SIZE).clamp(1, INVENTORY_MAX_PAGE_SIZE)
 }
 
 fn unique_trimmed_strings(values: Vec<String>) -> Vec<String> {
@@ -2917,10 +2747,7 @@ fn collect_inventory_descriptors(
         };
 
         if let Some(group_key) = inventory_work_group_key(&source.watched) {
-            grouped_work_members
-                .entry(group_key)
-                .or_default()
-                .push(source);
+            grouped_work_members.entry(group_key).or_default().push(source);
         } else {
             descriptors.push(InventoryEntryDescriptor::Single(source));
         }
@@ -2930,7 +2757,7 @@ fn collect_inventory_descriptors(
         descriptors.push(InventoryEntryDescriptor::Work(members));
     }
 
-    descriptors.sort_by(|left, right| right.added_at().cmp(&left.added_at()));
+    descriptors.sort_by_key(|entry| std::cmp::Reverse(entry.added_at()));
     descriptors
 }
 
@@ -3023,9 +2850,7 @@ async fn fetch_provider_count(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "IPFS {endpoint} responded with status {status}: {body}"
-        ));
+        return Err(anyhow!("IPFS {endpoint} responded with status {status}: {body}"));
     }
 
     // The findprovs endpoint streams ndjson. Each line is a JSON object with
@@ -3038,9 +2863,7 @@ async fn fetch_provider_count(
             Ok(None) => break,
             Err(error) => {
                 if body.is_empty() {
-                    return Err(anyhow!(
-                        "Unable to read IPFS {endpoint} response body: {error}"
-                    ));
+                    return Err(anyhow!("Unable to read IPFS {endpoint} response body: {error}"));
                 }
                 break;
             }
@@ -3061,10 +2884,10 @@ async fn fetch_provider_count(
             continue;
         };
         for entry in responses {
-            if let Some(peer_id) = entry.get("ID").and_then(|v| v.as_str()) {
-                if !peer_id.is_empty() {
-                    unique_providers.insert(peer_id.to_string());
-                }
+            if let Some(peer_id) = entry.get("ID").and_then(|v| v.as_str())
+                && !peer_id.is_empty()
+            {
+                unique_providers.insert(peer_id.to_string());
             }
         }
     }
@@ -3073,9 +2896,7 @@ async fn fetch_provider_count(
 }
 
 async fn sync_now(State(state): State<AppState>) -> Result<Json<SyncNowResponse>, AppError> {
-    let outcome = sync_all_watched_pins(&state, true)
-        .await
-        .map_err(AppError::internal)?;
+    let outcome = sync_all_watched_pins(&state, true).await.map_err(AppError::internal)?;
 
     Ok(Json(SyncNowResponse {
         synced: outcome.synced,
@@ -3131,10 +2952,9 @@ async fn add_files(
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
             "session_secret" => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|error| AppError::bad_request(format!("Bad session_secret: {error}")))?;
+                let value = field.text().await.map_err(|error| {
+                    AppError::bad_request(format!("Bad session_secret: {error}"))
+                })?;
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
                     session_secret = Some(trimmed.to_string());
@@ -3155,10 +2975,9 @@ async fn add_files(
                     .file_name()
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "file".to_string());
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|error| AppError::bad_request(format!("Upload read failed: {error}")))?;
+                let bytes = field.bytes().await.map_err(|error| {
+                    AppError::bad_request(format!("Upload read failed: {error}"))
+                })?;
                 total_bytes = total_bytes.saturating_add(bytes.len() as u64);
                 files.push((filename, bytes.to_vec()));
             }
@@ -3228,18 +3047,11 @@ async fn add_files(
         if trimmed.is_empty() {
             continue;
         }
-        let value: serde_json::Value = serde_json::from_str(trimmed)
-            .map_err(|error| AppError::internal(anyhow!("IPFS returned malformed line: {error}")))?;
-        let name = value
-            .get("Name")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string();
-        let cid = value
-            .get("Hash")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string();
+        let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|error| {
+            AppError::internal(anyhow!("IPFS returned malformed line: {error}"))
+        })?;
+        let name = value.get("Name").and_then(|value| value.as_str()).unwrap_or("").to_string();
+        let cid = value.get("Hash").and_then(|value| value.as_str()).unwrap_or("").to_string();
         if cid.is_empty() {
             continue;
         }
@@ -3252,9 +3064,7 @@ async fn add_files(
     }
 
     if entries.is_empty() {
-        return Err(AppError::internal(anyhow!(
-            "IPFS add returned no entries"
-        )));
+        return Err(AppError::internal(anyhow!("IPFS add returned no entries")));
     }
 
     let root_cid = if wrap {
@@ -3262,63 +3072,32 @@ async fn add_files(
             .iter()
             .find(|entry| entry.name.is_empty())
             .map(|entry| entry.cid.clone())
-            .unwrap_or_else(|| {
-                entries
-                    .last()
-                    .map(|entry| entry.cid.clone())
-                    .unwrap_or_default()
-            })
+            .unwrap_or_else(|| entries.last().map(|entry| entry.cid.clone()).unwrap_or_default())
     } else {
-        entries
-            .last()
-            .map(|entry| entry.cid.clone())
-            .unwrap_or_default()
+        entries.last().map(|entry| entry.cid.clone()).unwrap_or_default()
     };
 
     if root_cid.is_empty() {
-        return Err(AppError::internal(anyhow!(
-            "IPFS add did not return a root CID"
-        )));
+        return Err(AppError::internal(anyhow!("IPFS add did not return a root CID")));
     }
 
     let file_count = entries.iter().filter(|entry| !entry.name.is_empty()).count();
-    let file_count = if file_count == 0 {
-        entries.len()
-    } else {
-        file_count
-    };
+    let file_count = if file_count == 0 { entries.len() } else { file_count };
 
     let derived_label = label.clone().or_else(|| {
         if wrap {
-            entries
-                .iter()
-                .find(|entry| entry.name.is_empty())
-                .and_then(|entry| {
-                    entries
-                        .iter()
-                        .find(|inner| !inner.name.is_empty())
-                        .map(|inner| {
-                            inner
-                                .name
-                                .split('/')
-                                .next()
-                                .unwrap_or(entry.cid.as_str())
-                                .to_string()
-                        })
+            entries.iter().find(|entry| entry.name.is_empty()).and_then(|entry| {
+                entries.iter().find(|inner| !inner.name.is_empty()).map(|inner| {
+                    inner.name.split('/').next().unwrap_or(entry.cid.as_str()).to_string()
                 })
+            })
         } else {
-            entries
-                .iter()
-                .find(|entry| !entry.name.is_empty())
-                .map(|entry| entry.name.clone())
+            entries.iter().find(|entry| !entry.name.is_empty()).map(|entry| entry.name.clone())
         }
     });
 
     let preferred_file_name = if !wrap {
-        entries
-            .iter()
-            .find(|entry| !entry.name.is_empty())
-            .map(|entry| entry.name.clone())
+        entries.iter().find(|entry| !entry.name.is_empty()).map(|entry| entry.name.clone())
     } else {
         None
     };
@@ -3390,10 +3169,7 @@ async fn share_work_view(
     let details_block = if detail_rows.is_empty() {
         String::new()
     } else {
-        format!(
-            r#"<ul class="plain" style="margin-top: 16px;">{}</ul>"#,
-            detail_rows
-        )
+        format!(r#"<ul class="plain" style="margin-top: 16px;">{}</ul>"#, detail_rows)
     };
 
     let artist = query
@@ -3479,10 +3255,7 @@ async fn share_work_form(
     let pins_block = if pin_rows.is_empty() {
         String::new()
     } else {
-        format!(
-            r#"<ul class="plain" style="margin-top: 16px;">{}</ul>"#,
-            pin_rows
-        )
+        format!(r#"<ul class="plain" style="margin-top: 16px;">{}</ul>"#, pin_rows)
     };
 
     let body = format!(
@@ -3571,11 +3344,7 @@ async fn pin_work_payload(
     let mut pins = Vec::new();
     let (metadata_file_name, media_file_name) = resolve_work_root_file_hints(state, &input).await;
 
-    if let Some(cid) = input
-        .metadata_cid
-        .as_deref()
-        .filter(|cid| !cid.trim().is_empty())
-    {
+    if let Some(cid) = input.metadata_cid.as_deref().filter(|cid| !cid.trim().is_empty()) {
         pins.push(
             pin_and_watch_cid(
                 state,
@@ -3597,11 +3366,7 @@ async fn pin_work_payload(
         );
     }
 
-    if let Some(cid) = input
-        .media_cid
-        .as_deref()
-        .filter(|cid| !cid.trim().is_empty())
-    {
+    if let Some(cid) = input.media_cid.as_deref().filter(|cid| !cid.trim().is_empty()) {
         pins.push(
             pin_and_watch_cid(
                 state,
@@ -3642,8 +3407,7 @@ async fn share_profile_inner(
     for cid in input.cids {
         let trimmed = cid.trim();
         if !trimmed.is_empty() {
-            seen.entry(trimmed.to_string())
-                .or_insert_with(|| Some("profile".to_string()));
+            seen.entry(trimmed.to_string()).or_insert_with(|| Some("profile".to_string()));
         }
     }
 
@@ -3697,14 +3461,8 @@ async fn pin_and_watch_cid(
     input: WatchPinInput,
 ) -> Result<PinCidResult, AppError> {
     let result = pin_single_cid(state, &input.cid, input.label.clone()).await?;
-    remember_watched_pin(
-        state,
-        input.clone(),
-        Some(result.pin_reference.clone()),
-        None,
-        true,
-    )
-    .await?;
+    remember_watched_pin(state, input.clone(), Some(result.pin_reference.clone()), None, true)
+        .await?;
 
     if let Err(error) = sync_cid_if_enabled(state, &input.cid).await {
         warn!("sync after pin failed for {}: {}", input.cid, error);
@@ -3728,9 +3486,8 @@ async fn remember_watched_pin(
 
         if let Some(existing) = persistent.watched_pins.get_mut(&input.cid) {
             existing.label = input.label.or(existing.label.clone());
-            existing.preferred_file_name = input
-                .preferred_file_name
-                .or(existing.preferred_file_name.clone());
+            existing.preferred_file_name =
+                input.preferred_file_name.or(existing.preferred_file_name.clone());
             existing.title = input.title.or(existing.title.clone());
             existing.contract_address =
                 input.contract_address.or(existing.contract_address.clone());
@@ -3797,9 +3554,7 @@ async fn remember_watched_pin(
         }
     }
 
-    persist_bridge_state(state)
-        .await
-        .map_err(AppError::internal)
+    persist_bridge_state(state).await.map_err(AppError::internal)
 }
 
 async fn mark_pin_checked(
@@ -3820,9 +3575,7 @@ async fn mark_pin_checked(
         persistent.updated_at = Some(now);
     }
 
-    persist_bridge_state(state)
-        .await
-        .map_err(AppError::internal)
+    persist_bridge_state(state).await.map_err(AppError::internal)
 }
 
 async fn mark_pin_synced(
@@ -3972,11 +3725,9 @@ impl InventoryEntryDescriptor {
     fn added_at(&self) -> DateTime<Utc> {
         match self {
             Self::Single(source) => source.watched.added_at,
-            Self::Work(members) => members
-                .iter()
-                .map(|member| member.watched.added_at)
-                .max()
-                .unwrap_or_else(Utc::now),
+            Self::Work(members) => {
+                members.iter().map(|member| member.watched.added_at).max().unwrap_or_else(Utc::now)
+            }
         }
     }
 
@@ -4026,11 +3777,7 @@ fn inventory_work_group_key(pin: &WatchedPin) -> Option<String> {
             return Some(format!(
                 "work-title:{}:{}",
                 trimmed.to_ascii_lowercase(),
-                pin.artist_username
-                    .as_deref()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_ascii_lowercase()
+                pin.artist_username.as_deref().unwrap_or_default().trim().to_ascii_lowercase()
             ));
         }
     }
@@ -4042,10 +3789,7 @@ fn first_present_string<I>(values: I) -> Option<String>
 where
     I: IntoIterator<Item = Option<String>>,
 {
-    values
-        .into_iter()
-        .flatten()
-        .find(|value| !value.trim().is_empty())
+    values.into_iter().flatten().find(|value| !value.trim().is_empty())
 }
 
 fn max_timestamp_by<F>(members: &[InventorySourcePin], accessor: F) -> Option<DateTime<Utc>>
@@ -4059,20 +3803,12 @@ fn first_present_error<F>(members: &[InventorySourcePin], accessor: F) -> Option
 where
     F: Fn(&InventorySourcePin) -> Option<&String>,
 {
-    members
-        .iter()
-        .filter_map(accessor)
-        .find(|value| !value.trim().is_empty())
-        .cloned()
+    members.iter().filter_map(accessor).find(|value| !value.trim().is_empty()).cloned()
 }
 
 fn related_cids_from_members(members: &[InventorySourcePin]) -> Vec<String> {
     let mut seen = HashSet::new();
-    members
-        .iter()
-        .map(|member| member.cid.clone())
-        .filter(|cid| seen.insert(cid.clone()))
-        .collect()
+    members.iter().map(|member| member.cid.clone()).filter(|cid| seen.insert(cid.clone())).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -4111,10 +3847,7 @@ fn push_unique_dependency(
     dependencies: &mut Vec<DiscoveredDependency>,
     candidate: DiscoveredDependency,
 ) -> bool {
-    if let Some(existing) = dependencies
-        .iter_mut()
-        .find(|entry| entry.cid == candidate.cid)
-    {
+    if let Some(existing) = dependencies.iter_mut().find(|entry| entry.cid == candidate.cid) {
         if existing.preferred_file_name.is_none() {
             existing.preferred_file_name = candidate.preferred_file_name;
         }
@@ -4222,10 +3955,7 @@ async fn resolve_dependency_probe_paths(
         }
     };
 
-    if preferred_file_name
-        .filter(|value| is_dependency_probe_candidate(value))
-        .is_some()
-    {
+    if preferred_file_name.filter(|value| is_dependency_probe_candidate(value)).is_some() {
         push_candidate(root_path.clone());
     }
 
@@ -4255,10 +3985,7 @@ async fn resolve_dependency_probe_paths(
             }
         }
         Err(_) => {
-            if preferred_file_name
-                .filter(|value| is_dependency_probe_candidate(value))
-                .is_some()
-            {
+            if preferred_file_name.filter(|value| is_dependency_probe_candidate(value)).is_some() {
                 push_candidate(root_path);
             }
         }
@@ -4291,10 +4018,8 @@ async fn resolve_work_root_file_hints(
     state: &AppState,
     input: &RelayShareWorkPayload,
 ) -> (Option<String>, Option<String>) {
-    let metadata_hint = if let Some(metadata_cid) = input
-        .metadata_cid
-        .as_deref()
-        .filter(|cid| !cid.trim().is_empty())
+    let metadata_hint = if let Some(metadata_cid) =
+        input.metadata_cid.as_deref().filter(|cid| !cid.trim().is_empty())
     {
         if let Some(child) = resolve_single_child_path(state, metadata_cid, &[".json"]).await {
             preferred_file_name_from_relative_path(&child)
@@ -4307,49 +4032,44 @@ async fn resolve_work_root_file_hints(
         None
     };
 
-    let media_hint = if let Some(media_cid) = input
-        .media_cid
-        .as_deref()
-        .filter(|cid| !cid.trim().is_empty())
-    {
-        let metadata = if let Some(metadata_cid) = input
-            .metadata_cid
-            .as_deref()
-            .filter(|cid| !cid.trim().is_empty())
-        {
-            load_work_metadata_record(state, metadata_cid, Some(&input.token_id)).await
+    let media_hint =
+        if let Some(media_cid) = input.media_cid.as_deref().filter(|cid| !cid.trim().is_empty()) {
+            let metadata = if let Some(metadata_cid) =
+                input.metadata_cid.as_deref().filter(|cid| !cid.trim().is_empty())
+            {
+                load_work_metadata_record(state, metadata_cid, Some(&input.token_id)).await
+            } else {
+                None
+            };
+
+            let from_metadata = metadata.as_ref().and_then(|record| {
+                [
+                    metadata_primary_media_url(record),
+                    metadata_file_url(record),
+                    metadata_image_url(record),
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(|raw| match parse_ipfs_reference(&raw) {
+                    Some((candidate_cid, relative_path))
+                        if candidate_cid.trim() == media_cid.trim() =>
+                    {
+                        preferred_file_name_from_relative_path(&relative_path)
+                    }
+                    _ => None,
+                })
+            });
+
+            if from_metadata.is_some() {
+                from_metadata
+            } else {
+                resolve_single_child_path(state, media_cid, &[])
+                    .await
+                    .and_then(|child| preferred_file_name_from_relative_path(&child))
+            }
         } else {
             None
         };
-
-        let from_metadata = metadata.as_ref().and_then(|record| {
-            [
-                metadata_primary_media_url(record),
-                metadata_file_url(record),
-                metadata_image_url(record),
-            ]
-            .into_iter()
-            .flatten()
-            .find_map(|raw| match parse_ipfs_reference(&raw) {
-                Some((candidate_cid, relative_path))
-                    if candidate_cid.trim() == media_cid.trim() =>
-                {
-                    preferred_file_name_from_relative_path(&relative_path)
-                }
-                _ => None,
-            })
-        });
-
-        if from_metadata.is_some() {
-            from_metadata
-        } else {
-            resolve_single_child_path(state, media_cid, &[])
-                .await
-                .and_then(|child| preferred_file_name_from_relative_path(&child))
-        }
-    } else {
-        None
-    };
 
     (metadata_hint, media_hint)
 }
@@ -4395,11 +4115,8 @@ async fn discover_work_dependency_inputs(
     .flatten()
     .collect::<HashSet<_>>();
 
-    if let Some(metadata_cid) = input
-        .metadata_cid
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    if let Some(metadata_cid) =
+        input.metadata_cid.as_deref().map(str::trim).filter(|value| !value.is_empty())
     {
         enqueue_dependency_probe(
             &mut queued,
@@ -4415,11 +4132,8 @@ async fn discover_work_dependency_inputs(
         }
     }
 
-    if let Some(media_cid) = input
-        .media_cid
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    if let Some(media_cid) =
+        input.media_cid.as_deref().map(str::trim).filter(|value| !value.is_empty())
     {
         enqueue_dependency_probe(
             &mut queued,
@@ -4511,10 +4225,10 @@ fn parse_ipfs_reference(raw: &str) -> Option<(String, String)> {
     }
 
     let url = Url::parse(trimmed).ok()?;
-    if let Some(host) = url.host_str() {
-        if let Some((cid, _)) = host.split_once(".ipfs.") {
-            return Some((cid.to_string(), url.path().trim_matches('/').to_string()));
-        }
+    if let Some(host) = url.host_str()
+        && let Some((cid, _)) = host.split_once(".ipfs.")
+    {
+        return Some((cid.to_string(), url.path().trim_matches('/').to_string()));
     }
 
     let path = url.path();
@@ -4528,12 +4242,7 @@ fn build_gateway_asset_url(base: &str, cid: &str, relative_path: &str) -> String
         return build_gateway_url(base, cid);
     }
 
-    format!(
-        "{}/ipfs/{}/{}",
-        trim_trailing_slash(base),
-        cid.trim(),
-        cleaned
-    )
+    format!("{}/ipfs/{}/{}", trim_trailing_slash(base), cid.trim(), cleaned)
 }
 
 fn normalize_asset_url_for_gateway(raw: &str, gateway_base: &str) -> String {
@@ -4576,16 +4285,8 @@ fn collect_url_candidates(value: Option<&serde_json::Value>) -> Vec<String> {
             continue;
         };
 
-        for key in [
-            "uri",
-            "url",
-            "src",
-            "href",
-            "animation_url",
-            "animation",
-            "image",
-            "image_url",
-        ] {
+        for key in ["uri", "url", "src", "href", "animation_url", "animation", "image", "image_url"]
+        {
             let candidate = json_string(record.get(key));
             if let Some(candidate) = candidate.filter(|value| !candidates.contains(value)) {
                 candidates.push(candidate);
@@ -4638,10 +4339,7 @@ fn metadata_primary_media_url(metadata: &serde_json::Value) -> Option<String> {
         json_string(metadata.get("animation")),
         json_string(nested_json_value(metadata, &["media", "uri"])),
         json_string(nested_json_value(metadata, &["media", "url"])),
-        json_string(nested_json_value(
-            metadata,
-            &["properties", "animation_url"],
-        )),
+        json_string(nested_json_value(metadata, &["properties", "animation_url"])),
         json_string(nested_json_value(metadata, &["properties", "animation"])),
         json_string(nested_json_value(metadata, &["artifactUri"])),
         json_string(nested_json_value(metadata, &["artifact_uri"])),
@@ -4666,9 +4364,9 @@ fn json_display_value(value: Option<&serde_json::Value>) -> Option<String> {
                 .collect::<Vec<_>>();
             (!joined.is_empty()).then(|| joined.join(", "))
         }
-        serde_json::Value::Object(record) => serde_json::to_string(record)
-            .ok()
-            .filter(|value| !value.is_empty()),
+        serde_json::Value::Object(record) => {
+            serde_json::to_string(record).ok().filter(|value| !value.is_empty())
+        }
     }
 }
 
@@ -4714,10 +4412,7 @@ fn build_metadata_summary_fields(
         };
         let dedupe_key = format!("{}:{}", label.to_ascii_lowercase(), value);
         if seen.insert(dedupe_key) {
-            fields.push(PinMetadataField {
-                label: label.to_string(),
-                value,
-            });
+            fields.push(PinMetadataField { label: label.to_string(), value });
         }
     };
 
@@ -4726,9 +4421,7 @@ fn build_metadata_summary_fields(
     push_field("Preview image", image_raw.map(ToOwned::to_owned));
     push_field(
         "Primary media",
-        media_raw
-            .filter(|entry| Some(*entry) != image_raw)
-            .map(ToOwned::to_owned),
+        media_raw.filter(|entry| Some(*entry) != image_raw).map(ToOwned::to_owned),
     );
     push_field("Mime type", metadata_mime_type(metadata));
 
@@ -4806,13 +4499,7 @@ fn build_metadata_view(
         return None;
     }
 
-    Some(PinMetadataView {
-        description,
-        fields,
-        attributes,
-        raw_json,
-        raw_json_truncated,
-    })
+    Some(PinMetadataView { description, fields, attributes, raw_json, raw_json_truncated })
 }
 
 fn detect_media_kind_from_text(value: &str) -> Option<String> {
@@ -4820,31 +4507,14 @@ fn detect_media_kind_from_text(value: &str) -> Option<String> {
     let markers: [(&str, &[&str]); 6] = [
         ("VIDEO", &[".mp4", ".mov", ".webm", "video"]),
         ("AUDIO", &[".mp3", ".wav", ".ogg", ".aac", "audio"]),
-        (
-            "IMAGE",
-            &[".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", "image"],
-        ),
+        ("IMAGE", &[".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", "image"]),
         ("HTML", &[".html", "text/html"]),
-        (
-            "MODEL",
-            &[
-                ".glb",
-                ".gltf",
-                ".usdz",
-                "model",
-                "model/gltf",
-                "model/vnd.usdz",
-                "3d",
-            ],
-        ),
+        ("MODEL", &[".glb", ".gltf", ".usdz", "model", "model/gltf", "model/vnd.usdz", "3d"]),
         ("JSON", &[".json", "application/json", "text/json"]),
     ];
 
     markers.iter().find_map(|(kind, entries)| {
-        entries
-            .iter()
-            .any(|marker| lower.contains(marker))
-            .then(|| (*kind).to_string())
+        entries.iter().any(|marker| lower.contains(marker)).then(|| (*kind).to_string())
     })
 }
 
@@ -4864,13 +4534,7 @@ async fn detect_media_kind_for_url(
         return None;
     }
 
-    let response = state
-        .http
-        .head(url)
-        .timeout(Duration::from_secs(6))
-        .send()
-        .await
-        .ok()?;
+    let response = state.http.head(url).timeout(Duration::from_secs(6)).send().await.ok()?;
 
     if let Some(content_type) = response
         .headers()
@@ -4909,9 +4573,7 @@ async fn resolve_single_child_path(
     cid: &str,
     required_suffixes: &[&str],
 ) -> Option<String> {
-    let links = list_ipfs_links(state, &format!("/ipfs/{}", cid.trim()))
-        .await
-        .ok()?;
+    let links = list_ipfs_links(state, &format!("/ipfs/{}", cid.trim())).await.ok()?;
     if links.is_empty() {
         return None;
     }
@@ -4923,9 +4585,7 @@ async fn resolve_single_child_path(
         .filter(|name| !name.is_empty())
         .filter(|name| {
             required_suffixes.is_empty()
-                || required_suffixes
-                    .iter()
-                    .any(|suffix| name.ends_with(suffix))
+                || required_suffixes.iter().any(|suffix| name.ends_with(suffix))
         })
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
@@ -4985,77 +4645,46 @@ async fn resolve_work_display(
     let image_raw = metadata.as_ref().and_then(metadata_image_url);
     let media_raw = metadata.as_ref().and_then(|record| {
         let image = image_raw.clone();
-        metadata_primary_media_url(record)
-            .or_else(|| metadata_file_url(record))
-            .or(image)
+        metadata_primary_media_url(record).or_else(|| metadata_file_url(record)).or(image)
     });
     display.metadata_view = metadata
         .as_ref()
         .and_then(|record| build_metadata_view(record, image_raw.as_deref(), media_raw.as_deref()));
 
-    if let Some(raw) = media_raw
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        display.local_open_url = Some(normalize_asset_url_for_gateway(
-            raw,
-            &config.local_gateway_base_url,
-        ));
-        display.public_open_url = Some(normalize_asset_url_for_gateway(
-            raw,
-            &config.public_gateway_base_url,
-        ));
+    if let Some(raw) = media_raw.as_deref().filter(|value| !value.trim().is_empty()) {
+        display.local_open_url =
+            Some(normalize_asset_url_for_gateway(raw, &config.local_gateway_base_url));
+        display.public_open_url =
+            Some(normalize_asset_url_for_gateway(raw, &config.public_gateway_base_url));
     } else if let Some(media_cid) = media_cid.filter(|value| !value.trim().is_empty()) {
         if let Some(child) = resolve_single_child_path(state, media_cid, &[]).await {
-            display.local_open_url = Some(build_gateway_asset_url(
-                &config.local_gateway_base_url,
-                media_cid,
-                &child,
-            ));
-            display.public_open_url = Some(build_gateway_asset_url(
-                &config.public_gateway_base_url,
-                media_cid,
-                &child,
-            ));
+            display.local_open_url =
+                Some(build_gateway_asset_url(&config.local_gateway_base_url, media_cid, &child));
+            display.public_open_url =
+                Some(build_gateway_asset_url(&config.public_gateway_base_url, media_cid, &child));
         } else {
             display.local_open_url =
                 Some(build_gateway_url(&config.local_gateway_base_url, media_cid));
-            display.public_open_url = Some(build_gateway_url(
-                &config.public_gateway_base_url,
-                media_cid,
-            ));
+            display.public_open_url =
+                Some(build_gateway_url(&config.public_gateway_base_url, media_cid));
         }
     } else if let Some(metadata_cid) = metadata_cid.filter(|value| !value.trim().is_empty()) {
-        display.local_open_url = Some(build_gateway_url(
-            &config.local_gateway_base_url,
-            metadata_cid,
-        ));
-        display.public_open_url = Some(build_gateway_url(
-            &config.public_gateway_base_url,
-            metadata_cid,
-        ));
+        display.local_open_url =
+            Some(build_gateway_url(&config.local_gateway_base_url, metadata_cid));
+        display.public_open_url =
+            Some(build_gateway_url(&config.public_gateway_base_url, metadata_cid));
     }
 
-    if let Some(raw) = image_raw
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        display.preview_local_url = Some(normalize_asset_url_for_gateway(
-            raw,
-            &config.local_gateway_base_url,
-        ));
-        display.preview_public_url = Some(normalize_asset_url_for_gateway(
-            raw,
-            &config.public_gateway_base_url,
-        ));
+    if let Some(raw) = image_raw.as_deref().filter(|value| !value.trim().is_empty()) {
+        display.preview_local_url =
+            Some(normalize_asset_url_for_gateway(raw, &config.local_gateway_base_url));
+        display.preview_public_url =
+            Some(normalize_asset_url_for_gateway(raw, &config.public_gateway_base_url));
     }
 
     display.media_kind = detect_media_kind_for_url(
         state,
-        display
-            .local_open_url
-            .as_deref()
-            .or(display.preview_local_url.as_deref()),
+        display.local_open_url.as_deref().or(display.preview_local_url.as_deref()),
         &[
             media_raw.clone(),
             image_raw.clone(),
@@ -5135,12 +4764,12 @@ async fn build_work_inventory_item(
     config: &BridgeConfig,
     members: &[InventorySourcePin],
 ) -> PinInventoryItem {
-    let metadata_member = members
-        .iter()
-        .find(|member| matches!(member.watched.label.as_deref(), Some("metadata")));
-    let media_member = members
-        .iter()
-        .find(|member| matches!(member.watched.label.as_deref(), Some("media")));
+    let metadata_member =
+        members.iter().find(|member| matches!(member.watched.label.as_deref(), Some("metadata")));
+    let media_member =
+        members.iter().find(|member| matches!(member.watched.label.as_deref(), Some("media")));
+    // SAFETY: callers only invoke this on a non-empty group; `members.first()` is the fallback.
+    #[allow(clippy::expect_used)]
     let primary_member = media_member
         .or(metadata_member)
         .or_else(|| members.first())
@@ -5157,10 +4786,8 @@ async fn build_work_inventory_item(
     )
     .await;
 
-    let primary_cid = media_cid
-        .clone()
-        .or(metadata_cid.clone())
-        .unwrap_or_else(|| primary_member.cid.clone());
+    let primary_cid =
+        media_cid.clone().or(metadata_cid.clone()).unwrap_or_else(|| primary_member.cid.clone());
 
     PinInventoryItem {
         cid: primary_cid.clone(),
@@ -5174,27 +4801,19 @@ async fn build_work_inventory_item(
         source_kind: Some("work".to_string()),
         title: first_present_string(members.iter().map(|member| member.watched.title.clone())),
         contract_address: first_present_string(
-            members
-                .iter()
-                .map(|member| member.watched.contract_address.clone()),
+            members.iter().map(|member| member.watched.contract_address.clone()),
         ),
         token_id: first_present_string(
             members.iter().map(|member| member.watched.token_id.clone()),
         ),
         foundation_url: first_present_string(
-            members
-                .iter()
-                .map(|member| member.watched.foundation_url.clone()),
+            members.iter().map(|member| member.watched.foundation_url.clone()),
         ),
         artist_username: first_present_string(
-            members
-                .iter()
-                .map(|member| member.watched.artist_username.clone()),
+            members.iter().map(|member| member.watched.artist_username.clone()),
         ),
         account_address: first_present_string(
-            members
-                .iter()
-                .map(|member| member.watched.account_address.clone()),
+            members.iter().map(|member| member.watched.account_address.clone()),
         ),
         username: first_present_string(
             members.iter().map(|member| member.watched.username.clone()),
@@ -5204,30 +4823,20 @@ async fn build_work_inventory_item(
         last_repaired_at: max_timestamp_by(members, |member| member.watched.last_repaired_at),
         last_error: first_present_error(members, |member| member.watched.last_error.as_ref()),
         pin_reference: primary_member.watched.pin_reference.clone(),
-        verify_count: members
-            .iter()
-            .map(|member| member.watched.verify_count)
-            .sum(),
-        repair_count: members
-            .iter()
-            .map(|member| member.watched.repair_count)
-            .sum(),
+        verify_count: members.iter().map(|member| member.watched.verify_count).sum(),
+        repair_count: members.iter().map(|member| member.watched.repair_count).sum(),
         sync_path: media_member
             .and_then(|member| member.watched.sync_path.clone())
             .or_else(|| metadata_member.and_then(|member| member.watched.sync_path.clone()))
             .or_else(|| primary_member.watched.sync_path.clone()),
-        local_gateway_url: display.local_open_url.clone().or_else(|| {
-            Some(build_gateway_url(
-                &config.local_gateway_base_url,
-                &primary_cid,
-            ))
-        }),
-        public_gateway_url: display.public_open_url.clone().or_else(|| {
-            Some(build_gateway_url(
-                &config.public_gateway_base_url,
-                &primary_cid,
-            ))
-        }),
+        local_gateway_url: display
+            .local_open_url
+            .clone()
+            .or_else(|| Some(build_gateway_url(&config.local_gateway_base_url, &primary_cid))),
+        public_gateway_url: display
+            .public_open_url
+            .clone()
+            .or_else(|| Some(build_gateway_url(&config.public_gateway_base_url, &primary_cid))),
         preview_local_gateway_url: display.preview_local_url.clone(),
         preview_public_gateway_url: display.preview_public_url.clone(),
         media_kind: display.media_kind.clone(),
@@ -5245,17 +4854,11 @@ async fn build_work_inventory_item(
             .map(|member| member.watched.retry_attempts)
             .max()
             .unwrap_or(0),
-        next_retry_at: members
-            .iter()
-            .filter_map(|member| member.watched.next_retry_at)
-            .min(),
+        next_retry_at: members.iter().filter_map(|member| member.watched.next_retry_at).min(),
         error_category: first_present_error(members, |member| {
             member.watched.error_category.as_ref()
         }),
-        provider_count: members
-            .iter()
-            .filter_map(|member| member.watched.provider_count)
-            .min(),
+        provider_count: members.iter().filter_map(|member| member.watched.provider_count).min(),
         provider_checked_at: max_timestamp_by(members, |member| member.watched.provider_checked_at),
         custom_tags: {
             let mut tags = Vec::new();
@@ -5271,9 +4874,7 @@ async fn build_work_inventory_item(
         },
         remote_pinned: members.iter().any(|member| member.watched.remote_pinned),
         remote_pin_service: first_present_string(
-            members
-                .iter()
-                .map(|member| member.watched.remote_pin_service.clone()),
+            members.iter().map(|member| member.watched.remote_pin_service.clone()),
         ),
         remote_pin_last_error: first_present_error(members, |member| {
             member.watched.remote_pin_last_error.as_ref()
@@ -5293,10 +4894,7 @@ async fn list_local_pin_inventory(state: &AppState) -> anyhow::Result<PinsRespon
 
     Ok(PinsResponse {
         total: descriptors.len(),
-        pinned_count: descriptors
-            .iter()
-            .filter(|descriptor| descriptor.pinned())
-            .count(),
+        pinned_count: descriptors.iter().filter(|descriptor| descriptor.pinned()).count(),
         managed_count: descriptors.len(),
         last_repair_cycle_at: persistent.last_repair_cycle_at,
         items,
@@ -5316,10 +4914,7 @@ async fn list_local_pin_inventory_page(
     let total = descriptors.len();
     let start = cursor.min(total);
     let end = start.saturating_add(limit).min(total);
-    let pinned_count = descriptors
-        .iter()
-        .filter(|descriptor| descriptor.pinned())
-        .count();
+    let pinned_count = descriptors.iter().filter(|descriptor| descriptor.pinned()).count();
 
     let mut items = Vec::with_capacity(end.saturating_sub(start));
     for descriptor in &descriptors[start..end] {
@@ -5346,16 +4941,8 @@ async fn sync_cid_if_enabled(state: &AppState, cid: &str) -> anyhow::Result<bool
 }
 
 async fn sync_all_watched_pins(state: &AppState, force: bool) -> anyhow::Result<SyncOutcome> {
-    let watched = {
-        state
-            .persistent
-            .read()
-            .await
-            .watched_pins
-            .values()
-            .cloned()
-            .collect::<Vec<_>>()
-    };
+    let watched =
+        { state.persistent.read().await.watched_pins.values().cloned().collect::<Vec<_>>() };
 
     let sync_enabled = { state.config.read().await.sync_enabled };
     let mut outcome = SyncOutcome::default();
@@ -5470,18 +5057,17 @@ fn leaf_name_from_ipfs_path(ipfs_path: &str) -> Option<String> {
 async fn resolve_sync_leaf_file_name(state: &AppState, ipfs_path: &str, bytes: &[u8]) -> String {
     let mut file_name = leaf_name_from_ipfs_path(ipfs_path);
 
-    if file_name.is_none() {
-        if let Some((cid, relative_path)) = parse_ipfs_path(ipfs_path) {
-            if relative_path.is_empty() {
-                file_name = state
-                    .persistent
-                    .read()
-                    .await
-                    .watched_pins
-                    .get(&cid)
-                    .and_then(|pin| pin.preferred_file_name.clone());
-            }
-        }
+    if file_name.is_none()
+        && let Some((cid, relative_path)) = parse_ipfs_path(ipfs_path)
+        && relative_path.is_empty()
+    {
+        file_name = state
+            .persistent
+            .read()
+            .await
+            .watched_pins
+            .get(&cid)
+            .and_then(|pin| pin.preferred_file_name.clone());
     }
 
     let mut resolved = file_name.unwrap_or_else(|| "content".to_string());
@@ -5521,10 +5107,7 @@ async fn download_ipfs_leaf(
     }
 
     fs::write(&target_file, &bytes).await.with_context(|| {
-        format!(
-            "Unable to write synced IPFS file to {}",
-            target_file.display()
-        )
+        format!("Unable to write synced IPFS file to {}", target_file.display())
     })?;
 
     Ok(())
@@ -5550,28 +5133,18 @@ async fn download_ipfs_path_recursive(
     }
 
     fs::create_dir_all(destination_dir).await.with_context(|| {
-        format!(
-            "Unable to create destination directory {}",
-            destination_dir.display()
-        )
+        format!("Unable to create destination directory {}", destination_dir.display())
     })?;
 
     for link in links {
-        let name = link
-            .get("Name")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .trim();
+        let name = link.get("Name").and_then(|value| value.as_str()).unwrap_or("").trim();
         if name.is_empty() {
             continue;
         }
 
         let child_destination = destination_dir.join(name);
         let child_ipfs_path = format!("{}/{}", ipfs_path.trim_end_matches('/'), name);
-        let link_type = link
-            .get("Type")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0);
+        let link_type = link.get("Type").and_then(|value| value.as_i64()).unwrap_or(0);
 
         if matches!(link_type, 1 | 5) {
             download_ipfs_path_recursive(state, &child_ipfs_path, &child_destination).await?;
@@ -5643,10 +5216,7 @@ async fn download_ipfs_file(
 
     let bytes = response.bytes().await?;
     fs::write(destination_file, &bytes).await.with_context(|| {
-        format!(
-            "Unable to write synced IPFS file to {}",
-            destination_file.display()
-        )
+        format!("Unable to write synced IPFS file to {}", destination_file.display())
     })?;
 
     Ok(())
@@ -5702,18 +5272,10 @@ async fn perform_relay_unlink(state: &AppState, notify_server: bool) -> anyhow::
 
     if notify_server
         && !config.relay_server_url.trim().is_empty()
-        && config
-            .relay_device_token
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-            == false
+        && !config.relay_device_token.as_deref().map(str::trim).unwrap_or("").is_empty()
     {
-        let endpoint = format!(
-            "{}/api/relay/bridge/unlink",
-            trim_trailing_slash(&config.relay_server_url)
-        );
+        let endpoint =
+            format!("{}/api/relay/bridge/unlink", trim_trailing_slash(&config.relay_server_url));
 
         let _ = state
             .http
@@ -5735,16 +5297,11 @@ async fn send_relay_inventory(
     >,
 ) -> anyhow::Result<()> {
     let snapshot = list_local_pin_inventory(state).await?;
-    let payload = RelayInventoryMessage {
-        r#type: "device.inventory",
-        items: snapshot.items,
-    };
+    let payload = RelayInventoryMessage { r#type: "device.inventory", items: snapshot.items };
 
     socket
         .send(Message::Text(
-            serde_json::to_string(&payload)
-                .context("Unable to encode relay inventory")?
-                .into(),
+            serde_json::to_string(&payload).context("Unable to encode relay inventory")?.into(),
         ))
         .await
         .context("Unable to send relay inventory to the archive server")?;
@@ -5772,11 +5329,7 @@ async fn run_relay_socket_session(state: &AppState) -> anyhow::Result<()> {
     )
     .await?;
 
-    info!(
-        "relay websocket connected: {} ({})",
-        response.status(),
-        config.relay_server_url
-    );
+    info!("relay websocket connected: {} ({})", response.status(), config.relay_server_url);
 
     send_relay_inventory(state, &mut socket).await?;
 
@@ -5785,10 +5338,7 @@ async fn run_relay_socket_session(state: &AppState) -> anyhow::Result<()> {
             Message::Text(text) => {
                 let value = serde_json::from_str::<serde_json::Value>(&text)
                     .context("Unable to parse relay websocket message")?;
-                let message_type = value
-                    .get("type")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or("");
+                let message_type = value.get("type").and_then(|item| item.as_str()).unwrap_or("");
 
                 match message_type {
                     "relay.welcome" => {
@@ -5859,9 +5409,7 @@ async fn run_relay_socket_session(state: &AppState) -> anyhow::Result<()> {
                         clear_relay_link(state).await?;
                         return Err(anyhow!(
                             "Archive relay disconnected this desktop app: {}",
-                            payload
-                                .reason
-                                .unwrap_or_else(|| "connection closed".to_string())
+                            payload.reason.unwrap_or_else(|| "connection closed".to_string())
                         ));
                     }
                     _ => {}
@@ -5912,26 +5460,15 @@ async fn remember_relay_error(state: &AppState, message: String) -> anyhow::Resu
 }
 
 async fn repair_watched_pins(state: &AppState) -> anyhow::Result<RepairCycleOutcome> {
-    let watched = {
-        state
-            .persistent
-            .read()
-            .await
-            .watched_pins
-            .values()
-            .cloned()
-            .collect::<Vec<_>>()
-    };
+    let watched =
+        { state.persistent.read().await.watched_pins.values().cloned().collect::<Vec<_>>() };
 
     let total = watched.len();
     set_current_operation(
         state,
         OperationStatus::busy(
             "repairing",
-            Some(format!(
-                "Checking {total} watched pin{}",
-                if total == 1 { "" } else { "s" }
-            )),
+            Some(format!("Checking {total} watched pin{}", if total == 1 { "" } else { "s" })),
             Some(total),
         ),
     )
@@ -5954,11 +5491,11 @@ async fn repair_watched_pins(state: &AppState) -> anyhow::Result<RepairCycleOutc
         )
         .await;
 
-        if let Some(next_retry_at) = pin.next_retry_at {
-            if next_retry_at > now {
-                outcome.healthy += 1;
-                continue;
-            }
+        if let Some(next_retry_at) = pin.next_retry_at
+            && next_retry_at > now
+        {
+            outcome.healthy += 1;
+            continue;
         }
 
         match is_cid_pinned(state, &pin.cid).await {
@@ -6103,30 +5640,19 @@ async fn record_pin_failure(
 
     persist_bridge_state(state).await?;
 
-    if should_notify_relay {
-        if let Some(latest) = state
-            .persistent
-            .read()
-            .await
-            .watched_pins
-            .get(&pin.cid)
-            .cloned()
-        {
-            if let Err(error) = send_relay_pin_failure(state, &latest, message).await {
-                warn!("relay pin-failure callback failed for {}: {error}", pin.cid);
-            }
-        }
+    if should_notify_relay
+        && let Some(latest) = state.persistent.read().await.watched_pins.get(&pin.cid).cloned()
+        && let Err(error) = send_relay_pin_failure(state, &latest, message).await
+    {
+        warn!("relay pin-failure callback failed for {}: {error}", pin.cid);
     }
 
     Ok(())
 }
 
 async fn is_cid_pinned(state: &AppState, cid: &str) -> anyhow::Result<bool> {
-    let endpoint = format!(
-        "{}/api/v0/pin/ls?arg={}",
-        state.ipfs_api_url.trim_end_matches('/'),
-        cid.trim()
-    );
+    let endpoint =
+        format!("{}/api/v0/pin/ls?arg={}", state.ipfs_api_url.trim_end_matches('/'), cid.trim());
 
     let mut request = state.http.post(endpoint);
     if let Some(header) = &state.ipfs_api_auth_header {
@@ -6156,11 +5682,8 @@ async fn pin_single_cid(
         return Err(AppError::bad_request("CID is required"));
     }
 
-    let endpoint = format!(
-        "{}/api/v0/pin/add?arg={}",
-        state.ipfs_api_url.trim_end_matches('/'),
-        trimmed
-    );
+    let endpoint =
+        format!("{}/api/v0/pin/add?arg={}", state.ipfs_api_url.trim_end_matches('/'), trimmed);
 
     let mut request = state.http.post(endpoint);
     if let Some(header) = &state.ipfs_api_auth_header {
@@ -6224,10 +5747,7 @@ struct KuboRepoStat {
 }
 
 async fn fetch_kubo_repo_stat(state: &AppState) -> anyhow::Result<KuboRepoStat> {
-    let endpoint = format!(
-        "{}/api/v0/repo/stat",
-        state.ipfs_api_url.trim_end_matches('/')
-    );
+    let endpoint = format!("{}/api/v0/repo/stat", state.ipfs_api_url.trim_end_matches('/'));
     let mut request = state.http.post(endpoint).timeout(Duration::from_secs(8));
     if let Some(header) = &state.ipfs_api_auth_header {
         request = request.header("Authorization", header);
@@ -6291,11 +5811,7 @@ async fn build_storage_snapshot(state: &AppState) -> StorageSnapshot {
     let quota_used_fraction = match (quota_gb, repo_size) {
         (Some(gb), Some(bytes)) if gb > 0.0 => {
             let max_bytes = gb * 1_000_000_000.0;
-            if max_bytes > 0.0 {
-                Some((bytes as f64) / max_bytes)
-            } else {
-                None
-            }
+            if max_bytes > 0.0 { Some((bytes as f64) / max_bytes) } else { None }
         }
         _ => None,
     };
@@ -6328,10 +5844,7 @@ fn categorize_pin_error(message: &str) -> (&'static str, &'static str) {
         || lower.contains("timeout")
         || lower.contains("timed out")
     {
-        return (
-            "timeout",
-            "The IPFS network took too long to answer. Try again in a minute.",
-        );
+        return ("timeout", "The IPFS network took too long to answer. Try again in a minute.");
     }
     if lower.contains("no providers")
         || lower.contains("could not find provider")
@@ -6343,26 +5856,17 @@ fn categorize_pin_error(message: &str) -> (&'static str, &'static str) {
         );
     }
     if lower.contains("not pinned") {
-        return (
-            "not_pinned",
-            "The CID is not pinned locally. The next cycle will pin it.",
-        );
+        return ("not_pinned", "The CID is not pinned locally. The next cycle will pin it.");
     }
     if lower.contains("invalid") || lower.contains("not a valid cid") {
-        return (
-            "invalid_cid",
-            "The CID looks malformed. Re-request the share.",
-        );
+        return ("invalid_cid", "The CID looks malformed. Re-request the share.");
     }
     if lower.contains("unauthorized")
         || lower.contains("forbidden")
         || lower.contains("401")
         || lower.contains("403")
     {
-        return (
-            "unauthorized",
-            "The IPFS API rejected the request. Verify IPFS_API_AUTH_HEADER.",
-        );
+        return ("unauthorized", "The IPFS API rejected the request. Verify IPFS_API_AUTH_HEADER.");
     }
     if lower.contains("disk") || lower.contains("no space") || lower.contains("quota") {
         return (
@@ -6370,10 +5874,7 @@ fn categorize_pin_error(message: &str) -> (&'static str, &'static str) {
             "The IPFS datastore cannot accept more data. Free space or raise the quota.",
         );
     }
-    (
-        "unknown",
-        "Cause not recognized. Check the detail for the raw message.",
-    )
+    ("unknown", "Cause not recognized. Check the detail for the raw message.")
 }
 
 async fn compute_next_retry_at(state: &AppState, attempt: u32) -> DateTime<Utc> {
@@ -6401,22 +5902,14 @@ struct DiagnoseResponse {
 }
 
 async fn probe_gateway(client: &Client, url: &str) -> Option<bool> {
-    let response = client
-        .head(url)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .ok()?;
+    let response = client.head(url).timeout(Duration::from_secs(5)).send().await.ok()?;
     Some(response.status().is_success() || response.status().is_redirection())
 }
 
 async fn check_gateway_reachability(state: &AppState, cid: &str) -> (Option<bool>, Option<bool>) {
     let (local_base, public_base) = {
         let config = state.config.read().await;
-        (
-            config.local_gateway_base_url.clone(),
-            config.public_gateway_base_url.clone(),
-        )
+        (config.local_gateway_base_url.clone(), config.public_gateway_base_url.clone())
     };
     let local = probe_gateway(&state.http, &build_gateway_url(&local_base, cid)).await;
     let public = probe_gateway(&state.http, &build_gateway_url(&public_base, cid)).await;
@@ -6477,19 +5970,14 @@ struct GatewayHealthResponse {
 async fn gateway_health_probe(state: &AppState) -> GatewayHealthResponse {
     let (local_base, public_base) = {
         let config = state.config.read().await;
-        (
-            config.local_gateway_base_url.clone(),
-            config.public_gateway_base_url.clone(),
-        )
+        (config.local_gateway_base_url.clone(), config.public_gateway_base_url.clone())
     };
     const PROBE_CID: &str = "bafkqaaa";
     let local_ok = probe_gateway(&state.http, &build_gateway_url(&local_base, PROBE_CID)).await;
     let public_ok = probe_gateway(&state.http, &build_gateway_url(&public_base, PROBE_CID)).await;
-    let utility_ok = probe_gateway(
-        &state.http,
-        &build_gateway_url(PUBLIC_UTILITY_GATEWAY_BASE_URL, PROBE_CID),
-    )
-    .await;
+    let utility_ok =
+        probe_gateway(&state.http, &build_gateway_url(PUBLIC_UTILITY_GATEWAY_BASE_URL, PROBE_CID))
+            .await;
     GatewayHealthResponse {
         local_gateway_base_url: local_base,
         public_gateway_base_url: public_base,
@@ -6581,11 +6069,7 @@ async fn send_relay_pin_failure(
 ) -> anyhow::Result<bool> {
     let (relay_enabled, relay_server_url, device_token) = {
         let config = state.config.read().await;
-        (
-            config.relay_enabled,
-            config.relay_server_url.clone(),
-            config.relay_device_token.clone(),
-        )
+        (config.relay_enabled, config.relay_server_url.clone(), config.relay_device_token.clone())
     };
     if !relay_enabled {
         return Ok(false);
@@ -6596,10 +6080,8 @@ async fn send_relay_pin_failure(
     if relay_server_url.trim().is_empty() {
         return Ok(false);
     }
-    let endpoint = format!(
-        "{}/api/relay/bridge/pin-failure",
-        trim_trailing_slash(&relay_server_url)
-    );
+    let endpoint =
+        format!("{}/api/relay/bridge/pin-failure", trim_trailing_slash(&relay_server_url));
     let payload = serde_json::json!({
         "deviceToken": token,
         "cid": pin.cid,
@@ -6612,19 +6094,11 @@ async fn send_relay_pin_failure(
         "retryAttempts": pin.retry_attempts,
         "reportedAt": Utc::now(),
     });
-    let response = state
-        .http
-        .post(endpoint)
-        .json(&payload)
-        .timeout(Duration::from_secs(8))
-        .send()
-        .await;
+    let response =
+        state.http.post(endpoint).json(&payload).timeout(Duration::from_secs(8)).send().await;
     match response {
         Ok(resp) if resp.status().is_success() => Ok(true),
-        Ok(resp) => Err(anyhow!(
-            "Relay pin-failure callback returned {}",
-            resp.status()
-        )),
+        Ok(resp) => Err(anyhow!("Relay pin-failure callback returned {}", resp.status())),
         Err(error) => Err(anyhow!(error)),
     }
 }
@@ -6635,11 +6109,7 @@ fn sanitize_custom_tag(raw: &str) -> Option<String> {
         return None;
     }
     let cleaned: String = trimmed.chars().filter(|c| !c.is_control()).collect();
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
-    }
+    if cleaned.is_empty() { None } else { Some(cleaned) }
 }
 
 fn csv_escape(value: &str) -> String {
@@ -6777,9 +6247,7 @@ async fn retry_pin_now(
                 }
                 persistent.updated_at = Some(now);
             }
-            persist_bridge_state(&state)
-                .await
-                .map_err(AppError::internal)?;
+            persist_bridge_state(&state).await.map_err(AppError::internal)?;
             let reply = if let Some(service) = used_remote.clone() {
                 format!(
                     "Local pin failed ({hint}), but the remote pinning service {service} accepted it."
@@ -6814,12 +6282,7 @@ async fn retry_sync_single(
     if trimmed.is_empty() {
         return Err(AppError::bad_request("CID is required"));
     }
-    let exists = state
-        .persistent
-        .read()
-        .await
-        .watched_pins
-        .contains_key(&trimmed);
+    let exists = state.persistent.read().await.watched_pins.contains_key(&trimmed);
     if !exists {
         return Err(AppError::bad_request("CID is not watched by this bridge"));
     }
@@ -6883,13 +6346,8 @@ async fn set_pin_tags(
         existing.custom_tags = cleaned.clone();
         persistent.updated_at = Some(Utc::now());
     }
-    persist_bridge_state(&state)
-        .await
-        .map_err(AppError::internal)?;
-    Ok(Json(SetPinTagsResponse {
-        cid: trimmed,
-        tags: cleaned,
-    }))
+    persist_bridge_state(&state).await.map_err(AppError::internal)?;
+    Ok(Json(SetPinTagsResponse { cid: trimmed, tags: cleaned }))
 }
 
 async fn gateway_health_handler(State(state): State<AppState>) -> Json<GatewayHealthResponse> {
@@ -6937,16 +6395,8 @@ async fn export_pins_handler(
                     csv_escape(&pin.source_kind),
                     csv_escape(pin.label.as_deref().unwrap_or("")),
                     csv_escape(&pin.added_at.to_rfc3339()),
-                    csv_escape(
-                        &pin.last_verified_at
-                            .map(|t| t.to_rfc3339())
-                            .unwrap_or_default()
-                    ),
-                    csv_escape(
-                        &pin.last_repaired_at
-                            .map(|t| t.to_rfc3339())
-                            .unwrap_or_default()
-                    ),
+                    csv_escape(&pin.last_verified_at.map(|t| t.to_rfc3339()).unwrap_or_default()),
+                    csv_escape(&pin.last_repaired_at.map(|t| t.to_rfc3339()).unwrap_or_default()),
                     pin.verify_count,
                     pin.repair_count,
                     pin.sync_count,
@@ -7014,47 +6464,32 @@ async fn artist_summary_handler(State(state): State<AppState>) -> Json<ArtistSum
     let mut artist_counts: HashMap<String, HashSet<String>> = HashMap::new();
     let mut works_by_group: HashSet<String> = HashSet::new();
     let mut total_copies = 0_usize;
-    let current_username = sessions
-        .values()
-        .filter_map(|s| s.profile_username.clone())
-        .next();
+    let current_username = sessions.values().filter_map(|s| s.profile_username.clone()).next();
     let mut works_by_you = 0_usize;
     for pin in persistent.watched_pins.values() {
         total_copies += 1;
         let group = inventory_work_group_key(pin).unwrap_or_else(|| pin.cid.clone());
         if works_by_group.insert(group.clone()) {
-            let artist = pin
-                .artist_username
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
-            artist_counts
-                .entry(artist)
-                .or_default()
-                .insert(group.clone());
-            if let Some(me) = current_username.as_deref() {
-                if pin
+            let artist = pin.artist_username.clone().unwrap_or_else(|| "unknown".to_string());
+            artist_counts.entry(artist).or_default().insert(group.clone());
+            if let Some(me) = current_username.as_deref()
+                && pin
                     .artist_username
                     .as_deref()
                     .map(|v| v.eq_ignore_ascii_case(me))
                     .unwrap_or(false)
-                {
-                    works_by_you += 1;
-                }
+            {
+                works_by_you += 1;
             }
         }
     }
     let artists_tracked = artist_counts.len();
     let mut top_artists: Vec<ArtistEntry> = artist_counts
         .into_iter()
-        .map(|(username, works)| ArtistEntry {
-            artist_username: username,
-            works: works.len(),
-        })
+        .map(|(username, works)| ArtistEntry { artist_username: username, works: works.len() })
         .collect();
     top_artists.sort_by(|a, b| {
-        b.works
-            .cmp(&a.works)
-            .then_with(|| a.artist_username.cmp(&b.artist_username))
+        b.works.cmp(&a.works).then_with(|| a.artist_username.cmp(&b.artist_username))
     });
     top_artists.truncate(5);
     Json(ArtistSummary {
@@ -7932,10 +7367,7 @@ fn render_artist_summary(
         return String::new();
     }
 
-    let current_username = sessions
-        .values()
-        .filter_map(|s| s.profile_username.clone())
-        .next();
+    let current_username = sessions.values().filter_map(|s| s.profile_username.clone()).next();
 
     let mut artist_counts: HashMap<String, HashSet<String>> = HashMap::new();
     let mut group_keys: HashSet<String> = HashSet::new();
@@ -7944,33 +7376,24 @@ fn render_artist_summary(
     for pin in persistent.watched_pins.values() {
         let group = inventory_work_group_key(pin).unwrap_or_else(|| pin.cid.clone());
         if group_keys.insert(group.clone()) {
-            let artist = pin
-                .artist_username
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
-            artist_counts
-                .entry(artist)
-                .or_default()
-                .insert(group.clone());
-            if let Some(me) = current_username.as_deref() {
-                if pin
+            let artist = pin.artist_username.clone().unwrap_or_else(|| "unknown".to_string());
+            artist_counts.entry(artist).or_default().insert(group.clone());
+            if let Some(me) = current_username.as_deref()
+                && pin
                     .artist_username
                     .as_deref()
                     .map(|v| v.eq_ignore_ascii_case(me))
                     .unwrap_or(false)
-                {
-                    works_by_you += 1;
-                }
+            {
+                works_by_you += 1;
             }
         }
     }
 
     let total_works = group_keys.len();
     let artists_tracked = artist_counts.len();
-    let mut top: Vec<(String, usize)> = artist_counts
-        .iter()
-        .map(|(artist, set)| (artist.clone(), set.len()))
-        .collect();
+    let mut top: Vec<(String, usize)> =
+        artist_counts.iter().map(|(artist, set)| (artist.clone(), set.len())).collect();
     top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     top.truncate(5);
 
@@ -7980,10 +7403,7 @@ fn render_artist_summary(
         let inner = top
             .iter()
             .map(|(artist, count)| {
-                format!(
-                    r#"<span class="pill">@{} · {count}</span>"#,
-                    escape_html(artist)
-                )
+                format!(r#"<span class="pill">@{} · {count}</span>"#, escape_html(artist))
             })
             .collect::<Vec<_>>()
             .join(" ");
@@ -8052,11 +7472,8 @@ fn render_export_card() -> String {
 }
 
 fn render_live_status_panel(status: &OperationStatus) -> String {
-    let (phase_label, phase_class) = if status.phase == "idle" {
-        ("Idle", "pill")
-    } else {
-        (status.phase.as_str(), "pill ok")
-    };
+    let (phase_label, phase_class) =
+        if status.phase == "idle" { ("Idle", "pill") } else { (status.phase.as_str(), "pill ok") };
 
     let detail = status.detail.clone().unwrap_or_else(|| {
         if status.phase == "idle" {

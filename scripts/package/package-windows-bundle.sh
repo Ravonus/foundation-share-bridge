@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 DIST_ROOT="$PROJECT_DIR/dist"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$PROJECT_DIR/Cargo.toml" | head -n 1)"
 APP_NAME="FoundationShareBridge-${VERSION}-windows"
@@ -49,12 +49,12 @@ mkdir -p "$PAYLOAD_BIN_DIR" "$PAYLOAD_SCRIPT_DIR" "$DIST_ROOT"
 
 cp "$BINARY_PATH" "$PAYLOAD_BIN_DIR/foundation-share-bridge.exe"
 cp "$PROJECT_DIR/docker-compose.yml" "$PAYLOAD_DIR/docker-compose.yml"
-cp "$PROJECT_DIR/scripts/install.ps1" "$PAYLOAD_SCRIPT_DIR/install.ps1"
-cp "$PROJECT_DIR/scripts/uninstall.ps1" "$PAYLOAD_SCRIPT_DIR/uninstall.ps1"
-cp "$PROJECT_DIR/scripts/install-windows-service.ps1" "$PAYLOAD_SCRIPT_DIR/install-windows-service.ps1"
-cp "$PROJECT_DIR/scripts/uninstall-windows-service.ps1" "$PAYLOAD_SCRIPT_DIR/uninstall-windows-service.ps1"
-cp "$PROJECT_DIR/scripts/run-bridge-stack.ps1" "$PAYLOAD_SCRIPT_DIR/run-bridge-stack.ps1"
-cp "$PROJECT_DIR/scripts/handle-deep-link.ps1" "$PAYLOAD_SCRIPT_DIR/handle-deep-link.ps1"
+cp "$PROJECT_DIR/scripts/install/install.ps1" "$PAYLOAD_SCRIPT_DIR/install.ps1"
+cp "$PROJECT_DIR/scripts/uninstall/uninstall.ps1" "$PAYLOAD_SCRIPT_DIR/uninstall.ps1"
+cp "$PROJECT_DIR/scripts/install/install-windows-service.ps1" "$PAYLOAD_SCRIPT_DIR/install-windows-service.ps1"
+cp "$PROJECT_DIR/scripts/uninstall/uninstall-windows-service.ps1" "$PAYLOAD_SCRIPT_DIR/uninstall-windows-service.ps1"
+cp "$PROJECT_DIR/scripts/runtime/run-bridge-stack.ps1" "$PAYLOAD_SCRIPT_DIR/run-bridge-stack.ps1"
+cp "$PROJECT_DIR/scripts/runtime/handle-deep-link.ps1" "$PAYLOAD_SCRIPT_DIR/handle-deep-link.ps1"
 cp "$PROJECT_DIR/LICENSE" "$PACKAGE_DIR/LICENSE"
 
 cat > "$PACKAGE_DIR/Install Foundation Share Bridge.cmd" <<'EOF'

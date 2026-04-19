@@ -1,0 +1,28 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --check
+        language: system
+        pass_filenames: false
+        types_or: [rust]
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        types_or: [rust]
+
+      - id: file-size-guard
+        name: src/*.rs file size (<=600 lines)
+        entry: bash scripts/lint/check-file-size.sh
+        language: system
+        pass_filenames: false
+
+      - id: folder-fanout-guard
+        name: folder fanout (<=6 children)
+        entry: bash scripts/lint/check-folder-fanout.sh
+        language: system
+        pass_filenames: false

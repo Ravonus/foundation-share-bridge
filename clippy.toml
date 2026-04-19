@@ -1,0 +1,9 @@
+# clippy.toml — per-lint numeric thresholds.
+#
+# Policy rules (deny / warn levels) live in Cargo.toml [lints.clippy].
+# This file ONLY tunes the thresholds those lints use.
+
+too-many-arguments-threshold  = 4
+too-many-lines-threshold      = 80
+type-complexity-threshold     = 250
+cognitive-complexity-threshold = 15

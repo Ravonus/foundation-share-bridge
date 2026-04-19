@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PAYLOAD_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PAYLOAD_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 AGENT_LABEL="com.ravonus.foundation-share-bridge"
 MENU_AGENT_LABEL="com.ravonus.foundation-share-bridge.menu"
 SERVICE_NAME="Foundation Share Bridge"
@@ -99,7 +99,10 @@ build_or_resolve_binary() {
 build_or_resolve_menu_binary() {
   local source_root="$1"
   local bundled_binary="$source_root/bin/foundation-share-bridge-menu"
-  local menu_source="$source_root/scripts/foundation-share-bridge-menu.swift"
+  local menu_source="$source_root/scripts/menu/foundation-share-bridge-menu.swift"
+  if [ ! -f "$menu_source" ]; then
+    menu_source="$source_root/scripts/foundation-share-bridge-menu.swift"
+  fi
   local built_binary="$source_root/target/foundation-share-bridge-menu"
 
   if [ -x "$bundled_binary" ]; then
@@ -123,12 +126,26 @@ build_or_resolve_menu_binary() {
   printf '%s\n' "$built_binary"
 }
 
+resolve_scripts_asset() {
+  local source_root="$1"
+  local subfolder="$2"
+  local file_name="$3"
+  local nested="$source_root/scripts/$subfolder/$file_name"
+  local flat="$source_root/scripts/$file_name"
+
+  if [ -f "$nested" ]; then
+    printf '%s\n' "$nested"
+  else
+    printf '%s\n' "$flat"
+  fi
+}
+
 SOURCE_ROOT="$(resolve_source_root)"
 BINARY_SOURCE="$(build_or_resolve_binary "$SOURCE_ROOT")"
 MENU_BINARY_SOURCE="$(build_or_resolve_menu_binary "$SOURCE_ROOT")"
 COMPOSE_SOURCE="$SOURCE_ROOT/docker-compose.yml"
-RUN_SCRIPT_SOURCE="$SOURCE_ROOT/scripts/run-bridge-stack.sh"
-DEEP_LINK_SCRIPT_SOURCE="$SOURCE_ROOT/scripts/handle-deep-link.sh"
+RUN_SCRIPT_SOURCE="$(resolve_scripts_asset "$SOURCE_ROOT" "runtime" "run-bridge-stack.sh")"
+DEEP_LINK_SCRIPT_SOURCE="$(resolve_scripts_asset "$SOURCE_ROOT" "runtime" "handle-deep-link.sh")"
 LOGO_LIGHT_SOURCE="$SOURCE_ROOT/assets/logo-light.png"
 LOGO_DARK_SOURCE="$SOURCE_ROOT/assets/logo-dark.png"
 

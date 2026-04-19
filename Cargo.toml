@@ -23,3 +23,34 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 url = "2.5.8"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
+
+[lints.rust]
+unsafe_code     = "forbid"
+missing_docs    = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+# Broad groups, warn-level so they don't wall off iteration.
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+
+# User's hard rules — deny. These are the guardrails preventing re-monolithing.
+too_many_arguments   = "deny"
+too_many_lines       = "deny"
+cognitive_complexity = "deny"
+large_enum_variant   = "deny"
+
+# Safety / correctness — strict. Current code already satisfies these
+# (0 unwrap, 1 expect, 0 panic, 0 dbg, 0 todo, 0 unsafe) so we lock them in.
+unwrap_used      = "deny"
+expect_used      = "warn"
+panic            = "deny"
+dbg_macro        = "deny"
+todo             = "warn"
+unimplemented    = "deny"
+await_holding_lock = "deny"
+
+# Pedantic rules that are too noisy or counterproductive in practice.
+module_name_repetitions = "allow"
+missing_errors_doc      = "warn"
+missing_panics_doc      = "warn"

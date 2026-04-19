@@ -2,8 +2,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir ".."))
-$payloadRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir ".."))
+$repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir "..\.."))
+$payloadRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir "..\.."))
 $serviceName = "Foundation Share Bridge"
 $taskName = "FoundationShareBridge"
 $runtimeDir = Join-Path $env:LOCALAPPDATA "FoundationShareBridge"
@@ -84,11 +84,19 @@ function Warn-MissingContainerRuntime {
   Write-Warning "Docker Desktop was not found. The background task can still be installed, but the bundled Kubo node will not come online until Docker Desktop is installed."
 }
 
+function Resolve-ScriptsAsset([string]$sourceRoot, [string]$subfolder, [string]$fileName) {
+  $nested = Join-Path $sourceRoot (Join-Path "scripts" (Join-Path $subfolder $fileName))
+  if (Test-Path $nested) {
+    return $nested
+  }
+  return (Join-Path $sourceRoot (Join-Path "scripts" $fileName))
+}
+
 $sourceRoot = Resolve-SourceRoot
 $binarySource = Build-OrResolveBinary -sourceRoot $sourceRoot
 $composeSource = Join-Path $sourceRoot "docker-compose.yml"
-$runScriptSource = Join-Path $sourceRoot "scripts\run-bridge-stack.ps1"
-$deepLinkScriptSource = Join-Path $sourceRoot "scripts\handle-deep-link.ps1"
+$runScriptSource = Resolve-ScriptsAsset -sourceRoot $sourceRoot -subfolder "runtime" -fileName "run-bridge-stack.ps1"
+$deepLinkScriptSource = Resolve-ScriptsAsset -sourceRoot $sourceRoot -subfolder "runtime" -fileName "handle-deep-link.ps1"
 
 if (-not (Test-Path $binarySource)) {
   throw "Bridge binary was not found at $binarySource"

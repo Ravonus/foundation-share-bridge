@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 DIST_ROOT="$PROJECT_DIR/dist"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$PROJECT_DIR/Cargo.toml" | head -n 1)"
 APP_NAME="FoundationShareBridge-${VERSION}-linux"
@@ -46,12 +46,12 @@ mkdir -p "$PAYLOAD_BIN_DIR" "$PAYLOAD_SCRIPT_DIR" "$DIST_ROOT"
 
 cp "$BINARY_PATH" "$PAYLOAD_BIN_DIR/foundation-share-bridge"
 cp "$PROJECT_DIR/docker-compose.yml" "$PAYLOAD_DIR/docker-compose.yml"
-cp "$PROJECT_DIR/scripts/install.sh" "$PAYLOAD_SCRIPT_DIR/install.sh"
-cp "$PROJECT_DIR/scripts/uninstall.sh" "$PAYLOAD_SCRIPT_DIR/uninstall.sh"
-cp "$PROJECT_DIR/scripts/install-linux-service.sh" "$PAYLOAD_SCRIPT_DIR/install-linux-service.sh"
-cp "$PROJECT_DIR/scripts/uninstall-linux-service.sh" "$PAYLOAD_SCRIPT_DIR/uninstall-linux-service.sh"
-cp "$PROJECT_DIR/scripts/run-bridge-stack-linux.sh" "$PAYLOAD_SCRIPT_DIR/run-bridge-stack-linux.sh"
-cp "$PROJECT_DIR/scripts/handle-deep-link.sh" "$PAYLOAD_SCRIPT_DIR/handle-deep-link.sh"
+cp "$PROJECT_DIR/scripts/install/install.sh" "$PAYLOAD_SCRIPT_DIR/install.sh"
+cp "$PROJECT_DIR/scripts/uninstall/uninstall.sh" "$PAYLOAD_SCRIPT_DIR/uninstall.sh"
+cp "$PROJECT_DIR/scripts/install/install-linux-service.sh" "$PAYLOAD_SCRIPT_DIR/install-linux-service.sh"
+cp "$PROJECT_DIR/scripts/uninstall/uninstall-linux-service.sh" "$PAYLOAD_SCRIPT_DIR/uninstall-linux-service.sh"
+cp "$PROJECT_DIR/scripts/runtime/run-bridge-stack-linux.sh" "$PAYLOAD_SCRIPT_DIR/run-bridge-stack-linux.sh"
+cp "$PROJECT_DIR/scripts/runtime/handle-deep-link.sh" "$PAYLOAD_SCRIPT_DIR/handle-deep-link.sh"
 cp "$PROJECT_DIR/LICENSE" "$PACKAGE_DIR/LICENSE"
 
 cat > "$PACKAGE_DIR/install-foundation-share-bridge.sh" <<'EOF'
