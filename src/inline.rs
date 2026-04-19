@@ -9,9 +9,9 @@
 #![allow(clippy::nursery)]
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     env,
-    net::{Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -37,16 +37,25 @@ use crate::{
         },
         pin::{
             AddFilesResult, AddedFileEntry, ExportQuery, InventoryEntryDescriptor,
-            InventorySourcePin, PinCidRequest, PinCidResult, PinInventoryItem, PinLsResponse,
-            PinVerification, PinsPageQuery, PinsPageResponse, PinsResponse, RepairCycleOutcome,
-            RepairNowResponse, ResolvedWorkDisplay, RetryPinResponse, RetrySyncResponse,
-            SetPinTagsRequest, SetPinTagsResponse, SyncNowResponse, SyncOutcome,
-            UnwatchPinsRequest, UnwatchPinsResponse, VerifyPinsRequest, VerifyPinsResponse,
-            WatchPinInput, WatchedPin,
-            dependency::{
-                build_work_dependency_input, collect_dependency_refs_from_json_value,
-                enqueue_dependency_probe, extract_absolute_ipfs_reference_strings,
-                is_dependency_probe_candidate, push_unique_dependency,
+            InventorySourcePin, PinCidRequest, PinCidResult, PinInventoryItem, PinVerification,
+            PinsPageQuery, PinsPageResponse, PinsResponse, RepairCycleOutcome, RepairNowResponse,
+            ResolvedWorkDisplay, RetryPinResponse, RetrySyncResponse, SetPinTagsRequest,
+            SetPinTagsResponse, SyncNowResponse, SyncOutcome, UnwatchPinsRequest,
+            UnwatchPinsResponse, VerifyPinsRequest, VerifyPinsResponse, WatchPinInput, WatchedPin,
+            client::{
+                discovery::{
+                    discover_work_dependency_inputs, load_work_metadata_record,
+                    resolve_work_root_file_hints,
+                },
+                kubo::{
+                    fetch_kubo_repo_stat, is_cid_pinned, list_kubo_pinset, pin_single_cid,
+                    resolve_single_child_path,
+                },
+                remote::submit_to_remote_pinning_service,
+                sync::{
+                    detect_media_kind_for_url, measure_synced_bytes_on_disk, sync_cid_if_enabled,
+                    sync_cid_to_download_dir,
+                },
             },
             inventory::{
                 INVENTORY_PAGE_SIZE, build_single_inventory_item, categorize_pin_error,
@@ -55,8 +64,8 @@ use crate::{
                 resolve_inventory_page_size,
             },
             metadata::{
-                build_metadata_view, detect_media_kind_from_text, metadata_file_url,
-                metadata_image_url, metadata_primary_media_url,
+                build_metadata_view, metadata_file_url, metadata_image_url,
+                metadata_primary_media_url,
             },
         },
         relay::{
@@ -72,30 +81,24 @@ use crate::{
         },
         system::{
             ArtistEntry, ArtistSummary, DiagnoseResponse, GatewayHealthResponse, HealthResponse,
-            KuboRepoStat, StorageSnapshot,
+            StorageSnapshot, check_gateway_reachability, detect_public_ipv4, gateway_health_probe,
         },
     },
     util::{
         data::{
             first_present_error, first_present_string, max_timestamp_by, unique_trimmed_strings,
         },
-        file::{
-            ensure_leaf_file_extension, leaf_name_from_ipfs_path,
-            preferred_file_name_from_relative_path, sniff_leaf_file_extension,
-        },
         format::{format_bytes_human, format_timestamp},
         text::{csv_escape, escape_html, sanitize_custom_tag},
         url::{
             PUBLIC_UTILITY_GATEWAY_BASE_URL, build_direct_ip_gateway_base_url,
             build_gateway_asset_url, build_gateway_url, encode_query_component,
-            normalize_asset_url_for_gateway, parse_ipfs_path, parse_ipfs_reference,
-            trim_trailing_slash,
+            normalize_asset_url_for_gateway, trim_trailing_slash,
         },
     },
 };
 
 use anyhow::{Context, anyhow};
-use async_recursion::async_recursion;
 use axum::{
     Form, Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State},
@@ -110,7 +113,6 @@ use axum::{
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt, stream};
 use reqwest::Client;
-use serde::Deserialize;
 use tokio::time::sleep;
 use tokio::{
     fs,
@@ -129,9 +131,6 @@ use url::Url;
 use uuid::Uuid;
 
 const VERIFY_CONCURRENCY: usize = 6;
-const MAX_DISCOVERY_TEXT_BYTES: usize = 512 * 1024;
-const MAX_DEPENDENCY_DISCOVERY_DEPTH: usize = 2;
-const MAX_DEPENDENCY_SCAN_CIDS: usize = 24;
 const MAX_UPLOAD_BYTES: usize = 5 * 1024 * 1024 * 1024;
 
 async fn add_private_network_access_header(mut response: Response) -> Response {
@@ -2675,7 +2674,7 @@ async fn mark_pin_checked(
     persist_bridge_state(state).await.map_err(AppError::internal)
 }
 
-async fn mark_pin_synced(
+pub(crate) async fn mark_pin_synced(
     state: &AppState,
     cid: &str,
     sync_path: String,
@@ -2701,7 +2700,11 @@ async fn mark_pin_synced(
     persist_bridge_state(state).await
 }
 
-async fn mark_pin_sync_failed(state: &AppState, cid: &str, message: String) -> anyhow::Result<()> {
+pub(crate) async fn mark_pin_sync_failed(
+    state: &AppState,
+    cid: &str,
+    message: String,
+) -> anyhow::Result<()> {
     {
         let mut persistent = state.persistent.write().await;
         let now = Utc::now();
@@ -2714,407 +2717,6 @@ async fn mark_pin_sync_failed(state: &AppState, cid: &str, message: String) -> a
     }
 
     persist_bridge_state(state).await
-}
-
-async fn detect_public_ipv4(state: &AppState) -> Option<String> {
-    #[derive(Debug, Deserialize)]
-    struct IpifyResponse {
-        ip: String,
-    }
-
-    let response = state
-        .http
-        .get("https://api4.ipify.org?format=json")
-        .timeout(Duration::from_secs(4))
-        .send()
-        .await
-        .ok()?;
-
-    if !response.status().is_success() {
-        return None;
-    }
-
-    let payload = response.json::<IpifyResponse>().await.ok()?;
-    let parsed = payload.ip.parse::<Ipv4Addr>().ok()?;
-    Some(parsed.to_string())
-}
-
-async fn list_kubo_pinset(state: &AppState) -> anyhow::Result<HashMap<String, String>> {
-    let endpoint = format!("{}/api/v0/pin/ls", state.ipfs_api_url.trim_end_matches('/'));
-
-    let mut request = state.http.post(endpoint);
-    if let Some(header) = &state.ipfs_api_auth_header {
-        request = request.header("Authorization", header);
-    }
-
-    let response = request.send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Unable to list the local IPFS pinset: {body}"));
-    }
-
-    let payload = response.json::<PinLsResponse>().await?;
-    let mut pins = HashMap::new();
-    for (cid, entry) in payload.keys.unwrap_or_default() {
-        pins.insert(cid, entry.kind.unwrap_or_else(|| "recursive".to_string()));
-    }
-
-    Ok(pins)
-}
-
-async fn fetch_ipfs_text(state: &AppState, ipfs_path: &str) -> anyhow::Result<Option<String>> {
-    let endpoint = format!("{}/api/v0/cat", state.ipfs_api_url.trim_end_matches('/'));
-    let mut request = state.http.post(endpoint).query(&[("arg", ipfs_path)]);
-    if let Some(header) = &state.ipfs_api_auth_header {
-        request = request.header("Authorization", header);
-    }
-
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-
-    let body = response.bytes().await?;
-    if body.is_empty() {
-        return Ok(None);
-    }
-
-    let bounded = &body[..body.len().min(MAX_DISCOVERY_TEXT_BYTES)];
-    if bounded.contains(&0) {
-        return Ok(None);
-    }
-
-    Ok(Some(String::from_utf8_lossy(bounded).into_owned()))
-}
-
-async fn resolve_dependency_probe_paths(
-    state: &AppState,
-    cid: &str,
-    preferred_file_name: Option<&str>,
-) -> Vec<String> {
-    let root_path = format!("/ipfs/{}", cid.trim());
-    let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
-    let mut push_candidate = |path: String| {
-        if seen.insert(path.clone()) {
-            candidates.push(path);
-        }
-    };
-
-    if preferred_file_name.filter(|value| is_dependency_probe_candidate(value)).is_some() {
-        push_candidate(root_path.clone());
-    }
-
-    match list_ipfs_links(state, &root_path).await {
-        Ok(links) if links.is_empty() => {
-            push_candidate(root_path);
-        }
-        Ok(links) => {
-            for preferred_name in ["index.html", "metadata.json"] {
-                if let Some(name) = links
-                    .iter()
-                    .filter_map(|link| link.get("Name").and_then(|value| value.as_str()))
-                    .map(str::trim)
-                    .find(|name| name.eq_ignore_ascii_case(preferred_name))
-                {
-                    push_candidate(format!("{}/{}", root_path, name));
-                }
-            }
-
-            for name in links
-                .iter()
-                .filter_map(|link| link.get("Name").and_then(|value| value.as_str()))
-                .map(str::trim)
-                .filter(|name| !name.is_empty() && is_dependency_probe_candidate(name))
-            {
-                push_candidate(format!("{}/{}", root_path, name));
-            }
-        }
-        Err(_) => {
-            if preferred_file_name.filter(|value| is_dependency_probe_candidate(value)).is_some() {
-                push_candidate(root_path);
-            }
-        }
-    }
-
-    candidates.truncate(6);
-    candidates
-}
-
-async fn resolve_work_root_file_hints(
-    state: &AppState,
-    input: &RelayShareWorkPayload,
-) -> (Option<String>, Option<String>) {
-    let metadata_hint = if let Some(metadata_cid) =
-        input.metadata_cid.as_deref().filter(|cid| !cid.trim().is_empty())
-    {
-        if let Some(child) = resolve_single_child_path(state, metadata_cid, &[".json"]).await {
-            preferred_file_name_from_relative_path(&child)
-        } else if !input.token_id.trim().is_empty() {
-            Some(format!("{}.json", input.token_id.trim()))
-        } else {
-            Some("metadata.json".to_string())
-        }
-    } else {
-        None
-    };
-
-    let media_hint =
-        if let Some(media_cid) = input.media_cid.as_deref().filter(|cid| !cid.trim().is_empty()) {
-            let metadata = if let Some(metadata_cid) =
-                input.metadata_cid.as_deref().filter(|cid| !cid.trim().is_empty())
-            {
-                load_work_metadata_record(state, metadata_cid, Some(&input.token_id)).await
-            } else {
-                None
-            };
-
-            let from_metadata = metadata.as_ref().and_then(|record| {
-                [
-                    metadata_primary_media_url(record),
-                    metadata_file_url(record),
-                    metadata_image_url(record),
-                ]
-                .into_iter()
-                .flatten()
-                .find_map(|raw| match parse_ipfs_reference(&raw) {
-                    Some((candidate_cid, relative_path))
-                        if candidate_cid.trim() == media_cid.trim() =>
-                    {
-                        preferred_file_name_from_relative_path(&relative_path)
-                    }
-                    _ => None,
-                })
-            });
-
-            if from_metadata.is_some() {
-                from_metadata
-            } else {
-                resolve_single_child_path(state, media_cid, &[])
-                    .await
-                    .and_then(|child| preferred_file_name_from_relative_path(&child))
-            }
-        } else {
-            None
-        };
-
-    (metadata_hint, media_hint)
-}
-
-async fn discover_work_dependency_inputs(
-    state: &AppState,
-    input: &RelayShareWorkPayload,
-    metadata_hint: Option<String>,
-    media_hint: Option<String>,
-) -> Vec<WatchPinInput> {
-    let mut dependencies = Vec::new();
-    let mut queued = HashSet::new();
-    let mut scanned = HashSet::new();
-    let mut queue = VecDeque::<(String, Option<String>, usize)>::new();
-
-    let root_cids = [
-        input
-            .metadata_cid
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned),
-        input
-            .media_cid
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<HashSet<_>>();
-
-    if let Some(metadata_cid) =
-        input.metadata_cid.as_deref().map(str::trim).filter(|value| !value.is_empty())
-    {
-        enqueue_dependency_probe(
-            &mut queued,
-            &mut queue,
-            metadata_cid.to_string(),
-            metadata_hint.clone(),
-            0,
-        );
-        if let Some(metadata) =
-            load_work_metadata_record(state, metadata_cid, Some(&input.token_id)).await
-        {
-            collect_dependency_refs_from_json_value(&metadata, &mut dependencies);
-        }
-    }
-
-    if let Some(media_cid) =
-        input.media_cid.as_deref().map(str::trim).filter(|value| !value.is_empty())
-    {
-        enqueue_dependency_probe(
-            &mut queued,
-            &mut queue,
-            media_cid.to_string(),
-            media_hint.clone(),
-            0,
-        );
-    }
-
-    for dependency in dependencies.clone() {
-        if !root_cids.contains(&dependency.cid) {
-            enqueue_dependency_probe(
-                &mut queued,
-                &mut queue,
-                dependency.cid,
-                dependency.preferred_file_name,
-                1,
-            );
-        }
-    }
-
-    while let Some((cid, preferred_file_name, depth)) = queue.pop_front() {
-        if scanned.len() >= MAX_DEPENDENCY_SCAN_CIDS || !scanned.insert(cid.clone()) {
-            continue;
-        }
-
-        let probe_paths =
-            resolve_dependency_probe_paths(state, &cid, preferred_file_name.as_deref()).await;
-        for probe_path in probe_paths {
-            let Ok(Some(text)) = fetch_ipfs_text(state, &probe_path).await else {
-                continue;
-            };
-            for dependency in extract_absolute_ipfs_reference_strings(&text) {
-                if root_cids.contains(&dependency.cid) {
-                    continue;
-                }
-
-                let is_new = push_unique_dependency(&mut dependencies, dependency.clone());
-                if depth < MAX_DEPENDENCY_DISCOVERY_DEPTH && is_new {
-                    enqueue_dependency_probe(
-                        &mut queued,
-                        &mut queue,
-                        dependency.cid,
-                        dependency.preferred_file_name,
-                        depth + 1,
-                    );
-                }
-            }
-        }
-    }
-
-    dependencies
-        .into_iter()
-        .filter(|dependency| !root_cids.contains(&dependency.cid))
-        .map(|dependency| build_work_dependency_input(input, dependency))
-        .collect()
-}
-
-async fn detect_media_kind_for_url(
-    state: &AppState,
-    local_url: Option<&str>,
-    hints: &[Option<String>],
-) -> Option<String> {
-    for value in hints.iter().flatten() {
-        if let Some(kind) = detect_media_kind_from_text(value) {
-            return Some(kind);
-        }
-    }
-
-    let url = local_url?.trim();
-    if url.is_empty() {
-        return None;
-    }
-
-    let response = state.http.head(url).timeout(Duration::from_secs(6)).send().await.ok()?;
-
-    if let Some(content_type) = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(detect_media_kind_from_text)
-    {
-        return Some(content_type);
-    }
-
-    detect_media_kind_from_text(response.url().as_str())
-}
-
-async fn fetch_ipfs_json(
-    state: &AppState,
-    ipfs_path: &str,
-) -> anyhow::Result<Option<serde_json::Value>> {
-    let endpoint = format!("{}/api/v0/cat", state.ipfs_api_url.trim_end_matches('/'));
-    let mut request = state.http.post(endpoint).query(&[("arg", ipfs_path)]);
-    if let Some(header) = &state.ipfs_api_auth_header {
-        request = request.header("Authorization", header);
-    }
-
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-
-    let body = response.bytes().await?;
-    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
-    Ok(parsed)
-}
-
-async fn resolve_single_child_path(
-    state: &AppState,
-    cid: &str,
-    required_suffixes: &[&str],
-) -> Option<String> {
-    let links = list_ipfs_links(state, &format!("/ipfs/{}", cid.trim())).await.ok()?;
-    if links.is_empty() {
-        return None;
-    }
-
-    let mut names = links
-        .iter()
-        .filter_map(|link| link.get("Name").and_then(|value| value.as_str()))
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .filter(|name| {
-            required_suffixes.is_empty()
-                || required_suffixes.iter().any(|suffix| name.ends_with(suffix))
-        })
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-
-    names.dedup();
-    (names.len() == 1).then(|| names.remove(0))
-}
-
-async fn load_work_metadata_record(
-    state: &AppState,
-    metadata_cid: &str,
-    token_id: Option<&str>,
-) -> Option<serde_json::Value> {
-    let mut candidates = Vec::new();
-    let cid = metadata_cid.trim();
-
-    if let Some(token_id) = token_id.map(str::trim).filter(|value| !value.is_empty()) {
-        candidates.push(format!("/ipfs/{cid}/{token_id}.json"));
-        candidates.push(format!("/ipfs/{cid}/{token_id}"));
-    }
-
-    candidates.push(format!("/ipfs/{cid}/metadata.json"));
-    if let Some(single_json_child) = resolve_single_child_path(state, cid, &[".json"]).await {
-        candidates.push(format!("/ipfs/{cid}/{single_json_child}"));
-    }
-    candidates.push(format!("/ipfs/{cid}"));
-
-    let mut seen = HashSet::new();
-    for candidate in candidates {
-        if !seen.insert(candidate.clone()) {
-            continue;
-        }
-        if let Ok(Some(metadata)) = fetch_ipfs_json(state, &candidate).await {
-            return Some(metadata);
-        }
-    }
-
-    None
 }
 
 async fn resolve_work_display(
@@ -3369,16 +2971,6 @@ async fn list_local_pin_inventory_page(
     })
 }
 
-async fn sync_cid_if_enabled(state: &AppState, cid: &str) -> anyhow::Result<bool> {
-    let sync_enabled = { state.config.read().await.sync_enabled };
-    if !sync_enabled {
-        return Ok(false);
-    }
-
-    sync_cid_to_download_dir(state, cid).await?;
-    Ok(true)
-}
-
 async fn sync_all_watched_pins(state: &AppState, force: bool) -> anyhow::Result<SyncOutcome> {
     let watched =
         { state.persistent.read().await.watched_pins.values().cloned().collect::<Vec<_>>() };
@@ -3407,212 +2999,6 @@ async fn sync_all_watched_pins(state: &AppState, force: bool) -> anyhow::Result<
     }
 
     Ok(outcome)
-}
-
-async fn sync_cid_to_download_dir(state: &AppState, cid: &str) -> anyhow::Result<PathBuf> {
-    let config = { state.config.read().await.clone() };
-    let root_dir = PathBuf::from(config.download_root_dir.clone()).join(cid.trim());
-
-    let sync_result = async {
-        if fs::try_exists(&root_dir).await.unwrap_or(false) {
-            let _ = fs::remove_dir_all(&root_dir).await;
-        }
-
-        fs::create_dir_all(&root_dir)
-            .await
-            .with_context(|| format!("Unable to create sync directory {}", root_dir.display()))?;
-
-        download_ipfs_path_recursive(state, &format!("/ipfs/{}", cid.trim()), &root_dir).await?;
-
-        let local_gateway_url = build_gateway_url(&config.local_gateway_base_url, cid);
-        let public_gateway_url = build_gateway_url(&config.public_gateway_base_url, cid);
-
-        mark_pin_synced(
-            state,
-            cid,
-            root_dir.display().to_string(),
-            local_gateway_url,
-            public_gateway_url,
-        )
-        .await?;
-
-        Ok::<PathBuf, anyhow::Error>(root_dir.clone())
-    }
-    .await;
-
-    if let Err(error) = &sync_result {
-        let _ = mark_pin_sync_failed(state, cid, error.to_string()).await;
-    }
-
-    sync_result
-}
-
-async fn resolve_sync_leaf_file_name(state: &AppState, ipfs_path: &str, bytes: &[u8]) -> String {
-    let mut file_name = leaf_name_from_ipfs_path(ipfs_path);
-
-    if file_name.is_none()
-        && let Some((cid, relative_path)) = parse_ipfs_path(ipfs_path)
-        && relative_path.is_empty()
-    {
-        file_name = state
-            .persistent
-            .read()
-            .await
-            .watched_pins
-            .get(&cid)
-            .and_then(|pin| pin.preferred_file_name.clone());
-    }
-
-    let mut resolved = file_name.unwrap_or_else(|| "content".to_string());
-    if let Some(extension) = sniff_leaf_file_extension(bytes) {
-        resolved = ensure_leaf_file_extension(&resolved, extension);
-    }
-    resolved
-}
-
-async fn download_ipfs_leaf(
-    state: &AppState,
-    ipfs_path: &str,
-    destination_dir: &Path,
-) -> anyhow::Result<()> {
-    let endpoint = format!("{}/api/v0/cat", state.ipfs_api_url.trim_end_matches('/'));
-    let mut request = state.http.post(endpoint).query(&[("arg", ipfs_path)]);
-    if let Some(header) = &state.ipfs_api_auth_header {
-        request = request.header("Authorization", header);
-    }
-
-    let response = request.send().await?;
-    let status = response.status();
-
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Unable to download IPFS file {ipfs_path}: {body}"));
-    }
-
-    let bytes = response.bytes().await?;
-    let file_name = resolve_sync_leaf_file_name(state, ipfs_path, &bytes).await;
-    let target_file = destination_dir.join(file_name);
-
-    if let Some(parent) = target_file.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("Unable to create file directory {}", parent.display()))?;
-    }
-
-    fs::write(&target_file, &bytes).await.with_context(|| {
-        format!("Unable to write synced IPFS file to {}", target_file.display())
-    })?;
-
-    Ok(())
-}
-
-#[async_recursion]
-async fn download_ipfs_path_recursive(
-    state: &AppState,
-    ipfs_path: &str,
-    destination_dir: &Path,
-) -> anyhow::Result<()> {
-    let links = match list_ipfs_links(state, ipfs_path).await {
-        Ok(links) => links,
-        Err(_) => {
-            download_ipfs_leaf(state, ipfs_path, destination_dir).await?;
-            return Ok(());
-        }
-    };
-
-    if links.is_empty() {
-        download_ipfs_leaf(state, ipfs_path, destination_dir).await?;
-        return Ok(());
-    }
-
-    fs::create_dir_all(destination_dir).await.with_context(|| {
-        format!("Unable to create destination directory {}", destination_dir.display())
-    })?;
-
-    for link in links {
-        let name = link.get("Name").and_then(|value| value.as_str()).unwrap_or("").trim();
-        if name.is_empty() {
-            continue;
-        }
-
-        let child_destination = destination_dir.join(name);
-        let child_ipfs_path = format!("{}/{}", ipfs_path.trim_end_matches('/'), name);
-        let link_type = link.get("Type").and_then(|value| value.as_i64()).unwrap_or(0);
-
-        if matches!(link_type, 1 | 5) {
-            download_ipfs_path_recursive(state, &child_ipfs_path, &child_destination).await?;
-        } else {
-            download_ipfs_file(state, &child_ipfs_path, &child_destination).await?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn list_ipfs_links(
-    state: &AppState,
-    ipfs_path: &str,
-) -> anyhow::Result<Vec<serde_json::Value>> {
-    let endpoint = format!("{}/api/v0/ls", state.ipfs_api_url.trim_end_matches('/'));
-
-    let mut request = state.http.post(endpoint).query(&[("arg", ipfs_path)]);
-    if let Some(header) = &state.ipfs_api_auth_header {
-        request = request.header("Authorization", header);
-    }
-
-    let response = request.send().await?;
-    let status = response.status();
-    let payload = response.text().await.unwrap_or_default();
-
-    if !status.is_success() {
-        return Err(anyhow!("Unable to list IPFS path {ipfs_path}: {payload}"));
-    }
-
-    let json = serde_json::from_str::<serde_json::Value>(&payload)?;
-    let links = json
-        .get("Objects")
-        .and_then(|value| value.as_array())
-        .and_then(|objects| objects.first())
-        .and_then(|object| object.get("Links"))
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    Ok(links)
-}
-
-async fn download_ipfs_file(
-    state: &AppState,
-    ipfs_path: &str,
-    destination_file: &Path,
-) -> anyhow::Result<()> {
-    if let Some(parent) = destination_file.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("Unable to create file directory {}", parent.display()))?;
-    }
-
-    let endpoint = format!("{}/api/v0/cat", state.ipfs_api_url.trim_end_matches('/'));
-
-    let mut request = state.http.post(endpoint).query(&[("arg", ipfs_path)]);
-    if let Some(header) = &state.ipfs_api_auth_header {
-        request = request.header("Authorization", header);
-    }
-
-    let response = request.send().await?;
-    let status = response.status();
-
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Unable to download IPFS file {ipfs_path}: {body}"));
-    }
-
-    let bytes = response.bytes().await?;
-    fs::write(destination_file, &bytes).await.with_context(|| {
-        format!("Unable to write synced IPFS file to {}", destination_file.display())
-    })?;
-
-    Ok(())
 }
 
 async fn clear_relay_link(state: &AppState) -> anyhow::Result<()> {
@@ -4012,144 +3398,6 @@ async fn record_pin_failure(
     Ok(())
 }
 
-async fn is_cid_pinned(state: &AppState, cid: &str) -> anyhow::Result<bool> {
-    let endpoint =
-        format!("{}/api/v0/pin/ls?arg={}", state.ipfs_api_url.trim_end_matches('/'), cid.trim());
-
-    let mut request = state.http.post(endpoint);
-    if let Some(header) = &state.ipfs_api_auth_header {
-        request = request.header("Authorization", header);
-    }
-
-    let response = request.send().await?;
-    if response.status().is_success() {
-        return Ok(true);
-    }
-
-    let body = response.text().await.unwrap_or_default();
-    if body.to_lowercase().contains("not pinned") {
-        return Ok(false);
-    }
-
-    Err(anyhow!("Unable to verify pin status for {cid}: {body}"))
-}
-
-async fn pin_single_cid(
-    state: &AppState,
-    cid: &str,
-    label: Option<String>,
-) -> Result<PinCidResult, AppError> {
-    let trimmed = cid.trim();
-    if trimmed.is_empty() {
-        return Err(AppError::bad_request("CID is required"));
-    }
-
-    let endpoint =
-        format!("{}/api/v0/pin/add?arg={}", state.ipfs_api_url.trim_end_matches('/'), trimmed);
-
-    let mut request = state.http.post(endpoint);
-    if let Some(header) = &state.ipfs_api_auth_header {
-        request = request.header("Authorization", header);
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|error| AppError::internal(anyhow!("Failed to reach IPFS API: {error}")))?;
-
-    let status = response.status();
-
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(AppError::internal(anyhow!(
-            "IPFS pin failed with status {}: {}",
-            status,
-            body
-        )));
-    }
-
-    let payload = response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| AppError::internal(anyhow!("Unable to decode IPFS response: {error}")))?;
-
-    let pin_reference = payload
-        .get("Pinned")
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            payload
-                .get("Pins")
-                .and_then(|value| value.as_array())
-                .and_then(|pins| pins.first())
-                .and_then(|value| value.as_str())
-        })
-        .unwrap_or(trimmed)
-        .to_string();
-
-    Ok(PinCidResult {
-        cid: trimmed.to_string(),
-        label,
-        pinned: true,
-        provider: "kubo",
-        pin_reference,
-        requested_at: Utc::now(),
-    })
-}
-
-async fn fetch_kubo_repo_stat(state: &AppState) -> anyhow::Result<KuboRepoStat> {
-    let endpoint = format!("{}/api/v0/repo/stat", state.ipfs_api_url.trim_end_matches('/'));
-    let mut request = state.http.post(endpoint).timeout(Duration::from_secs(8));
-    if let Some(header) = &state.ipfs_api_auth_header {
-        request = request.header("Authorization", header);
-    }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Unable to read IPFS repo/stat: {body}"));
-    }
-    Ok(response.json::<KuboRepoStat>().await?)
-}
-
-#[async_recursion]
-async fn sum_dir_size(path: &Path) -> u64 {
-    let Ok(metadata) = fs::metadata(path).await else {
-        return 0;
-    };
-    if metadata.is_file() {
-        return metadata.len();
-    }
-    if !metadata.is_dir() {
-        return 0;
-    }
-    let Ok(mut entries) = fs::read_dir(path).await else {
-        return 0;
-    };
-    let mut total = 0u64;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let child = entry.path();
-        total = total.saturating_add(sum_dir_size(&child).await);
-    }
-    total
-}
-
-async fn measure_synced_bytes_on_disk(state: &AppState) -> u64 {
-    let paths = {
-        state
-            .persistent
-            .read()
-            .await
-            .watched_pins
-            .values()
-            .filter_map(|pin| pin.sync_path.clone())
-            .collect::<Vec<_>>()
-    };
-    let mut total = 0u64;
-    for path in paths {
-        total = total.saturating_add(sum_dir_size(&PathBuf::from(path)).await);
-    }
-    total
-}
-
 async fn build_storage_snapshot(state: &AppState) -> StorageSnapshot {
     let (repo_size, storage_max, num_objects, ipfs_daemon_reachable) =
         match fetch_kubo_repo_stat(state).await {
@@ -4183,21 +3431,6 @@ async fn compute_next_retry_at(state: &AppState, attempt: u32) -> DateTime<Utc> 
     let base = 30u64.saturating_mul(1u64 << effective.min(10));
     let capped = base.min(60 * 60 * 6);
     Utc::now() + chrono::Duration::seconds(capped as i64)
-}
-
-async fn probe_gateway(client: &Client, url: &str) -> Option<bool> {
-    let response = client.head(url).timeout(Duration::from_secs(5)).send().await.ok()?;
-    Some(response.status().is_success() || response.status().is_redirection())
-}
-
-async fn check_gateway_reachability(state: &AppState, cid: &str) -> (Option<bool>, Option<bool>) {
-    let (local_base, public_base) = {
-        let config = state.config.read().await;
-        (config.local_gateway_base_url.clone(), config.public_gateway_base_url.clone())
-    };
-    let local = probe_gateway(&state.http, &build_gateway_url(&local_base, cid)).await;
-    let public = probe_gateway(&state.http, &build_gateway_url(&public_base, cid)).await;
-    (local, public)
 }
 
 async fn diagnose_pin(state: &AppState, cid: &str) -> DiagnoseResponse {
@@ -4237,78 +3470,6 @@ async fn diagnose_pin(state: &AppState, cid: &str) -> DiagnoseResponse {
         gateway_local_ok,
         gateway_public_ok,
     }
-}
-
-async fn gateway_health_probe(state: &AppState) -> GatewayHealthResponse {
-    let (local_base, public_base) = {
-        let config = state.config.read().await;
-        (config.local_gateway_base_url.clone(), config.public_gateway_base_url.clone())
-    };
-    const PROBE_CID: &str = "bafkqaaa";
-    let local_ok = probe_gateway(&state.http, &build_gateway_url(&local_base, PROBE_CID)).await;
-    let public_ok = probe_gateway(&state.http, &build_gateway_url(&public_base, PROBE_CID)).await;
-    let utility_ok =
-        probe_gateway(&state.http, &build_gateway_url(PUBLIC_UTILITY_GATEWAY_BASE_URL, PROBE_CID))
-            .await;
-    GatewayHealthResponse {
-        local_gateway_base_url: local_base,
-        public_gateway_base_url: public_base,
-        utility_gateway_base_url: PUBLIC_UTILITY_GATEWAY_BASE_URL,
-        local_ok,
-        public_ok,
-        utility_ok,
-        checked_at: Utc::now(),
-    }
-}
-
-async fn submit_to_remote_pinning_service(
-    state: &AppState,
-    cid: &str,
-    name_hint: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    let (enabled, service_name, service_url, token) = {
-        let config = state.config.read().await;
-        (
-            config.remote_pinning_enabled,
-            config.remote_pinning_service_name.clone(),
-            config.remote_pinning_service_url.clone(),
-            config.remote_pinning_access_token.clone(),
-        )
-    };
-    if !enabled {
-        return Ok(None);
-    }
-    let service_url = service_url
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("Remote pinning is enabled but service URL is empty"))?;
-    let token = token
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("Remote pinning is enabled but access token is empty"))?;
-    let endpoint = format!("{}/pins", trim_trailing_slash(&service_url));
-    let mut body = serde_json::json!({"cid": cid.trim()});
-    if let Some(name) = name_hint.map(str::trim).filter(|value| !value.is_empty()) {
-        body["name"] = serde_json::Value::String(name.to_string());
-    }
-    let response = state
-        .http
-        .post(endpoint)
-        .bearer_auth(token.trim())
-        .json(&body)
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await
-        .context("Unable to reach remote pinning service")?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "Remote pin failed ({}): {}",
-            status,
-            text.chars().take(300).collect::<String>()
-        ));
-    }
-    let _ = response.bytes().await;
-    Ok(Some(service_name.unwrap_or_else(|| "remote".to_string())))
 }
 
 async fn set_current_operation(state: &AppState, status: OperationStatus) {
