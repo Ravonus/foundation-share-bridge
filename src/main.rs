@@ -452,6 +452,7 @@ struct RootPageQuery {
     relay_server_url: Option<String>,
     pairing_code: Option<String>,
     device_name: Option<String>,
+    autolink: Option<String>,
     linked: Option<String>,
     unlinked: Option<String>,
     error: Option<String>,
@@ -1313,6 +1314,18 @@ async fn root_page(
         .map_err(AppError::internal)?;
 
     let relay_connected = relay_is_connected(&config);
+    let relay_server_value = query
+        .relay_server_url
+        .as_deref()
+        .unwrap_or(config.relay_server_url.as_str());
+    let pairing_code_value = query.pairing_code.as_deref().unwrap_or("");
+    let device_name_value = query
+        .device_name
+        .as_deref()
+        .or(Some(config.relay_device_name.as_str()))
+        .unwrap_or("Foundation desktop helper");
+    let autolink_requested =
+        query.autolink.as_deref() == Some("1") && !pairing_code_value.trim().is_empty();
 
     let connection_block = if relay_connected {
         format!(
@@ -1343,6 +1356,35 @@ async fn root_page(
                     .unwrap_or_else(|| "not yet".to_string())
             ),
         )
+    } else if autolink_requested {
+        format!(
+            r#"<section id="connection" class="card">
+  <p class="eyebrow">Pair with archive</p>
+  <h2>Finishing your connection…</h2>
+  <p class="muted" style="margin-top: 10px;">This local helper page opened from the archive site. It will confirm the one-time pairing automatically so you can see the connection happen here instead of guessing in the background.</p>
+  <dl class="kv" style="margin-top: 16px;">
+    <dt>Archive server</dt><dd>{server}</dd>
+    <dt>Desktop name</dt><dd>{name}</dd>
+    <dt>Pairing code</dt><dd><code>{code}</code></dd>
+  </dl>
+  <form id="autolink-form" action="/relay/link/form" method="post" class="btn-row" style="margin-top: 24px;">
+    <input type="hidden" name="relay_server_url" value="{server_attr}" />
+    <input type="hidden" name="pairing_code" value="{code_attr}" />
+    <input type="hidden" name="device_name" value="{name_attr}" />
+    <button type="submit" class="btn">Finish connection now</button>
+    <a class="btn ghost" href="/settings">Open settings</a>
+  </form>
+  <p class="muted" id="autolink-status" style="margin-top: 12px;">Waiting for this helper to confirm with the archive site…</p>
+</section>
+<script>{script}</script>"#,
+            server = escape_html(relay_server_value),
+            name = escape_html(device_name_value),
+            code = escape_html(pairing_code_value),
+            server_attr = escape_html(relay_server_value),
+            code_attr = escape_html(pairing_code_value),
+            name_attr = escape_html(device_name_value),
+            script = ROOT_AUTOLINK_SCRIPT,
+        )
     } else {
         format!(
             r#"<section id="connection" class="card">
@@ -1367,20 +1409,9 @@ async fn root_page(
     </div>
   </form>
 </section>"#,
-            server = escape_html(
-                query
-                    .relay_server_url
-                    .as_deref()
-                    .unwrap_or(config.relay_server_url.as_str())
-            ),
-            code = escape_html(query.pairing_code.as_deref().unwrap_or("")),
-            name = escape_html(
-                query
-                    .device_name
-                    .as_deref()
-                    .or(Some(config.relay_device_name.as_str()))
-                    .unwrap_or("Foundation desktop helper")
-            ),
+            server = escape_html(relay_server_value),
+            code = escape_html(pairing_code_value),
+            name = escape_html(device_name_value),
         )
     };
 
@@ -1938,6 +1969,10 @@ async fn link_relay_device_form(
     State(state): State<AppState>,
     Form(input): Form<RelayLinkFormRequest>,
 ) -> Result<Redirect, AppError> {
+    let redirect_relay_server_url = input.relay_server_url.clone();
+    let redirect_pairing_code = input.pairing_code.clone();
+    let redirect_device_name = input.device_name.clone();
+
     match perform_relay_link(
         &state,
         RelayLinkRequest {
@@ -1950,8 +1985,11 @@ async fn link_relay_device_form(
     {
         Ok(_) => Ok(Redirect::to("/?linked=1")),
         Err(error) => Ok(Redirect::to(&format!(
-            "/?error={}",
-            encode_query_component(&error.message)
+            "/?error={}&relay_server_url={}&pairing_code={}&device_name={}",
+            encode_query_component(&error.message),
+            encode_query_component(&redirect_relay_server_url),
+            encode_query_component(&redirect_pairing_code),
+            encode_query_component(redirect_device_name.as_deref().unwrap_or("")),
         ))),
     }
 }
@@ -6047,6 +6085,27 @@ const INVENTORY_BROWSER_SCRIPT: &str = r####"
   }
 
   void loadNextPage();
+})();
+"####;
+
+const ROOT_AUTOLINK_SCRIPT: &str = r####"
+(() => {
+  const form = document.getElementById("autolink-form");
+  const status = document.getElementById("autolink-status");
+  if (!form) return;
+
+  window.setTimeout(() => {
+    if (status) {
+      status.textContent = "Confirming with the archive site now…";
+    }
+
+    if (typeof form.requestSubmit === "function") {
+      form.requestSubmit();
+      return;
+    }
+
+    form.submit();
+  }, 400);
 })();
 "####;
 

@@ -36,7 +36,6 @@ case "$OS_NAME" in
 esac
 
 if "$BINARY_PATH" handle-url "$DEEP_LINK"; then
-  "$OPEN_CMD" "$BRIDGE_URL/?linked=1" >/dev/null 2>&1 || true
   exit 0
 fi
 
