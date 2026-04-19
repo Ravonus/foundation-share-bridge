@@ -1,11 +1,20 @@
-//! Shared application state and long-running operation tracking.
+//! Crate-core primitives: shared `AppState`, `OperationStatus`, and `AppError`.
 //!
-//! `AppState` is the single value every handler, background loop, and service
-//! function receives. It must stay `Clone` — `tokio::spawn(state.clone())` is
-//! the pattern used by both background loops.
+//! These three types are ubiquitous — every handler imports `AppState` +
+//! `AppError`; background loops and render services also touch
+//! `OperationStatus`. They live together at the crate root so every other
+//! module has a single place to look.
+//!
+//! `AppState` must stay `Clone` — `tokio::spawn(state.clone())` is the
+//! pattern used by both background loops. A compile-time assertion guards it.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Serialize;
@@ -73,5 +82,35 @@ impl OperationStatus {
             started_at: now,
             updated_at: now,
         }
+    }
+}
+
+/// Crate-wide HTTP error type. Every handler returns `Result<T, AppError>`.
+#[derive(Debug)]
+pub struct AppError {
+    pub status: StatusCode,
+    pub message: String,
+}
+
+impl AppError {
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::BAD_REQUEST, message: message.into() }
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::UNAUTHORIZED, message: message.into() }
+    }
+
+    // `anyhow::Error` is taken by value so callers can write
+    // `.map_err(AppError::internal)?` without borrowing.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn internal(error: anyhow::Error) -> Self {
+        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: error.to_string() }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
     }
 }

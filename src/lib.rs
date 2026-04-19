@@ -13,7 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub(crate) mod app;
-pub(crate) mod error;
+pub(crate) mod html;
 pub(crate) mod inline;
 pub(crate) mod util;
 
