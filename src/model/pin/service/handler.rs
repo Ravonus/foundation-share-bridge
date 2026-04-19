@@ -1,8 +1,5 @@
-//! Pin + sync HTTP handlers extracted from the transitional inline monolith.
-//! Each handler is `pub` but explicitly called from the router wiring — the
-//! parent `mod.rs` does not re-export these.
-//!
-//! Transitional blanket allows inherited from inline.rs.
+//! Pin + sync HTTP handlers. Each handler is `pub` but explicitly called from
+//! the router wiring — the parent `mod.rs` does not re-export these.
 #![allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::pedantic, clippy::nursery)]
 
 use std::collections::HashSet;

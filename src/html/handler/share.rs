@@ -1,6 +1,4 @@
 //! HTML handlers for the `/share/work` confirm + post-submit pages.
-//!
-//! Transitional blanket allows inherited from inline.rs.
 #![allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::pedantic, clippy::nursery)]
 
 use axum::{

@@ -1,6 +1,4 @@
-//! System HTTP handlers extracted from inline.rs.
-//!
-//! Transitional blanket allows inherited from inline.rs.
+//! System HTTP handlers: health, storage stats, live status, and export.
 #![allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::pedantic, clippy::nursery)]
 
 use std::collections::{HashMap, HashSet};

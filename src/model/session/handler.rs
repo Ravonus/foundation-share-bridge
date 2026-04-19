@@ -1,6 +1,4 @@
 //! HTTP handlers for session management.
-//!
-//! Transitional blanket allows inherited from inline.rs.
 #![allow(clippy::pedantic, clippy::nursery)]
 
 use axum::{

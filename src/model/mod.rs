@@ -1,15 +1,13 @@
-//! Serde data-transfer objects for the bridge.
+//! Domain modules for the bridge — each child groups the DTOs, service-layer
+//! logic, and HTTP handlers for one concern (config, pin, relay, session,
+//! system).
 //!
-//! Every HTTP request/response body, relay WebSocket envelope, persistent-state
-//! shape, and dashboard query-string binding is declared here. The module is
-//! deliberately leaf-level: no IPFS logic, no handlers, no `AppState`
-//! interaction — just struct/enum definitions with `serde` attributes.
-//!
-//! Persistence note: many of these types back on-disk files (`bridge-state.json`,
-//! the config file). Their serde attributes (`rename_all`, `default`, field
-//! renames) are load-bearing — changing them silently breaks existing user
-//! installs. Treat the wire format as frozen unless you are intentionally
-//! writing a migration.
+//! Persistence note: many types under these modules back on-disk files
+//! (`bridge-state.json`, the config file) or the relay WebSocket protocol.
+//! Their serde attributes (`rename_all`, `default`, field renames) are
+//! load-bearing — changing them silently breaks existing user installs or
+//! the relay wire protocol. Treat those wire formats as frozen unless you
+//! are intentionally writing a migration.
 
 pub mod config;
 pub mod pin;

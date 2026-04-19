@@ -1,7 +1,5 @@
 //! Background task that maintains the relay WebSocket connection and
 //! dispatches incoming share-work jobs to the pin domain.
-//!
-//! Transitional blanket allows — matches inline.rs. Removed in Stage 11.
 #![allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::pedantic, clippy::nursery)]
 
 use anyhow::{Context, anyhow};

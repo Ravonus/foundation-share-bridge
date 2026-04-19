@@ -94,8 +94,8 @@ pub async fn pin_work_payload(
     Ok(pins)
 }
 
-// 5 args are 4 independent hints + state. Handler decomposition (Stage 9)
-// will replace them with a typed WorkDisplayInput.
+// 5 args are 4 independent hints + state. A future typed WorkDisplayInput
+// could bundle them, but the call sites are few and stable.
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_work_display(
     state: &AppState,

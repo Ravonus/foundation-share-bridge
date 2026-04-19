@@ -1,7 +1,4 @@
 //! HTML handler for the bridge settings (`GET /settings`) page.
-//!
-//! Transitional blanket allows inherited from inline.rs — removed in Stage 11
-//! when `settings_page` gets decomposed into a render pipeline.
 #![allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::pedantic, clippy::nursery)]
 
 use axum::{
@@ -19,7 +16,7 @@ use crate::{
     model::{
         config::SettingsPageQuery, relay::relay_is_connected, system::probe::detect_public_ipv4,
     },
-    util::{format::format_timestamp, text::escape_html, url::build_direct_ip_gateway_base_url},
+    util::{text::escape_html, url::build_direct_ip_gateway_base_url},
 };
 
 pub async fn settings_page(
@@ -79,16 +76,6 @@ pub async fn settings_page(
         })
         .unwrap_or_default();
 
-    let linked_device = config
-        .relay_device_label
-        .as_deref()
-        .or(config.relay_device_id.as_deref())
-        .unwrap_or("None yet");
-    let linked_at = config
-        .relay_last_connected_at
-        .map(format_timestamp)
-        .unwrap_or_else(|| "Not linked yet".to_string());
-    let yaml_path = state.config_file.display().to_string();
     let detected_public_ipv4 = detect_public_ipv4(&state).await;
     let current_external_gateway = escape_html(&config.public_gateway_base_url);
 
@@ -120,8 +107,6 @@ pub async fn settings_page(
             current_external_gateway = current_external_gateway,
         )
     };
-
-    let _ = (linked_device, linked_at, yaml_path);
 
     let body = format!(
         r#"<main class="shell narrow settings-shell">

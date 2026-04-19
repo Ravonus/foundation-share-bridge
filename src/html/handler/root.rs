@@ -1,7 +1,4 @@
 //! HTML handler for the bridge root (`GET /`) page.
-//!
-//! Transitional blanket allows inherited from inline.rs — removed in Stage 11
-//! when `root_page` gets decomposed into a render pipeline.
 #![allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::pedantic, clippy::nursery)]
 
 use axum::{

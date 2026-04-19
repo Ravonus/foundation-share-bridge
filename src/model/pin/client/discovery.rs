@@ -29,8 +29,7 @@ use super::kubo::{fetch_ipfs_json, fetch_ipfs_text, list_ipfs_links, resolve_sin
 
 // A shallow breadth-first walk is enough to cover every real-world collection
 // we've observed; deeper traversal risks pulling in sibling works and blows up
-// the probe loop. The scan-cap (24) matches what Stage 0 had before the
-// refactor started.
+// the probe loop.
 const MAX_DEPENDENCY_DISCOVERY_DEPTH: usize = 2;
 const MAX_DEPENDENCY_SCAN_CIDS: usize = 24;
 

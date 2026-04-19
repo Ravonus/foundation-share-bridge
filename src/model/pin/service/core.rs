@@ -40,8 +40,7 @@ pub async fn pin_and_watch_cid(
     Ok(result)
 }
 
-// 5 args bundle the incoming pin request plus 4 identifying fields; Stage 9
-// will collapse them into a typed struct when handlers decompose.
+// 5 args bundle the incoming pin request plus 4 identifying fields.
 //
 // `or_fun_call` / `significant_drop_tightening` / `assigning_clones` are
 // silenced on the inner field-copy block — the clones fire only when `input`
