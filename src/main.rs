@@ -27,6 +27,7 @@ use tokio::time::sleep;
 use tokio::{
     fs,
     net::TcpListener,
+    process::Command as TokioCommand,
     sync::RwLock,
     time::{Duration, interval},
 };
@@ -1284,6 +1285,129 @@ async fn persist_bridge_config(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn escape_notification_text(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', " ")
+}
+
+fn escape_xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+async fn show_backup_notification(body: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = TokioCommand::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "display notification \"{}\" with title \"Foundation Share Bridge\" subtitle \"Backup saved\"",
+                escape_notification_text(body)
+            ))
+            .status()
+            .await
+            .context("Unable to launch macOS notification command")?;
+
+        if !status.success() {
+            return Err(anyhow!("macOS notification command exited unsuccessfully"));
+        }
+
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let status = TokioCommand::new("notify-send")
+            .arg("Foundation Share Bridge")
+            .arg(body)
+            .status()
+            .await
+            .context("Unable to launch Linux notification command")?;
+
+        if !status.success() {
+            return Err(anyhow!("Linux notification command exited unsuccessfully"));
+        }
+
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            r#"
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime] > $null
+$template = @"
+<toast>
+  <visual>
+    <binding template="ToastGeneric">
+      <text>Foundation Share Bridge</text>
+      <text>Backup saved</text>
+      <text>{}</text>
+    </binding>
+  </visual>
+</toast>
+"@
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($template)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Foundation Share Bridge").Show($toast)
+"#,
+            escape_xml_text(body)
+        );
+
+        let status = TokioCommand::new("powershell")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(script)
+            .status()
+            .await
+            .context("Unable to launch Windows notification command")?;
+
+        if !status.success() {
+            return Err(anyhow!(
+                "Windows notification command exited unsuccessfully"
+            ));
+        }
+
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = body;
+        Ok(())
+    }
+}
+
+fn notify_work_share_success(title: &str, pin_count: usize) {
+    let work_title = title.trim();
+    let label = if work_title.is_empty() {
+        "your Foundation work".to_string()
+    } else {
+        format!("\"{}\"", work_title)
+    };
+    let body = format!(
+        "Saved backup for {}. {} root{} pinned and now on the watch list.",
+        label,
+        pin_count,
+        if pin_count == 1 { "" } else { "s" },
+    );
+
+    tokio::spawn(async move {
+        if let Err(error) = show_backup_notification(&body).await {
+            warn!("backup notification failed: {error}");
+        }
+    });
+}
+
 fn spawn_repair_loop(state: AppState) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(state.repair_interval_seconds));
@@ -1341,7 +1465,11 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let (active_sessions, watched_pin_count, last_repair_cycle_at) = {
         let sessions = state.sessions.read().await;
         let persistent = state.persistent.read().await;
-        (sessions.len(), persistent.watched_pins.len(), persistent.last_repair_cycle_at)
+        (
+            sessions.len(),
+            persistent.watched_pins.len(),
+            persistent.last_repair_cycle_at,
+        )
     };
     let (
         download_root_dir,
@@ -1733,6 +1861,72 @@ async fn root_page(
         .map(format_timestamp)
         .unwrap_or_else(|| "never".to_string());
 
+    let storage_snapshot = build_storage_snapshot(&state).await;
+    let disk_used = match storage_snapshot.repo_size_bytes {
+        Some(bytes) => format_bytes_human(bytes),
+        None => "—".to_string(),
+    };
+    let disk_body = match (
+        storage_snapshot.quota_gb,
+        storage_snapshot.quota_used_fraction,
+    ) {
+        (Some(gb), Some(fraction)) => format!(
+            "Quota {:.1} GB · {}% used",
+            gb,
+            (fraction * 100.0).round() as i64
+        ),
+        _ => {
+            if storage_snapshot.ipfs_daemon_reachable {
+                "Reported by the Kubo repo/stat API.".to_string()
+            } else {
+                "IPFS daemon not reachable — start Kubo to see usage.".to_string()
+            }
+        }
+    };
+
+    let pending_failures = persistent
+        .watched_pins
+        .values()
+        .filter(|pin| pin.last_error.is_some())
+        .count();
+    let final_failures = persistent
+        .watched_pins
+        .values()
+        .filter(|pin| pin.final_failure_reported_at.is_some())
+        .count();
+    let failure_banner = if pending_failures == 0 {
+        String::new()
+    } else {
+        let cls = if final_failures > 0 {
+            "flash err"
+        } else {
+            "flash warn"
+        };
+        let copy = if final_failures > 0 {
+            format!(
+                "{pending_failures} pin{} report errors right now, and {final_failures} have exhausted their retry budget. Open a card to diagnose or retry sooner.",
+                if pending_failures == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "{pending_failures} pin{} are waiting for a retry. Open a card to diagnose or retry sooner.",
+                if pending_failures == 1 { "" } else { "s" }
+            )
+        };
+        format!(r#"<div class="{cls}">{}</div>"#, escape_html(&copy))
+    };
+
+    let artist_summary_html = {
+        let sessions_guard = state.sessions.read().await;
+        render_artist_summary(&persistent, &sessions_guard)
+    };
+    let gateway_card = render_gateway_card(&config);
+    let export_card = render_export_card();
+    let live_status_block = {
+        let op_guard = state.operation.read().await;
+        render_live_status_panel(&op_guard)
+    };
+
     let body = format!(
         r##"<main class="shell">
   <div class="stack">
@@ -1748,6 +1942,9 @@ async fn root_page(
     </section>
 
     {flash}
+    {failure_banner}
+
+    {live_status_block}
 
     <section id="status">
       <div class="stats">
@@ -1762,14 +1959,14 @@ async fn root_page(
           <p class="stat-body">Watched roots this app will keep repairing.</p>
         </div>
         <div class="stat">
-          <p class="eyebrow">Last repair</p>
-          <p class="stat-value" style="font-size: 1rem; font-family: ui-monospace, Menlo, Consolas, monospace;">{last_repair}</p>
-          <p class="stat-body">If a pin disappears, it is restored on the next cycle.</p>
+          <p class="eyebrow">Disk used</p>
+          <p class="stat-value" style="font-size: 1.4rem;">{disk_used}</p>
+          <p class="stat-body">{disk_body}</p>
         </div>
         <div class="stat">
-          <p class="eyebrow">Repair interval</p>
-          <p class="stat-value">{repair_interval}s</p>
-          <p class="stat-body">How often this app checks that watched roots are still there.</p>
+          <p class="eyebrow">Last repair</p>
+          <p class="stat-value" style="font-size: 1rem; font-family: ui-monospace, Menlo, Consolas, monospace;">{last_repair}</p>
+          <p class="stat-body">{repair_interval}s cadence · missing pins are restored on the next cycle.</p>
         </div>
       </div>
     </section>
@@ -1779,28 +1976,44 @@ async fn root_page(
       {session}
     </section>
 
+    {artist_summary_html}
+
     <section id="inventory">
       <div class="section-head" style="border-bottom: 0; padding-bottom: 0;">
         <p class="eyebrow">Local inventory</p>
         <h2 style="margin-top: 8px;">Everything this node has pinned</h2>
-        <p class="lead">Foundation-linked roots keep their rescue context. Other IPFS items show up here too. "Open pinned" uses your external gateway base URL, and every card also includes a separate public IPFS link for quick sharing.</p>
+        <p class="lead">Foundation-linked roots keep their rescue context. Each card now shows retry state, provider count, and action buttons to diagnose or retry a pin individually.</p>
       </div>
       <div style="margin-top: 20px;">{inventory_body}</div>
     </section>
 
+    <section class="two-col">
+      {gateway_card}
+      {export_card}
+    </section>
+
     <p class="footer">Agorix share bridge · local-only · {repair_interval}s repair interval · last cycle {last_repair}</p>
   </div>
-</main>"##,
+</main>
+<script>{live_status_script}</script>"##,
         conn_pill = connection_pill_class,
         conn_status = connection_status,
         pinned = pinned_count,
         managed = managed_count,
         repair_interval = repair_interval,
         last_repair = escape_html(&last_repair),
+        disk_used = escape_html(&disk_used),
+        disk_body = escape_html(&disk_body),
         flash = flash_block,
+        failure_banner = failure_banner,
+        live_status_block = live_status_block,
         connection = connection_block,
         session = session_block,
+        artist_summary_html = artist_summary_html,
         inventory_body = inventory_body,
+        gateway_card = gateway_card,
+        export_card = export_card,
+        live_status_script = LIVE_STATUS_SCRIPT,
     );
 
     Ok(Html(render_page("Foundation Share Bridge", &body)))
@@ -2669,7 +2882,10 @@ fn collect_inventory_descriptors(
         };
 
         if let Some(group_key) = inventory_work_group_key(&source.watched) {
-            grouped_work_members.entry(group_key).or_default().push(source);
+            grouped_work_members
+                .entry(group_key)
+                .or_default()
+                .push(source);
         } else {
             descriptors.push(InventoryEntryDescriptor::Single(source));
         }
@@ -3051,6 +3267,8 @@ async fn share_work_inner(
     )
     .await?;
 
+    notify_work_share_success(&input.title, pins.len());
+
     Ok(ShareWorkResponse {
         share_id: Uuid::new_v4().to_string(),
         title: input.title,
@@ -3068,6 +3286,7 @@ async fn pin_work_payload(
     input: RelayShareWorkPayload,
 ) -> Result<Vec<PinCidResult>, AppError> {
     let mut pins = Vec::new();
+    let (metadata_file_name, media_file_name) = resolve_work_root_file_hints(state, &input).await;
 
     if let Some(cid) = input
         .metadata_cid
@@ -3080,7 +3299,7 @@ async fn pin_work_payload(
                 WatchPinInput {
                     cid: cid.to_string(),
                     label: Some("metadata".to_string()),
-                    preferred_file_name: None,
+                    preferred_file_name: metadata_file_name.clone(),
                     source_kind: "work".to_string(),
                     title: Some(input.title.clone()),
                     contract_address: Some(input.contract_address.clone()),
@@ -3106,7 +3325,7 @@ async fn pin_work_payload(
                 WatchPinInput {
                     cid: cid.to_string(),
                     label: Some("media".to_string()),
-                    preferred_file_name: None,
+                    preferred_file_name: media_file_name.clone(),
                     source_kind: "work".to_string(),
                     title: Some(input.title.clone()),
                     contract_address: Some(input.contract_address.clone()),
@@ -3119,6 +3338,12 @@ async fn pin_work_payload(
             )
             .await?,
         );
+    }
+
+    for dependency in
+        discover_work_dependency_inputs(state, &input, metadata_file_name, media_file_name).await
+    {
+        pins.push(pin_and_watch_cid(state, dependency).await?);
     }
 
     Ok(pins)
@@ -3220,8 +3445,9 @@ async fn remember_watched_pin(
 
         if let Some(existing) = persistent.watched_pins.get_mut(&input.cid) {
             existing.label = input.label.or(existing.label.clone());
-            existing.preferred_file_name =
-                input.preferred_file_name.or(existing.preferred_file_name.clone());
+            existing.preferred_file_name = input
+                .preferred_file_name
+                .or(existing.preferred_file_name.clone());
             existing.title = input.title.or(existing.title.clone());
             existing.contract_address =
                 input.contract_address.or(existing.contract_address.clone());
@@ -3563,6 +3789,410 @@ fn related_cids_from_members(members: &[InventorySourcePin]) -> Vec<String> {
         .iter()
         .map(|member| member.cid.clone())
         .filter(|cid| seen.insert(cid.clone()))
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveredDependency {
+    cid: String,
+    preferred_file_name: Option<String>,
+}
+
+fn sanitize_file_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('/');
+    let file_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let cleaned = file_name
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            value => value,
+        })
+        .collect::<String>();
+    let sanitized = cleaned.trim().trim_matches('.').to_string();
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn preferred_file_name_from_relative_path(relative_path: &str) -> Option<String> {
+    sanitize_file_name(relative_path)
+}
+
+fn parse_discovered_dependency(raw: &str) -> Option<DiscoveredDependency> {
+    let (cid, relative_path) = parse_ipfs_reference(raw)?;
+    Some(DiscoveredDependency {
+        cid,
+        preferred_file_name: preferred_file_name_from_relative_path(&relative_path),
+    })
+}
+
+fn push_unique_dependency(
+    dependencies: &mut Vec<DiscoveredDependency>,
+    candidate: DiscoveredDependency,
+) -> bool {
+    if let Some(existing) = dependencies
+        .iter_mut()
+        .find(|entry| entry.cid == candidate.cid)
+    {
+        if existing.preferred_file_name.is_none() {
+            existing.preferred_file_name = candidate.preferred_file_name;
+        }
+        false
+    } else {
+        dependencies.push(candidate);
+        true
+    }
+}
+
+fn extract_absolute_ipfs_reference_strings(text: &str) -> Vec<DiscoveredDependency> {
+    let mut dependencies = Vec::new();
+    for token in text.split(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '='
+            )
+    }) {
+        let candidate = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+        });
+        if let Some(dependency) = parse_discovered_dependency(candidate) {
+            push_unique_dependency(&mut dependencies, dependency);
+        }
+    }
+    dependencies
+}
+
+fn collect_dependency_refs_from_json_value(
+    value: &serde_json::Value,
+    dependencies: &mut Vec<DiscoveredDependency>,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(dependency) = parse_discovered_dependency(text) {
+                push_unique_dependency(dependencies, dependency);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_dependency_refs_from_json_value(item, dependencies);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for item in entries.values() {
+                collect_dependency_refs_from_json_value(item, dependencies);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn fetch_ipfs_text(state: &AppState, ipfs_path: &str) -> anyhow::Result<Option<String>> {
+    let endpoint = format!("{}/api/v0/cat", state.ipfs_api_url.trim_end_matches('/'));
+    let mut request = state.http.post(endpoint).query(&[("arg", ipfs_path)]);
+    if let Some(header) = &state.ipfs_api_auth_header {
+        request = request.header("Authorization", header);
+    }
+
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+
+    let body = response.bytes().await?;
+    if body.is_empty() {
+        return Ok(None);
+    }
+
+    let bounded = &body[..body.len().min(MAX_DISCOVERY_TEXT_BYTES)];
+    if bounded.contains(&0) {
+        return Ok(None);
+    }
+
+    Ok(Some(String::from_utf8_lossy(bounded).into_owned()))
+}
+
+fn is_dependency_probe_candidate(file_name: &str) -> bool {
+    let lower = file_name.trim().to_ascii_lowercase();
+    lower.ends_with(".html")
+        || lower.ends_with(".htm")
+        || lower.ends_with(".gltf")
+        || lower.ends_with(".json")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".css")
+        || lower.ends_with(".js")
+        || lower.ends_with(".txt")
+}
+
+async fn resolve_dependency_probe_paths(
+    state: &AppState,
+    cid: &str,
+    preferred_file_name: Option<&str>,
+) -> Vec<String> {
+    let root_path = format!("/ipfs/{}", cid.trim());
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_candidate = |path: String| {
+        if seen.insert(path.clone()) {
+            candidates.push(path);
+        }
+    };
+
+    if preferred_file_name
+        .filter(|value| is_dependency_probe_candidate(value))
+        .is_some()
+    {
+        push_candidate(root_path.clone());
+    }
+
+    match list_ipfs_links(state, &root_path).await {
+        Ok(links) if links.is_empty() => {
+            push_candidate(root_path);
+        }
+        Ok(links) => {
+            for preferred_name in ["index.html", "metadata.json"] {
+                if let Some(name) = links
+                    .iter()
+                    .filter_map(|link| link.get("Name").and_then(|value| value.as_str()))
+                    .map(str::trim)
+                    .find(|name| name.eq_ignore_ascii_case(preferred_name))
+                {
+                    push_candidate(format!("{}/{}", root_path, name));
+                }
+            }
+
+            for name in links
+                .iter()
+                .filter_map(|link| link.get("Name").and_then(|value| value.as_str()))
+                .map(str::trim)
+                .filter(|name| !name.is_empty() && is_dependency_probe_candidate(name))
+            {
+                push_candidate(format!("{}/{}", root_path, name));
+            }
+        }
+        Err(_) => {
+            if preferred_file_name
+                .filter(|value| is_dependency_probe_candidate(value))
+                .is_some()
+            {
+                push_candidate(root_path);
+            }
+        }
+    }
+
+    candidates.truncate(6);
+    candidates
+}
+
+fn build_work_dependency_input(
+    input: &RelayShareWorkPayload,
+    dependency: DiscoveredDependency,
+) -> WatchPinInput {
+    WatchPinInput {
+        cid: dependency.cid,
+        label: Some("dependency".to_string()),
+        preferred_file_name: dependency.preferred_file_name,
+        source_kind: "work".to_string(),
+        title: Some(input.title.clone()),
+        contract_address: Some(input.contract_address.clone()),
+        token_id: Some(input.token_id.clone()),
+        foundation_url: input.foundation_url.clone(),
+        artist_username: input.artist_username.clone(),
+        account_address: None,
+        username: None,
+    }
+}
+
+async fn resolve_work_root_file_hints(
+    state: &AppState,
+    input: &RelayShareWorkPayload,
+) -> (Option<String>, Option<String>) {
+    let metadata_hint = if let Some(metadata_cid) = input
+        .metadata_cid
+        .as_deref()
+        .filter(|cid| !cid.trim().is_empty())
+    {
+        if let Some(child) = resolve_single_child_path(state, metadata_cid, &[".json"]).await {
+            preferred_file_name_from_relative_path(&child)
+        } else if !input.token_id.trim().is_empty() {
+            Some(format!("{}.json", input.token_id.trim()))
+        } else {
+            Some("metadata.json".to_string())
+        }
+    } else {
+        None
+    };
+
+    let media_hint = if let Some(media_cid) = input
+        .media_cid
+        .as_deref()
+        .filter(|cid| !cid.trim().is_empty())
+    {
+        let metadata = if let Some(metadata_cid) = input
+            .metadata_cid
+            .as_deref()
+            .filter(|cid| !cid.trim().is_empty())
+        {
+            load_work_metadata_record(state, metadata_cid, Some(&input.token_id)).await
+        } else {
+            None
+        };
+
+        let from_metadata = metadata.as_ref().and_then(|record| {
+            [
+                metadata_primary_media_url(record),
+                metadata_file_url(record),
+                metadata_image_url(record),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|raw| match parse_ipfs_reference(&raw) {
+                Some((candidate_cid, relative_path))
+                    if candidate_cid.trim() == media_cid.trim() =>
+                {
+                    preferred_file_name_from_relative_path(&relative_path)
+                }
+                _ => None,
+            })
+        });
+
+        if from_metadata.is_some() {
+            from_metadata
+        } else {
+            resolve_single_child_path(state, media_cid, &[])
+                .await
+                .and_then(|child| preferred_file_name_from_relative_path(&child))
+        }
+    } else {
+        None
+    };
+
+    (metadata_hint, media_hint)
+}
+
+fn enqueue_dependency_probe(
+    queued: &mut HashSet<String>,
+    queue: &mut VecDeque<(String, Option<String>, usize)>,
+    cid: String,
+    preferred_file_name: Option<String>,
+    depth: usize,
+) {
+    if queued.insert(cid.clone()) {
+        queue.push_back((cid, preferred_file_name, depth));
+    }
+}
+
+async fn discover_work_dependency_inputs(
+    state: &AppState,
+    input: &RelayShareWorkPayload,
+    metadata_hint: Option<String>,
+    media_hint: Option<String>,
+) -> Vec<WatchPinInput> {
+    let mut dependencies = Vec::new();
+    let mut queued = HashSet::new();
+    let mut scanned = HashSet::new();
+    let mut queue = VecDeque::<(String, Option<String>, usize)>::new();
+
+    let root_cids = [
+        input
+            .metadata_cid
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        input
+            .media_cid
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<HashSet<_>>();
+
+    if let Some(metadata_cid) = input
+        .metadata_cid
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        enqueue_dependency_probe(
+            &mut queued,
+            &mut queue,
+            metadata_cid.to_string(),
+            metadata_hint.clone(),
+            0,
+        );
+        if let Some(metadata) =
+            load_work_metadata_record(state, metadata_cid, Some(&input.token_id)).await
+        {
+            collect_dependency_refs_from_json_value(&metadata, &mut dependencies);
+        }
+    }
+
+    if let Some(media_cid) = input
+        .media_cid
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        enqueue_dependency_probe(
+            &mut queued,
+            &mut queue,
+            media_cid.to_string(),
+            media_hint.clone(),
+            0,
+        );
+    }
+
+    for dependency in dependencies.clone() {
+        if !root_cids.contains(&dependency.cid) {
+            enqueue_dependency_probe(
+                &mut queued,
+                &mut queue,
+                dependency.cid,
+                dependency.preferred_file_name,
+                1,
+            );
+        }
+    }
+
+    while let Some((cid, preferred_file_name, depth)) = queue.pop_front() {
+        if scanned.len() >= MAX_DEPENDENCY_SCAN_CIDS || !scanned.insert(cid.clone()) {
+            continue;
+        }
+
+        let probe_paths =
+            resolve_dependency_probe_paths(state, &cid, preferred_file_name.as_deref()).await;
+        for probe_path in probe_paths {
+            let Ok(Some(text)) = fetch_ipfs_text(state, &probe_path).await else {
+                continue;
+            };
+            for dependency in extract_absolute_ipfs_reference_strings(&text) {
+                if root_cids.contains(&dependency.cid) {
+                    continue;
+                }
+
+                let is_new = push_unique_dependency(&mut dependencies, dependency.clone());
+                if depth < MAX_DEPENDENCY_DISCOVERY_DEPTH && is_new {
+                    enqueue_dependency_probe(
+                        &mut queued,
+                        &mut queue,
+                        dependency.cid,
+                        dependency.preferred_file_name,
+                        depth + 1,
+                    );
+                }
+            }
+        }
+    }
+
+    dependencies
+        .into_iter()
+        .filter(|dependency| !root_cids.contains(&dependency.cid))
+        .map(|dependency| build_work_dependency_input(input, dependency))
         .collect()
 }
 
@@ -4343,9 +4973,7 @@ async fn build_work_inventory_item(
             .iter()
             .filter_map(|member| member.watched.provider_count)
             .min(),
-        provider_checked_at: max_timestamp_by(members, |member| {
-            member.watched.provider_checked_at
-        }),
+        provider_checked_at: max_timestamp_by(members, |member| member.watched.provider_checked_at),
         custom_tags: {
             let mut tags = Vec::new();
             let mut seen = HashSet::new();
@@ -4382,7 +5010,10 @@ async fn list_local_pin_inventory(state: &AppState) -> anyhow::Result<PinsRespon
 
     Ok(PinsResponse {
         total: descriptors.len(),
-        pinned_count: descriptors.iter().filter(|descriptor| descriptor.pinned()).count(),
+        pinned_count: descriptors
+            .iter()
+            .filter(|descriptor| descriptor.pinned())
+            .count(),
         managed_count: descriptors.len(),
         last_repair_cycle_at: persistent.last_repair_cycle_at,
         items,
@@ -4402,7 +5033,10 @@ async fn list_local_pin_inventory_page(
     let total = descriptors.len();
     let start = cursor.min(total);
     let end = start.saturating_add(limit).min(total);
-    let pinned_count = descriptors.iter().filter(|descriptor| descriptor.pinned()).count();
+    let pinned_count = descriptors
+        .iter()
+        .filter(|descriptor| descriptor.pinned())
+        .count();
 
     let mut items = Vec::with_capacity(end.saturating_sub(start));
     for descriptor in &descriptors[start..end] {
@@ -4504,6 +5138,115 @@ async fn sync_cid_to_download_dir(state: &AppState, cid: &str) -> anyhow::Result
     sync_result
 }
 
+fn sniff_leaf_file_extension(bytes: &[u8]) -> Option<&'static str> {
+    let lower_prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).to_ascii_lowercase();
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("webp")
+    } else if bytes.starts_with(b"OggS") {
+        Some("ogg")
+    } else if bytes.starts_with(b"ID3") {
+        Some("mp3")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
+        Some("wav")
+    } else if bytes.get(4..8) == Some(b"ftyp") {
+        Some("mp4")
+    } else if bytes.starts_with(b"glTF") {
+        Some("glb")
+    } else if lower_prefix.contains("<svg") {
+        Some("svg")
+    } else if lower_prefix.contains("<html") || lower_prefix.contains("<!doctype html") {
+        Some("html")
+    } else if lower_prefix.trim_start().starts_with('{')
+        || lower_prefix.trim_start().starts_with('[')
+    {
+        Some("json")
+    } else {
+        None
+    }
+}
+
+fn ensure_leaf_file_extension(file_name: &str, extension: &str) -> String {
+    if Path::new(file_name).extension().is_some() {
+        file_name.to_string()
+    } else {
+        format!("{}.{}", file_name.trim_end_matches('.'), extension)
+    }
+}
+
+fn leaf_name_from_ipfs_path(ipfs_path: &str) -> Option<String> {
+    let (_, relative_path) = parse_ipfs_path(ipfs_path)?;
+    preferred_file_name_from_relative_path(&relative_path)
+}
+
+async fn resolve_sync_leaf_file_name(state: &AppState, ipfs_path: &str, bytes: &[u8]) -> String {
+    let mut file_name = leaf_name_from_ipfs_path(ipfs_path);
+
+    if file_name.is_none() {
+        if let Some((cid, relative_path)) = parse_ipfs_path(ipfs_path) {
+            if relative_path.is_empty() {
+                file_name = state
+                    .persistent
+                    .read()
+                    .await
+                    .watched_pins
+                    .get(&cid)
+                    .and_then(|pin| pin.preferred_file_name.clone());
+            }
+        }
+    }
+
+    let mut resolved = file_name.unwrap_or_else(|| "content".to_string());
+    if let Some(extension) = sniff_leaf_file_extension(bytes) {
+        resolved = ensure_leaf_file_extension(&resolved, extension);
+    }
+    resolved
+}
+
+async fn download_ipfs_leaf(
+    state: &AppState,
+    ipfs_path: &str,
+    destination_dir: &Path,
+) -> anyhow::Result<()> {
+    let endpoint = format!("{}/api/v0/cat", state.ipfs_api_url.trim_end_matches('/'));
+    let mut request = state.http.post(endpoint).query(&[("arg", ipfs_path)]);
+    if let Some(header) = &state.ipfs_api_auth_header {
+        request = request.header("Authorization", header);
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("Unable to download IPFS file {ipfs_path}: {body}"));
+    }
+
+    let bytes = response.bytes().await?;
+    let file_name = resolve_sync_leaf_file_name(state, ipfs_path, &bytes).await;
+    let target_file = destination_dir.join(file_name);
+
+    if let Some(parent) = target_file.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("Unable to create file directory {}", parent.display()))?;
+    }
+
+    fs::write(&target_file, &bytes).await.with_context(|| {
+        format!(
+            "Unable to write synced IPFS file to {}",
+            target_file.display()
+        )
+    })?;
+
+    Ok(())
+}
+
 #[async_recursion]
 async fn download_ipfs_path_recursive(
     state: &AppState,
@@ -4513,15 +5256,13 @@ async fn download_ipfs_path_recursive(
     let links = match list_ipfs_links(state, ipfs_path).await {
         Ok(links) => links,
         Err(_) => {
-            let target_file = destination_dir.join("content");
-            download_ipfs_file(state, ipfs_path, &target_file).await?;
+            download_ipfs_leaf(state, ipfs_path, destination_dir).await?;
             return Ok(());
         }
     };
 
     if links.is_empty() {
-        let target_file = destination_dir.join("content");
-        download_ipfs_file(state, ipfs_path, &target_file).await?;
+        download_ipfs_leaf(state, ipfs_path, destination_dir).await?;
         return Ok(());
     }
 
@@ -4783,9 +5524,11 @@ async fn run_relay_socket_session(state: &AppState) -> anyhow::Result<()> {
                                 let input = serde_json::from_str::<RelayShareWorkPayload>(
                                     &payload.payload,
                                 )?;
+                                let work_title = input.title.clone();
                                 let pins = pin_work_payload(state, input)
                                     .await
                                     .map_err(|error| anyhow!(error.message))?;
+                                notify_work_share_success(&work_title, pins.len());
                                 serde_json::to_string(&serde_json::json!({ "pins": pins }))
                                     .map_err(anyhow::Error::from)
                             }
@@ -4902,20 +5645,16 @@ async fn repair_watched_pins(state: &AppState) -> anyhow::Result<RepairCycleOutc
         state,
         OperationStatus::busy(
             "repairing",
-            Some(format!("Checking {total} watched pin{}", if total == 1 { "" } else { "s" })),
+            Some(format!(
+                "Checking {total} watched pin{}",
+                if total == 1 { "" } else { "s" }
+            )),
             Some(total),
         ),
     )
     .await;
 
-    let max_attempts = {
-        state
-            .config
-            .read()
-            .await
-            .max_retry_attempts
-            .unwrap_or(10)
-    };
+    let max_attempts = { state.config.read().await.max_retry_attempts.unwrap_or(10) };
 
     let mut outcome = RepairCycleOutcome::default();
     let now = Utc::now();
@@ -5082,7 +5821,14 @@ async fn record_pin_failure(
     persist_bridge_state(state).await?;
 
     if should_notify_relay {
-        if let Some(latest) = state.persistent.read().await.watched_pins.get(&pin.cid).cloned() {
+        if let Some(latest) = state
+            .persistent
+            .read()
+            .await
+            .watched_pins
+            .get(&pin.cid)
+            .cloned()
+        {
             if let Err(error) = send_relay_pin_failure(state, &latest, message).await {
                 warn!("relay pin-failure callback failed for {}: {error}", pin.cid);
             }
@@ -5195,7 +5941,10 @@ struct KuboRepoStat {
 }
 
 async fn fetch_kubo_repo_stat(state: &AppState) -> anyhow::Result<KuboRepoStat> {
-    let endpoint = format!("{}/api/v0/repo/stat", state.ipfs_api_url.trim_end_matches('/'));
+    let endpoint = format!(
+        "{}/api/v0/repo/stat",
+        state.ipfs_api_url.trim_end_matches('/')
+    );
     let mut request = state.http.post(endpoint).timeout(Duration::from_secs(8));
     if let Some(header) = &state.ipfs_api_auth_header {
         request = request.header("Authorization", header);
@@ -5210,14 +5959,18 @@ async fn fetch_kubo_repo_stat(state: &AppState) -> anyhow::Result<KuboRepoStat> 
 
 #[async_recursion]
 async fn sum_dir_size(path: &Path) -> u64 {
-    let Ok(metadata) = fs::metadata(path).await else { return 0; };
+    let Ok(metadata) = fs::metadata(path).await else {
+        return 0;
+    };
     if metadata.is_file() {
         return metadata.len();
     }
     if !metadata.is_dir() {
         return 0;
     }
-    let Ok(mut entries) = fs::read_dir(path).await else { return 0; };
+    let Ok(mut entries) = fs::read_dir(path).await else {
+        return 0;
+    };
     let mut total = 0u64;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let child = entry.path();
@@ -5255,7 +6008,11 @@ async fn build_storage_snapshot(state: &AppState) -> StorageSnapshot {
     let quota_used_fraction = match (quota_gb, repo_size) {
         (Some(gb), Some(bytes)) if gb > 0.0 => {
             let max_bytes = gb * 1_000_000_000.0;
-            if max_bytes > 0.0 { Some((bytes as f64) / max_bytes) } else { None }
+            if max_bytes > 0.0 {
+                Some((bytes as f64) / max_bytes)
+            } else {
+                None
+            }
         }
         _ => None,
     };
@@ -5303,24 +6060,41 @@ fn categorize_pin_error(message: &str) -> (&'static str, &'static str) {
         );
     }
     if lower.contains("not pinned") {
-        return ("not_pinned", "The CID is not pinned locally. The next cycle will pin it.");
+        return (
+            "not_pinned",
+            "The CID is not pinned locally. The next cycle will pin it.",
+        );
     }
     if lower.contains("invalid") || lower.contains("not a valid cid") {
-        return ("invalid_cid", "The CID looks malformed. Re-request the share.");
+        return (
+            "invalid_cid",
+            "The CID looks malformed. Re-request the share.",
+        );
     }
-    if lower.contains("unauthorized") || lower.contains("forbidden") || lower.contains("401") || lower.contains("403") {
-        return ("unauthorized", "The IPFS API rejected the request. Verify IPFS_API_AUTH_HEADER.");
+    if lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("401")
+        || lower.contains("403")
+    {
+        return (
+            "unauthorized",
+            "The IPFS API rejected the request. Verify IPFS_API_AUTH_HEADER.",
+        );
     }
     if lower.contains("disk") || lower.contains("no space") || lower.contains("quota") {
-        return ("disk_full", "The IPFS datastore cannot accept more data. Free space or raise the quota.");
+        return (
+            "disk_full",
+            "The IPFS datastore cannot accept more data. Free space or raise the quota.",
+        );
     }
-    ("unknown", "Cause not recognized. Check the detail for the raw message.")
+    (
+        "unknown",
+        "Cause not recognized. Check the detail for the raw message.",
+    )
 }
 
 async fn compute_next_retry_at(state: &AppState, attempt: u32) -> DateTime<Utc> {
-    let cap_attempts = {
-        state.config.read().await.max_retry_attempts.unwrap_or(10)
-    };
+    let cap_attempts = { state.config.read().await.max_retry_attempts.unwrap_or(10) };
     let effective = attempt.min(cap_attempts).min(14);
     let base = 30u64.saturating_mul(1u64 << effective.min(10));
     let capped = base.min(60 * 60 * 6);
@@ -5356,7 +6130,10 @@ async fn probe_gateway(client: &Client, url: &str) -> Option<bool> {
 async fn check_gateway_reachability(state: &AppState, cid: &str) -> (Option<bool>, Option<bool>) {
     let (local_base, public_base) = {
         let config = state.config.read().await;
-        (config.local_gateway_base_url.clone(), config.public_gateway_base_url.clone())
+        (
+            config.local_gateway_base_url.clone(),
+            config.public_gateway_base_url.clone(),
+        )
     };
     let local = probe_gateway(&state.http, &build_gateway_url(&local_base, cid)).await;
     let public = probe_gateway(&state.http, &build_gateway_url(&public_base, cid)).await;
@@ -5417,7 +6194,10 @@ struct GatewayHealthResponse {
 async fn gateway_health_probe(state: &AppState) -> GatewayHealthResponse {
     let (local_base, public_base) = {
         let config = state.config.read().await;
-        (config.local_gateway_base_url.clone(), config.public_gateway_base_url.clone())
+        (
+            config.local_gateway_base_url.clone(),
+            config.public_gateway_base_url.clone(),
+        )
     };
     const PROBE_CID: &str = "bafkqaaa";
     let local_ok = probe_gateway(&state.http, &build_gateway_url(&local_base, PROBE_CID)).await;
@@ -5425,7 +6205,8 @@ async fn gateway_health_probe(state: &AppState) -> GatewayHealthResponse {
     let utility_ok = probe_gateway(
         &state.http,
         &build_gateway_url(PUBLIC_UTILITY_GATEWAY_BASE_URL, PROBE_CID),
-    ).await;
+    )
+    .await;
     GatewayHealthResponse {
         local_gateway_base_url: local_base,
         public_gateway_base_url: public_base,
@@ -5451,7 +6232,9 @@ async fn submit_to_remote_pinning_service(
             config.remote_pinning_access_token.clone(),
         )
     };
-    if !enabled { return Ok(None); }
+    if !enabled {
+        return Ok(None);
+    }
     let service_url = service_url
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("Remote pinning is enabled but service URL is empty"))?;
@@ -5475,7 +6258,11 @@ async fn submit_to_remote_pinning_service(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Remote pin failed ({}): {}", status, text.chars().take(300).collect::<String>()));
+        return Err(anyhow!(
+            "Remote pin failed ({}): {}",
+            status,
+            text.chars().take(300).collect::<String>()
+        ));
     }
     let _ = response.bytes().await;
     Ok(Some(service_name.unwrap_or_else(|| "remote".to_string())))
@@ -5492,8 +6279,12 @@ async fn update_current_operation(
 ) {
     let mut guard = state.operation.write().await;
     guard.updated_at = Utc::now();
-    if let Some(d) = detail { guard.detail = Some(d); }
-    if let Some(p) = progress_current { guard.progress_current = Some(p); }
+    if let Some(d) = detail {
+        guard.detail = Some(d);
+    }
+    if let Some(p) = progress_current {
+        guard.progress_current = Some(p);
+    }
 }
 
 async fn clear_current_operation(state: &AppState) {
@@ -5507,11 +6298,21 @@ async fn send_relay_pin_failure(
 ) -> anyhow::Result<bool> {
     let (relay_enabled, relay_server_url, device_token) = {
         let config = state.config.read().await;
-        (config.relay_enabled, config.relay_server_url.clone(), config.relay_device_token.clone())
+        (
+            config.relay_enabled,
+            config.relay_server_url.clone(),
+            config.relay_device_token.clone(),
+        )
     };
-    if !relay_enabled { return Ok(false); }
-    let Some(token) = device_token.filter(|value| !value.trim().is_empty()) else { return Ok(false); };
-    if relay_server_url.trim().is_empty() { return Ok(false); }
+    if !relay_enabled {
+        return Ok(false);
+    }
+    let Some(token) = device_token.filter(|value| !value.trim().is_empty()) else {
+        return Ok(false);
+    };
+    if relay_server_url.trim().is_empty() {
+        return Ok(false);
+    }
     let endpoint = format!(
         "{}/api/relay/bridge/pin-failure",
         trim_trailing_slash(&relay_server_url)
@@ -5528,19 +6329,34 @@ async fn send_relay_pin_failure(
         "retryAttempts": pin.retry_attempts,
         "reportedAt": Utc::now(),
     });
-    let response = state.http.post(endpoint).json(&payload).timeout(Duration::from_secs(8)).send().await;
+    let response = state
+        .http
+        .post(endpoint)
+        .json(&payload)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await;
     match response {
         Ok(resp) if resp.status().is_success() => Ok(true),
-        Ok(resp) => Err(anyhow!("Relay pin-failure callback returned {}", resp.status())),
+        Ok(resp) => Err(anyhow!(
+            "Relay pin-failure callback returned {}",
+            resp.status()
+        )),
         Err(error) => Err(anyhow!(error)),
     }
 }
 
 fn sanitize_custom_tag(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.len() > 48 { return None; }
+    if trimmed.is_empty() || trimmed.len() > 48 {
+        return None;
+    }
     let cleaned: String = trimmed.chars().filter(|c| !c.is_control()).collect();
-    if cleaned.is_empty() { None } else { Some(cleaned) }
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
 }
 
 fn csv_escape(value: &str) -> String {
@@ -5557,11 +6373,17 @@ fn format_bytes_human(bytes: u64) -> String {
     const GB: f64 = MB * 1024.0;
     const TB: f64 = GB * 1024.0;
     let v = bytes as f64;
-    if v >= TB { format!("{:.2} TB", v / TB) }
-    else if v >= GB { format!("{:.2} GB", v / GB) }
-    else if v >= MB { format!("{:.1} MB", v / MB) }
-    else if v >= KB { format!("{:.1} KB", v / KB) }
-    else { format!("{} B", bytes) }
+    if v >= TB {
+        format!("{:.2} TB", v / TB)
+    } else if v >= GB {
+        format!("{:.2} GB", v / GB)
+    } else if v >= MB {
+        format!("{:.1} MB", v / MB)
+    } else if v >= KB {
+        format!("{:.1} KB", v / KB)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 async fn diagnose_single_pin(
@@ -5569,7 +6391,9 @@ async fn diagnose_single_pin(
     State(state): State<AppState>,
 ) -> Result<Json<DiagnoseResponse>, AppError> {
     let trimmed = cid.trim();
-    if trimmed.is_empty() { return Err(AppError::bad_request("CID is required")); }
+    if trimmed.is_empty() {
+        return Err(AppError::bad_request("CID is required"));
+    }
     Ok(Json(diagnose_pin(&state, trimmed).await))
 }
 
@@ -5587,7 +6411,9 @@ async fn retry_pin_now(
     State(state): State<AppState>,
 ) -> Result<Json<RetryPinResponse>, AppError> {
     let trimmed = cid.trim().to_string();
-    if trimmed.is_empty() { return Err(AppError::bad_request("CID is required")); }
+    if trimmed.is_empty() {
+        return Err(AppError::bad_request("CID is required"));
+    }
 
     {
         let mut persistent = state.persistent.write().await;
@@ -5600,7 +6426,13 @@ async fn retry_pin_now(
     }
 
     let snapshot = {
-        state.persistent.read().await.watched_pins.get(&trimmed).cloned()
+        state
+            .persistent
+            .read()
+            .await
+            .watched_pins
+            .get(&trimmed)
+            .cloned()
             .ok_or_else(|| AppError::bad_request("CID disappeared during retry"))?
     };
 
@@ -5624,7 +6456,8 @@ async fn retry_pin_now(
                 snapshot.pin_reference.clone(),
                 None,
                 true,
-            ).await?;
+            )
+            .await?;
             Ok(Json(RetryPinResponse {
                 cid: trimmed,
                 pinned: true,
@@ -5636,7 +6469,8 @@ async fn retry_pin_now(
             let message = error.message.clone();
             let (_category_label, hint) = categorize_pin_error(&message);
             let hint_name = snapshot.title.clone().or_else(|| Some(trimmed.clone()));
-            let remote_result = submit_to_remote_pinning_service(&state, &trimmed, hint_name.as_deref()).await;
+            let remote_result =
+                submit_to_remote_pinning_service(&state, &trimmed, hint_name.as_deref()).await;
             let (used_remote, remote_err) = match remote_result {
                 Ok(Some(service)) => (Some(service), None),
                 Ok(None) => (None, None),
@@ -5660,14 +6494,21 @@ async fn retry_pin_now(
                 }
                 persistent.updated_at = Some(now);
             }
-            persist_bridge_state(&state).await.map_err(AppError::internal)?;
+            persist_bridge_state(&state)
+                .await
+                .map_err(AppError::internal)?;
             let reply = if let Some(service) = used_remote.clone() {
-                format!("Local pin failed ({hint}), but the remote pinning service {service} accepted it.")
+                format!(
+                    "Local pin failed ({hint}), but the remote pinning service {service} accepted it."
+                )
             } else {
                 format!("Local pin failed. {hint} Detail: {message}")
             };
             Ok(Json(RetryPinResponse {
-                cid: trimmed, pinned: false, used_remote_service: used_remote, message: reply,
+                cid: trimmed,
+                pinned: false,
+                used_remote_service: used_remote,
+                message: reply,
             }))
         }
     }
@@ -5687,15 +6528,30 @@ async fn retry_sync_single(
     State(state): State<AppState>,
 ) -> Result<Json<RetrySyncResponse>, AppError> {
     let trimmed = cid.trim().to_string();
-    if trimmed.is_empty() { return Err(AppError::bad_request("CID is required")); }
-    let exists = state.persistent.read().await.watched_pins.contains_key(&trimmed);
-    if !exists { return Err(AppError::bad_request("CID is not watched by this bridge")); }
+    if trimmed.is_empty() {
+        return Err(AppError::bad_request("CID is required"));
+    }
+    let exists = state
+        .persistent
+        .read()
+        .await
+        .watched_pins
+        .contains_key(&trimmed);
+    if !exists {
+        return Err(AppError::bad_request("CID is not watched by this bridge"));
+    }
     match sync_cid_to_download_dir(&state, &trimmed).await {
         Ok(path) => Ok(Json(RetrySyncResponse {
-            cid: trimmed, synced: true, path: Some(path.display().to_string()), error: None,
+            cid: trimmed,
+            synced: true,
+            path: Some(path.display().to_string()),
+            error: None,
         })),
         Err(error) => Ok(Json(RetrySyncResponse {
-            cid: trimmed, synced: false, path: None, error: Some(error.to_string()),
+            cid: trimmed,
+            synced: false,
+            path: None,
+            error: Some(error.to_string()),
         })),
     }
 }
@@ -5719,27 +6575,38 @@ async fn set_pin_tags(
     Json(input): Json<SetPinTagsRequest>,
 ) -> Result<Json<SetPinTagsResponse>, AppError> {
     let trimmed = cid.trim().to_string();
-    if trimmed.is_empty() { return Err(AppError::bad_request("CID is required")); }
+    if trimmed.is_empty() {
+        return Err(AppError::bad_request("CID is required"));
+    }
     let cleaned: Vec<String> = {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for raw in input.tags {
             if let Some(tag) = sanitize_custom_tag(&raw) {
                 let key = tag.to_ascii_lowercase();
-                if seen.insert(key) { out.push(tag); }
+                if seen.insert(key) {
+                    out.push(tag);
+                }
             }
         }
         out
     };
     {
         let mut persistent = state.persistent.write().await;
-        let existing = persistent.watched_pins.get_mut(&trimmed)
+        let existing = persistent
+            .watched_pins
+            .get_mut(&trimmed)
             .ok_or_else(|| AppError::bad_request("CID is not watched by this bridge"))?;
         existing.custom_tags = cleaned.clone();
         persistent.updated_at = Some(Utc::now());
     }
-    persist_bridge_state(&state).await.map_err(AppError::internal)?;
-    Ok(Json(SetPinTagsResponse { cid: trimmed, tags: cleaned }))
+    persist_bridge_state(&state)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(SetPinTagsResponse {
+        cid: trimmed,
+        tags: cleaned,
+    }))
 }
 
 async fn gateway_health_handler(State(state): State<AppState>) -> Json<GatewayHealthResponse> {
@@ -5764,7 +6631,11 @@ async fn export_pins_handler(
     Query(query): Query<ExportQuery>,
 ) -> Result<Response, AppError> {
     let snapshot = state.persistent.read().await.clone();
-    let format = query.format.as_deref().map(|v| v.trim().to_ascii_lowercase()).unwrap_or_else(|| "json".to_string());
+    let format = query
+        .format
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "json".to_string());
     match format.as_str() {
         "csv" => {
             let mut body = String::new();
@@ -5783,12 +6654,23 @@ async fn export_pins_handler(
                     csv_escape(&pin.source_kind),
                     csv_escape(pin.label.as_deref().unwrap_or("")),
                     csv_escape(&pin.added_at.to_rfc3339()),
-                    csv_escape(&pin.last_verified_at.map(|t| t.to_rfc3339()).unwrap_or_default()),
-                    csv_escape(&pin.last_repaired_at.map(|t| t.to_rfc3339()).unwrap_or_default()),
-                    pin.verify_count, pin.repair_count, pin.sync_count,
+                    csv_escape(
+                        &pin.last_verified_at
+                            .map(|t| t.to_rfc3339())
+                            .unwrap_or_default()
+                    ),
+                    csv_escape(
+                        &pin.last_repaired_at
+                            .map(|t| t.to_rfc3339())
+                            .unwrap_or_default()
+                    ),
+                    pin.verify_count,
+                    pin.repair_count,
+                    pin.sync_count,
                     csv_escape(pin.last_error.as_deref().unwrap_or("")),
                     csv_escape(pin.error_category.as_deref().unwrap_or("")),
-                    pin.retry_attempts, pin.remote_pinned,
+                    pin.retry_attempts,
+                    pin.remote_pinned,
                     csv_escape(pin.remote_pin_service.as_deref().unwrap_or("")),
                     csv_escape(&pin.custom_tags.join(";")),
                     csv_escape(pin.sync_path.as_deref().unwrap_or("")),
@@ -5798,10 +6680,14 @@ async fn export_pins_handler(
                 StatusCode::OK,
                 [
                     ("content-type", "text/csv; charset=utf-8"),
-                    ("content-disposition", "attachment; filename=\"foundation-share-bridge-pins.csv\""),
+                    (
+                        "content-disposition",
+                        "attachment; filename=\"foundation-share-bridge-pins.csv\"",
+                    ),
                 ],
                 body,
-            ).into_response())
+            )
+                .into_response())
         }
         _ => {
             let json = serde_json::to_vec_pretty(&snapshot)
@@ -5810,10 +6696,14 @@ async fn export_pins_handler(
                 StatusCode::OK,
                 [
                     ("content-type", "application/json"),
-                    ("content-disposition", "attachment; filename=\"foundation-share-bridge-pins.json\""),
+                    (
+                        "content-disposition",
+                        "attachment; filename=\"foundation-share-bridge-pins.json\"",
+                    ),
                 ],
                 json,
-            ).into_response())
+            )
+                .into_response())
         }
     }
 }
@@ -5841,26 +6731,48 @@ async fn artist_summary_handler(State(state): State<AppState>) -> Json<ArtistSum
     let mut artist_counts: HashMap<String, HashSet<String>> = HashMap::new();
     let mut works_by_group: HashSet<String> = HashSet::new();
     let mut total_copies = 0_usize;
-    let current_username = sessions.values().filter_map(|s| s.profile_username.clone()).next();
+    let current_username = sessions
+        .values()
+        .filter_map(|s| s.profile_username.clone())
+        .next();
     let mut works_by_you = 0_usize;
     for pin in persistent.watched_pins.values() {
         total_copies += 1;
         let group = inventory_work_group_key(pin).unwrap_or_else(|| pin.cid.clone());
         if works_by_group.insert(group.clone()) {
-            let artist = pin.artist_username.clone().unwrap_or_else(|| "unknown".to_string());
-            artist_counts.entry(artist).or_default().insert(group.clone());
+            let artist = pin
+                .artist_username
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            artist_counts
+                .entry(artist)
+                .or_default()
+                .insert(group.clone());
             if let Some(me) = current_username.as_deref() {
-                if pin.artist_username.as_deref().map(|v| v.eq_ignore_ascii_case(me)).unwrap_or(false) {
+                if pin
+                    .artist_username
+                    .as_deref()
+                    .map(|v| v.eq_ignore_ascii_case(me))
+                    .unwrap_or(false)
+                {
                     works_by_you += 1;
                 }
             }
         }
     }
     let artists_tracked = artist_counts.len();
-    let mut top_artists: Vec<ArtistEntry> = artist_counts.into_iter()
-        .map(|(username, works)| ArtistEntry { artist_username: username, works: works.len() })
+    let mut top_artists: Vec<ArtistEntry> = artist_counts
+        .into_iter()
+        .map(|(username, works)| ArtistEntry {
+            artist_username: username,
+            works: works.len(),
+        })
         .collect();
-    top_artists.sort_by(|a, b| b.works.cmp(&a.works).then_with(|| a.artist_username.cmp(&b.artist_username)));
+    top_artists.sort_by(|a, b| {
+        b.works
+            .cmp(&a.works)
+            .then_with(|| a.artist_username.cmp(&b.artist_username))
+    });
     top_artists.truncate(5);
     Json(ArtistSummary {
         total_works_managed: works_by_group.len(),
@@ -6729,6 +7641,242 @@ hr.sep { border: 0; border-top: 1px solid var(--line); margin: 36px 0; }
 }
 "#;
 
+fn render_artist_summary(
+    persistent: &BridgePersistentState,
+    sessions: &HashMap<String, BridgeSession>,
+) -> String {
+    if persistent.watched_pins.is_empty() {
+        return String::new();
+    }
+
+    let current_username = sessions
+        .values()
+        .filter_map(|s| s.profile_username.clone())
+        .next();
+
+    let mut artist_counts: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut group_keys: HashSet<String> = HashSet::new();
+    let mut works_by_you = 0_usize;
+
+    for pin in persistent.watched_pins.values() {
+        let group = inventory_work_group_key(pin).unwrap_or_else(|| pin.cid.clone());
+        if group_keys.insert(group.clone()) {
+            let artist = pin
+                .artist_username
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            artist_counts
+                .entry(artist)
+                .or_default()
+                .insert(group.clone());
+            if let Some(me) = current_username.as_deref() {
+                if pin
+                    .artist_username
+                    .as_deref()
+                    .map(|v| v.eq_ignore_ascii_case(me))
+                    .unwrap_or(false)
+                {
+                    works_by_you += 1;
+                }
+            }
+        }
+    }
+
+    let total_works = group_keys.len();
+    let artists_tracked = artist_counts.len();
+    let mut top: Vec<(String, usize)> = artist_counts
+        .iter()
+        .map(|(artist, set)| (artist.clone(), set.len()))
+        .collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top.truncate(5);
+
+    let chips = if top.is_empty() {
+        String::new()
+    } else {
+        let inner = top
+            .iter()
+            .map(|(artist, count)| {
+                format!(
+                    r#"<span class="pill">@{} · {count}</span>"#,
+                    escape_html(artist)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(r#"<div class="btn-row" style="margin-top:14px;">{inner}</div>"#)
+    };
+
+    let me_line = match current_username.as_deref() {
+        Some(name) if works_by_you > 0 => format!(
+            r#"<p class="pin-context" style="margin-top:10px;">You are pinning {works_by_you} work{} that credit @{} as the artist.</p>"#,
+            if works_by_you == 1 { "" } else { "s" },
+            escape_html(name)
+        ),
+        Some(name) => format!(
+            r#"<p class="pin-context" style="margin-top:10px;">No works by @{} are pinned on this device yet.</p>"#,
+            escape_html(name)
+        ),
+        None => String::new(),
+    };
+
+    format!(
+        r#"<section id="artists" class="card">
+  <p class="eyebrow">Preservation summary</p>
+  <h2 style="margin-top:8px;">You are caring for {total_works} work{plural} from {artists_tracked} artist{a_plural}</h2>
+  <p class="muted settings-copy">This device keeps these roots pinned forever. Other collectors running the bridge may be pinning the same works alongside you.</p>
+  {me_line}
+  {chips}
+</section>"#,
+        plural = if total_works == 1 { "" } else { "s" },
+        a_plural = if artists_tracked == 1 { "" } else { "s" },
+    )
+}
+
+fn render_gateway_card(config: &BridgeConfig) -> String {
+    format!(
+        r#"<section id="gateway-card" class="card">
+  <p class="eyebrow">Gateway health</p>
+  <h2 style="margin-top:8px;">Are your gateways reachable?</h2>
+  <p class="muted settings-copy">Confirms the local Kubo gateway, your configured external gateway, and the public fallback can all serve pinned content.</p>
+  <dl class="kv" style="margin-top:12px;">
+    <dt>Local</dt><dd><code>{local}</code> <span class="pill" id="gateway-check-local-pill">Idle</span></dd>
+    <dt>External</dt><dd><code>{public}</code> <span class="pill" id="gateway-check-public-pill">Idle</span></dd>
+    <dt>Fallback</dt><dd><code>{utility}</code> <span class="pill" id="gateway-check-utility-pill">Idle</span></dd>
+  </dl>
+  <div class="btn-row">
+    <button type="button" class="btn ghost" id="gateway-check-run">Check gateways now</button>
+  </div>
+  <p class="muted inventory-status" id="gateway-check-status">Not yet tested in this session.</p>
+</section>"#,
+        local = escape_html(&config.local_gateway_base_url),
+        public = escape_html(&config.public_gateway_base_url),
+        utility = escape_html(PUBLIC_UTILITY_GATEWAY_BASE_URL),
+    )
+}
+
+fn render_export_card() -> String {
+    r#"<section id="export-card" class="card">
+  <p class="eyebrow">Backup</p>
+  <h2 style="margin-top:8px;">Export your rescue list</h2>
+  <p class="muted settings-copy">If this machine ever fails, keep an offline copy of what you are pinning. JSON is a complete restore payload; CSV is easier to skim in a spreadsheet.</p>
+  <div class="btn-row">
+    <a class="btn" href="/pins/export?format=json" download>Download JSON</a>
+    <a class="btn ghost" href="/pins/export?format=csv" download>Download CSV</a>
+  </div>
+</section>"#
+        .to_string()
+}
+
+fn render_live_status_panel(status: &OperationStatus) -> String {
+    let (phase_label, phase_class) = if status.phase == "idle" {
+        ("Idle", "pill")
+    } else {
+        (status.phase.as_str(), "pill ok")
+    };
+
+    let detail = status.detail.clone().unwrap_or_else(|| {
+        if status.phase == "idle" {
+            "The helper is resting between cycles.".to_string()
+        } else {
+            String::new()
+        }
+    });
+
+    let progress = match (status.progress_current, status.progress_total) {
+        (Some(current), Some(total)) if total > 0 => format!(" · {current} of {total}"),
+        _ => String::new(),
+    };
+
+    format!(
+        r#"<section id="live-status" class="card">
+  <p class="eyebrow">Live status</p>
+  <h2 style="margin-top:8px;">What this helper is doing right now</h2>
+  <div class="btn-row" style="margin-top:14px;">
+    <span class="{cls}" id="live-status-phase">{phase}</span>
+    <span class="muted inventory-status" id="live-status-detail">{detail}{progress}</span>
+  </div>
+</section>"#,
+        cls = phase_class,
+        phase = escape_html(phase_label),
+        detail = escape_html(&detail),
+    )
+}
+
+const LIVE_STATUS_SCRIPT: &str = r####"
+(() => {
+  const phaseNode = document.getElementById("live-status-phase");
+  const detailNode = document.getElementById("live-status-detail");
+
+  const refresh = async () => {
+    if (!phaseNode || !detailNode) return;
+    try {
+      const response = await fetch("/status/live", { headers: { Accept: "application/json" } });
+      if (!response.ok) return;
+      const data = await response.json();
+      const phase = data.phase === "idle" ? "Idle" : data.phase;
+      phaseNode.className = data.phase === "idle" ? "pill" : "pill ok";
+      phaseNode.textContent = phase;
+      const current = data.progressCurrent;
+      const total = data.progressTotal;
+      const progress = current != null && total != null && total > 0 ? ` · ${current} of ${total}` : "";
+      const detailText = (data.detail || (data.phase === "idle" ? "The helper is resting between cycles." : "")) + progress;
+      detailNode.textContent = detailText;
+    } catch (error) {
+      /* swallow */
+    }
+  };
+
+  const gatewayButton = document.getElementById("gateway-check-run");
+  const gatewayStatus = document.getElementById("gateway-check-status");
+  const localPill = document.getElementById("gateway-check-local-pill");
+  const publicPill = document.getElementById("gateway-check-public-pill");
+  const utilityPill = document.getElementById("gateway-check-utility-pill");
+
+  const setPill = (node, ok) => {
+    if (!node) return;
+    if (ok == null) {
+      node.textContent = "Idle";
+      node.className = "pill";
+    } else if (ok) {
+      node.textContent = "Reachable";
+      node.className = "pill ok";
+    } else {
+      node.textContent = "Unreachable";
+      node.className = "pill err";
+    }
+  };
+
+  if (gatewayButton) {
+    gatewayButton.addEventListener("click", async () => {
+      gatewayButton.disabled = true;
+      if (gatewayStatus) gatewayStatus.textContent = "Probing gateways…";
+      setPill(localPill, null);
+      setPill(publicPill, null);
+      setPill(utilityPill, null);
+      try {
+        const response = await fetch("/gateway/health", { headers: { Accept: "application/json" } });
+        if (!response.ok) throw new Error(`Gateway check failed (${response.status})`);
+        const data = await response.json();
+        setPill(localPill, data.localOk ?? null);
+        setPill(publicPill, data.publicOk ?? null);
+        setPill(utilityPill, data.utilityOk ?? null);
+        if (gatewayStatus) {
+          gatewayStatus.textContent = `Checked ${new Date(data.checkedAt).toLocaleTimeString()}`;
+        }
+      } catch (error) {
+        if (gatewayStatus) gatewayStatus.textContent = error instanceof Error ? error.message : "Gateway check failed.";
+      } finally {
+        gatewayButton.disabled = false;
+      }
+    });
+  }
+
+  void refresh();
+  window.setInterval(refresh, 5000);
+})();
+"####;
+
 const INVENTORY_BROWSER_SCRIPT: &str = r####"
 (() => {
   const browser = document.getElementById("inventory-browser");
@@ -7182,6 +8330,7 @@ const INVENTORY_BROWSER_SCRIPT: &str = r####"
 
           <div class="pin-actions">
             <button type="button" class="btn ghost" data-verify-cids="${escapeHtml(relatedCids.join(","))}">Test on network</button>
+            <button type="button" class="btn ghost" data-unwatch-cids="${escapeHtml(relatedCids.join(","))}">Stop repairing</button>
             ${pinnedUrl ? `<a class="btn" href="${escapeHtml(pinnedUrl)}" target="_blank" rel="noreferrer">Open pinned</a>` : ""}
             ${publicUrl ? `<a class="btn ghost" href="${escapeHtml(publicUrl)}" target="_blank" rel="noreferrer">Open public</a>` : ""}
             ${localUrl ? `<a class="btn ghost" href="${escapeHtml(localUrl)}" target="_blank" rel="noreferrer">Open local</a>` : ""}
@@ -7355,6 +8504,45 @@ const INVENTORY_BROWSER_SCRIPT: &str = r####"
     const metadataButton = event.target.closest("[data-toggle-metadata]");
     if (metadataButton) {
       toggleMetadataViewer(metadataButton);
+      return;
+    }
+
+    const unwatchButton = event.target.closest("[data-unwatch-cids]");
+    if (unwatchButton) {
+      const cids = uniqueStrings(
+        String(unwatchButton.getAttribute("data-unwatch-cids") || "").split(","),
+      );
+      const card = unwatchButton.closest(".pin-card");
+      const resultNode = card ? card.querySelector(".pin-test-status") : null;
+      if (cids.length === 0 || !resultNode) return;
+
+      const confirmed = window.confirm(
+        `Stop repairing ${cids.length} linked root${cids.length === 1 ? "" : "s"} for this saved work? Existing IPFS pins and synced files will be left alone.`,
+      );
+      if (!confirmed) return;
+
+      unwatchButton.setAttribute("disabled", "disabled");
+      resultNode.textContent = "Removing these roots from the forever-watch list…";
+
+      try {
+        const response = await fetch("/pins/unwatch", {
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ cids }),
+        });
+        if (!response.ok) {
+          throw new Error(`Unable to stop repairing (${response.status})`);
+        }
+
+        window.location.reload();
+      } catch (error) {
+        resultNode.textContent = error instanceof Error ? error.message : "Unable to stop repairing this work right now.";
+      } finally {
+        unwatchButton.removeAttribute("disabled");
+      }
       return;
     }
 
