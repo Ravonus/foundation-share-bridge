@@ -5,14 +5,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PAYLOAD_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT_LABEL="com.ravonus.foundation-share-bridge"
+MENU_AGENT_LABEL="com.ravonus.foundation-share-bridge.menu"
 SERVICE_NAME="Foundation Share Bridge"
 RUNTIME_DIR="$HOME/Library/Application Support/FoundationShareBridge"
 RUNTIME_BIN_DIR="$RUNTIME_DIR/bin"
 RUNTIME_SCRIPT_DIR="$RUNTIME_DIR/scripts"
+RUNTIME_ASSET_DIR="$RUNTIME_DIR/assets"
 RUNTIME_LOG_DIR="$RUNTIME_DIR/logs"
 RUNTIME_DATA_DIR="$RUNTIME_DIR/data/kubo"
 RUNTIME_STATE_FILE="$RUNTIME_DIR/bridge-state.json"
+RUNTIME_CONFIG_FILE="$RUNTIME_DIR/bridge-config.yaml"
+RUNTIME_LOGO_LIGHT_FILE="$RUNTIME_ASSET_DIR/logo-light.png"
+RUNTIME_LOGO_DARK_FILE="$RUNTIME_ASSET_DIR/logo-dark.png"
 PLIST_PATH="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+MENU_PLIST_PATH="$HOME/Library/LaunchAgents/$MENU_AGENT_LABEL.plist"
 RUN_SCRIPT="$RUNTIME_SCRIPT_DIR/run-bridge-stack.sh"
 DEEP_LINK_SCRIPT="$RUNTIME_SCRIPT_DIR/handle-deep-link.sh"
 PROTOCOL_APP_DIR="$HOME/Applications/Foundation Share Bridge Link.app"
@@ -90,13 +96,43 @@ build_or_resolve_binary() {
   printf '%s\n' "$source_root/target/release/foundation-share-bridge"
 }
 
+build_or_resolve_menu_binary() {
+  local source_root="$1"
+  local bundled_binary="$source_root/bin/foundation-share-bridge-menu"
+  local menu_source="$source_root/scripts/foundation-share-bridge-menu.swift"
+  local built_binary="$source_root/target/foundation-share-bridge-menu"
+
+  if [ -x "$bundled_binary" ]; then
+    printf '%s\n' "$bundled_binary"
+    return 0
+  fi
+
+  if [ ! -f "$menu_source" ]; then
+    echo "Menu bar source was not found at $menu_source" >&2
+    exit 1
+  fi
+
+  if ! command -v xcrun >/dev/null 2>&1; then
+    echo "xcrun is required to build the macOS menu bar app from source." >&2
+    exit 1
+  fi
+
+  mkdir -p "$source_root/target"
+  /usr/bin/xcrun swiftc -O -framework AppKit "$menu_source" -o "$built_binary"
+
+  printf '%s\n' "$built_binary"
+}
+
 SOURCE_ROOT="$(resolve_source_root)"
 BINARY_SOURCE="$(build_or_resolve_binary "$SOURCE_ROOT")"
+MENU_BINARY_SOURCE="$(build_or_resolve_menu_binary "$SOURCE_ROOT")"
 COMPOSE_SOURCE="$SOURCE_ROOT/docker-compose.yml"
 RUN_SCRIPT_SOURCE="$SOURCE_ROOT/scripts/run-bridge-stack.sh"
 DEEP_LINK_SCRIPT_SOURCE="$SOURCE_ROOT/scripts/handle-deep-link.sh"
+LOGO_LIGHT_SOURCE="$SOURCE_ROOT/assets/logo-light.png"
+LOGO_DARK_SOURCE="$SOURCE_ROOT/assets/logo-dark.png"
 
-if [ ! -x "$BINARY_SOURCE" ]; then
+if [ ! -x "$BINARY_SOURCE" ] || [ ! -x "$MENU_BINARY_SOURCE" ]; then
   echo "Bridge binary was not found at $BINARY_SOURCE" >&2
   exit 1
 fi
@@ -111,15 +147,27 @@ mkdir -p \
   "$HOME/Library/LaunchAgents" \
   "$RUNTIME_BIN_DIR" \
   "$RUNTIME_SCRIPT_DIR" \
+  "$RUNTIME_ASSET_DIR" \
   "$RUNTIME_LOG_DIR" \
   "$RUNTIME_DATA_DIR" \
   "$PROTOCOL_APP_MACOS_DIR"
 
 cp "$BINARY_SOURCE" "$RUNTIME_BIN_DIR/foundation-share-bridge"
+cp "$MENU_BINARY_SOURCE" "$RUNTIME_BIN_DIR/foundation-share-bridge-menu"
 cp "$RUN_SCRIPT_SOURCE" "$RUN_SCRIPT"
 cp "$DEEP_LINK_SCRIPT_SOURCE" "$DEEP_LINK_SCRIPT"
 cp "$COMPOSE_SOURCE" "$RUNTIME_DIR/docker-compose.yml"
-chmod +x "$RUNTIME_BIN_DIR/foundation-share-bridge" "$RUN_SCRIPT" "$DEEP_LINK_SCRIPT"
+if [ -f "$LOGO_LIGHT_SOURCE" ]; then
+  cp "$LOGO_LIGHT_SOURCE" "$RUNTIME_LOGO_LIGHT_FILE"
+fi
+if [ -f "$LOGO_DARK_SOURCE" ]; then
+  cp "$LOGO_DARK_SOURCE" "$RUNTIME_LOGO_DARK_FILE"
+fi
+chmod +x \
+  "$RUNTIME_BIN_DIR/foundation-share-bridge" \
+  "$RUNTIME_BIN_DIR/foundation-share-bridge-menu" \
+  "$RUN_SCRIPT" \
+  "$DEEP_LINK_SCRIPT"
 
 cat > "$PROTOCOL_APP_MACOS_DIR/foundation-share-bridge-link" <<EOF
 #!/bin/bash
@@ -202,9 +250,60 @@ cat > "$PLIST_PATH" <<EOF
 </plist>
 EOF
 
+cat > "$MENU_PLIST_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$MENU_AGENT_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$RUNTIME_BIN_DIR/foundation-share-bridge-menu</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>$RUNTIME_DIR</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>$RUNTIME_LOG_DIR/menu.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>$RUNTIME_LOG_DIR/menu.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FOUNDATION_SHARE_BRIDGE_RUNTIME_DIR</key>
+    <string>$RUNTIME_DIR</string>
+    <key>FOUNDATION_SHARE_BRIDGE_CONFIG_FILE</key>
+    <string>$RUNTIME_CONFIG_FILE</string>
+    <key>FOUNDATION_SHARE_BRIDGE_LOCAL_URL</key>
+    <string>http://127.0.0.1:43128</string>
+    <key>FOUNDATION_SHARE_BRIDGE_SITE_URL</key>
+    <string>https://foundation.agorix.io</string>
+    <key>FOUNDATION_SHARE_BRIDGE_LOGO_LIGHT_FILE</key>
+    <string>$RUNTIME_LOGO_LIGHT_FILE</string>
+    <key>FOUNDATION_SHARE_BRIDGE_LOGO_DARK_FILE</key>
+    <string>$RUNTIME_LOGO_DARK_FILE</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin</string>
+  </dict>
+</dict>
+</plist>
+EOF
+
 launchctl bootout "gui/$(id -u)" "$PLIST_PATH" >/dev/null 2>&1 || true
+launchctl bootout "gui/$(id -u)" "$MENU_PLIST_PATH" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+launchctl bootstrap "gui/$(id -u)" "$MENU_PLIST_PATH"
 launchctl kickstart -k "gui/$(id -u)/$AGENT_LABEL"
+launchctl kickstart -k "gui/$(id -u)/$MENU_AGENT_LABEL"
 
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 if [ -x "$LSREGISTER" ]; then
@@ -215,8 +314,10 @@ touch "$PROTOCOL_APP_DIR"
 cat <<EOF
 Installed and started $SERVICE_NAME
 
-LaunchAgent:
+Bridge LaunchAgent:
   $PLIST_PATH
+Menu bar LaunchAgent:
+  $MENU_PLIST_PATH
 Runtime:
   $RUNTIME_DIR
 Logs:
@@ -225,6 +326,7 @@ App link handler:
   $PROTOCOL_APP_DIR
 
 This installs a per-user background item. It will start after login and keep the
-Rust bridge plus bundled Kubo node alive in the background. It also registers
+Rust bridge plus bundled Kubo node alive in the background. It also starts a
+menu bar app for visibility and quick settings, and registers
 foundationsharebridge:// links so the archive site can open the installed app.
 EOF

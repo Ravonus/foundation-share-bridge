@@ -66,7 +66,9 @@ and then opens the local status page for confirmation.
 - `BRIDGE_STATE_FILE`
   Default: `./bridge-state.json`
 - `BRIDGE_CONFIG_FILE`
-  Default: `./bridge-config.json`
+  Default: `./bridge-config.yaml`
+- `BRIDGE_RELAY_SERVER_URL`
+  Default: `https://foundation.agorix.io`
 - `BRIDGE_DOWNLOAD_ROOT_DIR`
   Optional default export/sync folder.
 - `BRIDGE_SYNC_ENABLED`
@@ -139,6 +141,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1 --purge-data
 ### macOS
 
 - per-user `LaunchAgent`
+- per-user menu bar companion
 - runtime under `~/Library/Application Support/FoundationShareBridge`
 - starts after login
 - container runtime expected: Docker Desktop or Colima
@@ -147,12 +150,16 @@ Useful runtime paths:
 
 - LaunchAgent plist:
   `~/Library/LaunchAgents/com.ravonus.foundation-share-bridge.plist`
+- Menu bar plist:
+  `~/Library/LaunchAgents/com.ravonus.foundation-share-bridge.menu.plist`
 - Runtime dir:
   `~/Library/Application Support/FoundationShareBridge`
 - Logs:
   `~/Library/Application Support/FoundationShareBridge/logs`
 - Persistent watched-pin state:
   `~/Library/Application Support/FoundationShareBridge/bridge-state.json`
+- Editable bridge config:
+  `~/Library/Application Support/FoundationShareBridge/bridge-config.yaml`
 - Persistent Kubo repo:
   `~/Library/Application Support/FoundationShareBridge/data/kubo`
 
@@ -290,9 +297,16 @@ You can drive it from the Foundation archive site’s `/desktop` board or direct
 
 With `sync_enabled=false`, the bridge still pins and watches roots forever. It just waits for a manual sync run before exporting files into the download folder.
 
+The helper settings page also includes a quick-fill flow for external gateway links:
+
+- If you have a hostname or DDNS name, type it once and the helper will build the external pinned gateway URL for you.
+- If you do not have a hostname yet, the helper will try to detect your public IPv4 address and offer a direct IP gateway URL as a fallback.
+- Inventory cards keep that external "Open pinned" route separate from the public IPFS fallback link.
+
 ## Local pages and fallback flows
 
 - The bridge still exposes `GET /share/work/view` if you want a local browser confirmation page.
+- The macOS menu bar app can open the local UI, reveal the YAML config, and update the relay target plus desktop name while the bridge is running.
 - The desktop app link is the preferred pairing flow for installed apps.
 - For same-machine debugging, the site can still talk to the bridge directly over localhost.
 

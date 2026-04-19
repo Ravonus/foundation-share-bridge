@@ -73,6 +73,7 @@ if (-not (Test-Path $binPath)) {
 
 $env:IPFS_API_URL = "http://127.0.0.1:5001"
 $env:BRIDGE_STATE_FILE = Join-Path $runtimeDir "bridge-state.json"
+$env:BRIDGE_CONFIG_FILE = Join-Path $runtimeDir "bridge-config.yaml"
 
 if (-not $env:SELF_REPAIR_INTERVAL_SECONDS) {
   $env:SELF_REPAIR_INTERVAL_SECONDS = "900"

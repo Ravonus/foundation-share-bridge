@@ -14,9 +14,12 @@ SCRIPTS_DIR="$STAGING_DIR/scripts"
 PAYLOAD_DIR="$ROOT_DIR/usr/local/lib/foundation-share-bridge/payload"
 PAYLOAD_BIN_DIR="$PAYLOAD_DIR/bin"
 PAYLOAD_SCRIPT_DIR="$PAYLOAD_DIR/scripts"
+PAYLOAD_ASSET_DIR="$PAYLOAD_DIR/assets"
 BIN_DIR="$ROOT_DIR/usr/local/bin"
 UNSIGNED_PKG_PATH="$DIST_ROOT/$PKG_NAME"
 SIGNED_PKG_PATH="$DIST_ROOT/$SIGNED_PKG_NAME"
+MENU_SOURCE="$PROJECT_DIR/scripts/foundation-share-bridge-menu.swift"
+MENU_BINARY="$PROJECT_DIR/target/foundation-share-bridge-menu"
 
 if ! command -v pkgbuild >/dev/null 2>&1; then
   echo "pkgbuild is required to build the macOS installer package." >&2
@@ -25,18 +28,23 @@ fi
 
 cd "$PROJECT_DIR"
 cargo build --release
+/usr/bin/xcrun swiftc -O -framework AppKit "$MENU_SOURCE" -o "$MENU_BINARY"
 
 rm -rf "$STAGING_DIR"
-mkdir -p "$PAYLOAD_BIN_DIR" "$PAYLOAD_SCRIPT_DIR" "$BIN_DIR" "$SCRIPTS_DIR" "$DIST_ROOT"
+mkdir -p "$PAYLOAD_BIN_DIR" "$PAYLOAD_SCRIPT_DIR" "$PAYLOAD_ASSET_DIR" "$BIN_DIR" "$SCRIPTS_DIR" "$DIST_ROOT"
 
 cp "$PROJECT_DIR/target/release/foundation-share-bridge" "$PAYLOAD_BIN_DIR/foundation-share-bridge"
+cp "$MENU_BINARY" "$PAYLOAD_BIN_DIR/foundation-share-bridge-menu"
 cp "$PROJECT_DIR/docker-compose.yml" "$PAYLOAD_DIR/docker-compose.yml"
 cp "$PROJECT_DIR/scripts/run-bridge-stack.sh" "$PAYLOAD_SCRIPT_DIR/run-bridge-stack.sh"
 cp "$PROJECT_DIR/scripts/handle-deep-link.sh" "$PAYLOAD_SCRIPT_DIR/handle-deep-link.sh"
+cp "$PROJECT_DIR/scripts/foundation-share-bridge-menu.swift" "$PAYLOAD_SCRIPT_DIR/foundation-share-bridge-menu.swift"
 cp "$PROJECT_DIR/scripts/install.sh" "$PAYLOAD_SCRIPT_DIR/install.sh"
 cp "$PROJECT_DIR/scripts/uninstall.sh" "$PAYLOAD_SCRIPT_DIR/uninstall.sh"
 cp "$PROJECT_DIR/scripts/install-macos-service.sh" "$PAYLOAD_SCRIPT_DIR/install-macos-service.sh"
 cp "$PROJECT_DIR/scripts/uninstall-macos-service.sh" "$PAYLOAD_SCRIPT_DIR/uninstall-macos-service.sh"
+cp "$PROJECT_DIR/assets/logo-light.png" "$PAYLOAD_ASSET_DIR/logo-light.png"
+cp "$PROJECT_DIR/assets/logo-dark.png" "$PAYLOAD_ASSET_DIR/logo-dark.png"
 
 cat > "$BIN_DIR/foundation-share-bridge-install" <<'EOF'
 #!/bin/bash
@@ -63,8 +71,10 @@ EOF
 
 chmod +x \
   "$PAYLOAD_BIN_DIR/foundation-share-bridge" \
+  "$PAYLOAD_BIN_DIR/foundation-share-bridge-menu" \
   "$PAYLOAD_SCRIPT_DIR/run-bridge-stack.sh" \
   "$PAYLOAD_SCRIPT_DIR/handle-deep-link.sh" \
+  "$PAYLOAD_SCRIPT_DIR/foundation-share-bridge-menu.swift" \
   "$PAYLOAD_SCRIPT_DIR/install.sh" \
   "$PAYLOAD_SCRIPT_DIR/uninstall.sh" \
   "$PAYLOAD_SCRIPT_DIR/install-macos-service.sh" \

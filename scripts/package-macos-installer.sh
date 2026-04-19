@@ -9,22 +9,30 @@ PACKAGE_DIR="$DIST_ROOT/$APP_NAME"
 PAYLOAD_DIR="$PACKAGE_DIR/payload"
 PAYLOAD_BIN_DIR="$PAYLOAD_DIR/bin"
 PAYLOAD_SCRIPT_DIR="$PAYLOAD_DIR/scripts"
+PAYLOAD_ASSET_DIR="$PAYLOAD_DIR/assets"
 ARCHIVE_PATH="$DIST_ROOT/$APP_NAME.tar.gz"
+MENU_SOURCE="$PROJECT_DIR/scripts/foundation-share-bridge-menu.swift"
+MENU_BINARY="$PROJECT_DIR/target/foundation-share-bridge-menu"
 
 cd "$PROJECT_DIR"
 cargo build --release
+/usr/bin/xcrun swiftc -O -framework AppKit "$MENU_SOURCE" -o "$MENU_BINARY"
 
 rm -rf "$PACKAGE_DIR"
-mkdir -p "$PAYLOAD_BIN_DIR" "$PAYLOAD_SCRIPT_DIR"
+mkdir -p "$PAYLOAD_BIN_DIR" "$PAYLOAD_SCRIPT_DIR" "$PAYLOAD_ASSET_DIR"
 
 cp "$PROJECT_DIR/target/release/foundation-share-bridge" "$PAYLOAD_BIN_DIR/foundation-share-bridge"
+cp "$MENU_BINARY" "$PAYLOAD_BIN_DIR/foundation-share-bridge-menu"
 cp "$PROJECT_DIR/docker-compose.yml" "$PAYLOAD_DIR/docker-compose.yml"
 cp "$PROJECT_DIR/scripts/run-bridge-stack.sh" "$PAYLOAD_SCRIPT_DIR/run-bridge-stack.sh"
 cp "$PROJECT_DIR/scripts/handle-deep-link.sh" "$PAYLOAD_SCRIPT_DIR/handle-deep-link.sh"
+cp "$PROJECT_DIR/scripts/foundation-share-bridge-menu.swift" "$PAYLOAD_SCRIPT_DIR/foundation-share-bridge-menu.swift"
 cp "$PROJECT_DIR/scripts/install-macos-service.sh" "$PAYLOAD_SCRIPT_DIR/install-macos-service.sh"
 cp "$PROJECT_DIR/scripts/uninstall-macos-service.sh" "$PAYLOAD_SCRIPT_DIR/uninstall-macos-service.sh"
 cp "$PROJECT_DIR/scripts/install.sh" "$PAYLOAD_SCRIPT_DIR/install.sh"
 cp "$PROJECT_DIR/scripts/uninstall.sh" "$PAYLOAD_SCRIPT_DIR/uninstall.sh"
+cp "$PROJECT_DIR/assets/logo-light.png" "$PAYLOAD_ASSET_DIR/logo-light.png"
+cp "$PROJECT_DIR/assets/logo-dark.png" "$PAYLOAD_ASSET_DIR/logo-dark.png"
 cp "$PROJECT_DIR/LICENSE" "$PACKAGE_DIR/LICENSE"
 
 cat > "$PACKAGE_DIR/Install Foundation Share Bridge.command" <<'EOF'
@@ -62,8 +70,10 @@ EOF
 
 chmod +x \
   "$PAYLOAD_BIN_DIR/foundation-share-bridge" \
+  "$PAYLOAD_BIN_DIR/foundation-share-bridge-menu" \
   "$PAYLOAD_SCRIPT_DIR/run-bridge-stack.sh" \
   "$PAYLOAD_SCRIPT_DIR/handle-deep-link.sh" \
+  "$PAYLOAD_SCRIPT_DIR/foundation-share-bridge-menu.swift" \
   "$PAYLOAD_SCRIPT_DIR/install-macos-service.sh" \
   "$PAYLOAD_SCRIPT_DIR/uninstall-macos-service.sh" \
   "$PAYLOAD_SCRIPT_DIR/install.sh" \

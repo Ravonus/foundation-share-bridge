@@ -71,6 +71,7 @@ fi
 
 export IPFS_API_URL="http://127.0.0.1:5001"
 export BRIDGE_STATE_FILE="$RUNTIME_DIR/bridge-state.json"
+export BRIDGE_CONFIG_FILE="$RUNTIME_DIR/bridge-config.yaml"
 export SELF_REPAIR_INTERVAL_SECONDS="${SELF_REPAIR_INTERVAL_SECONDS:-900}"
 
 exec "$BIN_PATH"

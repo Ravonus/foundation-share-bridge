@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,7 +11,11 @@ use async_recursion::async_recursion;
 use axum::{
     Form, Json, Router,
     extract::{Path as AxumPath, Query, State},
-    http::StatusCode,
+    http::{
+        StatusCode,
+        header::{HeaderName, HeaderValue},
+    },
+    middleware,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -34,6 +38,13 @@ use tower_http::{
 use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
+
+const DEFAULT_RELAY_SERVER_URL: &str = "https://foundation.agorix.io";
+const FOUNDATION_SITE_HOSTNAME: &str = "foundation.agorix.io";
+const FOUNDATION_SOCKET_HOSTNAME: &str = "socket-foundation.agorix.io";
+const INVENTORY_PAGE_SIZE: usize = 12;
+const INVENTORY_MAX_PAGE_SIZE: usize = 24;
+const PUBLIC_UTILITY_GATEWAY_BASE_URL: &str = "https://dweb.link";
 
 #[derive(Clone)]
 struct AppState {
@@ -136,6 +147,14 @@ struct HealthResponse {
     relay_last_connected_at: Option<DateTime<Utc>>,
     relay_last_error: Option<String>,
     now: DateTime<Utc>,
+}
+
+async fn add_private_network_access_header(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        HeaderName::from_static("access-control-allow-private-network"),
+        HeaderValue::from_static("true"),
+    );
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,6 +275,39 @@ struct PinsResponse {
     items: Vec<PinInventoryItem>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PinsPageQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PinsPageResponse {
+    total: usize,
+    pinned_count: usize,
+    managed_count: usize,
+    next_cursor: Option<String>,
+    items: Vec<PinInventoryItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PinMetadataField {
+    label: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PinMetadataView {
+    description: Option<String>,
+    fields: Vec<PinMetadataField>,
+    attributes: Vec<PinMetadataField>,
+    raw_json: String,
+    raw_json_truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PinInventoryItem {
@@ -282,6 +334,14 @@ struct PinInventoryItem {
     sync_path: Option<String>,
     local_gateway_url: Option<String>,
     public_gateway_url: Option<String>,
+    preview_local_gateway_url: Option<String>,
+    preview_public_gateway_url: Option<String>,
+    media_kind: Option<String>,
+    metadata_view: Option<PinMetadataView>,
+    metadata_cid: Option<String>,
+    media_cid: Option<String>,
+    #[serde(default)]
+    related_cids: Vec<String>,
     last_synced_at: Option<DateTime<Utc>>,
     last_sync_error: Option<String>,
     sync_count: u64,
@@ -354,6 +414,17 @@ struct UpdateBridgeConfigRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct UpdateBridgeConfigFormRequest {
+    download_root_dir: String,
+    sync_enabled: Option<String>,
+    local_gateway_base_url: String,
+    public_gateway_base_url: String,
+    relay_enabled: Option<String>,
+    relay_server_url: String,
+    relay_device_name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct RelayLinkRequest {
     relay_server_url: Option<String>,
     pairing_code: String,
@@ -383,6 +454,12 @@ struct RootPageQuery {
     device_name: Option<String>,
     linked: Option<String>,
     unlinked: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettingsPageQuery {
+    saved: Option<String>,
     error: Option<String>,
 }
 
@@ -659,6 +736,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(900);
     let state_file = bridge_state_file_from_env()?;
     let config_file = bridge_config_file_from_env(&state_file)?;
+    let should_seed_config_file = bridge_config_uses_yaml(&config_file) && !config_file.exists();
 
     let address: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -682,24 +760,32 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(RwLock::new(config)),
     };
 
+    if should_seed_config_file {
+        persist_bridge_config(&state).await?;
+    }
+
     spawn_repair_loop(state.clone());
     spawn_relay_socket_loop(state.clone());
 
     let app = Router::new()
         .route("/", get(root_page))
+        .route("/settings", get(settings_page))
         .route("/health", get(health))
         .route("/sessions", get(list_sessions))
         .route("/session/connect", post(connect_session))
         .route("/session/disconnect", post(disconnect_session))
         .route("/session/{session_id}", get(session_by_id))
         .route("/config", get(get_config).post(update_config))
+        .route("/settings/form", post(update_config_form))
         .route("/relay/link", post(link_relay_device))
         .route("/relay/unlink", post(unlink_relay_device))
         .route("/relay/link/form", post(link_relay_device_form))
         .route("/relay/unlink/form", post(unlink_relay_device_form))
         .route("/pins", get(list_pins))
+        .route("/pins/page", get(list_pins_page))
         .route("/pins/repair", post(repair_now))
         .route("/pins/verify", post(verify_pins))
+        .route("/pins/item/{cid}/verify", post(verify_single_pin))
         .route("/sync/run", post(sync_now))
         .route("/ipfs/pin", post(pin_cid))
         .route("/share/work", post(share_work))
@@ -712,6 +798,7 @@ async fn main() -> anyhow::Result<()> {
                 .allow_headers(Any)
                 .allow_methods(Any),
         )
+        .layer(middleware::map_response(add_private_network_access_header))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -748,11 +835,26 @@ fn bridge_config_file_from_env(state_file: &Path) -> anyhow::Result<PathBuf> {
     }
 
     if let Some(parent) = state_file.parent() {
-        return Ok(parent.join("bridge-config.json"));
+        let yaml_path = parent.join("bridge-config.yaml");
+        if yaml_path.exists() {
+            return Ok(yaml_path);
+        }
+
+        let yml_path = parent.join("bridge-config.yml");
+        if yml_path.exists() {
+            return Ok(yml_path);
+        }
+
+        let json_path = parent.join("bridge-config.json");
+        if json_path.exists() {
+            return Ok(json_path);
+        }
+
+        return Ok(yaml_path);
     }
 
     let cwd = env::current_dir().context("Unable to determine current directory")?;
-    Ok(cwd.join("bridge-config.json"))
+    Ok(cwd.join("bridge-config.yaml"))
 }
 
 async fn load_persistent_state(path: &Path) -> anyhow::Result<BridgePersistentState> {
@@ -821,7 +923,7 @@ fn default_bridge_config(state_file: &Path) -> BridgeConfig {
         relay_server_url: env::var("BRIDGE_RELAY_SERVER_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_default(),
+            .unwrap_or_else(|| DEFAULT_RELAY_SERVER_URL.to_string()),
         relay_device_name: env::var("BRIDGE_DEVICE_NAME")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -834,15 +936,41 @@ fn default_bridge_config(state_file: &Path) -> BridgeConfig {
     }
 }
 
+fn bridge_config_uses_yaml(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|value| value.to_str()),
+        Some("yaml" | "yml")
+    )
+}
+
+fn parse_bridge_config(contents: &str, path: &Path) -> anyhow::Result<BridgeConfig> {
+    if bridge_config_uses_yaml(path) {
+        serde_yaml::from_str::<BridgeConfig>(contents)
+            .or_else(|_| serde_json::from_str::<BridgeConfig>(contents))
+            .with_context(|| format!("Unable to parse bridge config from {}", path.display()))
+    } else {
+        serde_json::from_str::<BridgeConfig>(contents)
+            .or_else(|_| serde_yaml::from_str::<BridgeConfig>(contents))
+            .with_context(|| format!("Unable to parse bridge config from {}", path.display()))
+    }
+}
+
+fn legacy_bridge_json_path(path: &Path) -> Option<PathBuf> {
+    if !bridge_config_uses_yaml(path) {
+        return None;
+    }
+
+    let file_stem = path.file_stem()?.to_str()?;
+    let parent = path.parent()?;
+    Some(parent.join(format!("{file_stem}.json")))
+}
+
 async fn load_bridge_config(path: &Path, state_file: &Path) -> anyhow::Result<BridgeConfig> {
     let defaults = default_bridge_config(state_file);
 
     match fs::read_to_string(path).await {
         Ok(contents) => {
-            let mut config =
-                serde_json::from_str::<BridgeConfig>(&contents).with_context(|| {
-                    format!("Unable to parse bridge config from {}", path.display())
-                })?;
+            let mut config = parse_bridge_config(&contents, path)?;
 
             if config.download_root_dir.trim().is_empty() {
                 config.download_root_dir = defaults.download_root_dir;
@@ -853,13 +981,53 @@ async fn load_bridge_config(path: &Path, state_file: &Path) -> anyhow::Result<Br
             if config.public_gateway_base_url.trim().is_empty() {
                 config.public_gateway_base_url = defaults.public_gateway_base_url;
             }
+            if config.relay_server_url.trim().is_empty() {
+                config.relay_server_url = defaults.relay_server_url;
+            }
             if config.relay_device_name.trim().is_empty() {
                 config.relay_device_name = defaults.relay_device_name;
             }
 
             Ok(config)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(defaults),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(legacy_path) = legacy_bridge_json_path(path) {
+                match fs::read_to_string(&legacy_path).await {
+                    Ok(contents) => {
+                        let mut config = parse_bridge_config(&contents, &legacy_path)?;
+
+                        if config.download_root_dir.trim().is_empty() {
+                            config.download_root_dir = defaults.download_root_dir;
+                        }
+                        if config.local_gateway_base_url.trim().is_empty() {
+                            config.local_gateway_base_url = defaults.local_gateway_base_url;
+                        }
+                        if config.public_gateway_base_url.trim().is_empty() {
+                            config.public_gateway_base_url = defaults.public_gateway_base_url;
+                        }
+                        if config.relay_server_url.trim().is_empty() {
+                            config.relay_server_url = defaults.relay_server_url;
+                        }
+                        if config.relay_device_name.trim().is_empty() {
+                            config.relay_device_name = defaults.relay_device_name;
+                        }
+
+                        return Ok(config);
+                    }
+                    Err(legacy_error) if legacy_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(legacy_error) => {
+                        return Err(legacy_error).with_context(|| {
+                            format!(
+                                "Unable to read legacy bridge config at {}",
+                                legacy_path.display()
+                            )
+                        });
+                    }
+                }
+            }
+
+            Ok(defaults)
+        }
         Err(error) => Err(error)
             .with_context(|| format!("Unable to read bridge config at {}", path.display())),
     }
@@ -894,13 +1062,25 @@ async fn persist_bridge_config(state: &AppState) -> anyhow::Result<()> {
             .with_context(|| format!("Unable to create config directory {}", parent.display()))?;
     }
 
-    let json = serde_json::to_vec_pretty(&snapshot).context("Unable to encode bridge config")?;
-    fs::write(&state.config_file, json).await.with_context(|| {
-        format!(
-            "Unable to write bridge config to {}",
-            state.config_file.display()
-        )
-    })?;
+    if bridge_config_uses_yaml(&state.config_file) {
+        let yaml =
+            serde_yaml::to_string(&snapshot).context("Unable to encode bridge config as YAML")?;
+        fs::write(&state.config_file, yaml).await.with_context(|| {
+            format!(
+                "Unable to write bridge config to {}",
+                state.config_file.display()
+            )
+        })?;
+    } else {
+        let json =
+            serde_json::to_vec_pretty(&snapshot).context("Unable to encode bridge config")?;
+        fs::write(&state.config_file, json).await.with_context(|| {
+            format!(
+                "Unable to write bridge config to {}",
+                state.config_file.display()
+            )
+        })?;
+    }
 
     Ok(())
 }
@@ -988,6 +1168,131 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+fn relay_is_connected(config: &BridgeConfig) -> bool {
+    config.relay_enabled
+        && config
+            .relay_last_error
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        && !config
+            .relay_device_token
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+}
+
+fn build_config_response(state: &AppState, config: &BridgeConfig) -> BridgeConfigResponse {
+    BridgeConfigResponse {
+        download_root_dir: config.download_root_dir.clone(),
+        sync_enabled: config.sync_enabled,
+        local_gateway_base_url: config.local_gateway_base_url.clone(),
+        public_gateway_base_url: config.public_gateway_base_url.clone(),
+        relay_enabled: config.relay_enabled,
+        relay_server_url: config.relay_server_url.clone(),
+        relay_device_name: config.relay_device_name.clone(),
+        relay_device_id: config.relay_device_id.clone(),
+        relay_device_label: config.relay_device_label.clone(),
+        relay_last_connected_at: config.relay_last_connected_at,
+        relay_last_error: config.relay_last_error.clone(),
+        config_file: state.config_file.display().to_string(),
+    }
+}
+
+fn render_inventory_table_rows(items: &[PinInventoryItem], limit: usize) -> String {
+    items.iter()
+        .take(limit)
+        .map(|pin| {
+            let status_pill = if pin.pinned {
+                format!(
+                    r#"<span class="pill ok">{}</span>"#,
+                    escape_html(pin.pin_type.as_deref().unwrap_or("pinned"))
+                )
+            } else {
+                r#"<span class="pill warn">Repair needed</span>"#.to_string()
+            };
+
+            let links = {
+                let mut parts = Vec::new();
+                if let Some(url) = pin.local_gateway_url.as_deref() {
+                    parts.push(format!(
+                        r#"<a href="{}" target="_blank" rel="noreferrer">local</a>"#,
+                        escape_html(url)
+                    ));
+                }
+                if let Some(url) = pin.public_gateway_url.as_deref() {
+                    parts.push(format!(
+                        r#"<a href="{}" target="_blank" rel="noreferrer">pinned</a>"#,
+                        escape_html(url)
+                    ));
+                }
+                parts.push(format!(
+                    r#"<a href="{}" target="_blank" rel="noreferrer">public</a>"#,
+                    escape_html(&build_public_utility_gateway_url(&pin.cid))
+                ));
+                if parts.is_empty() {
+                    r#"<span class="muted">—</span>"#.to_string()
+                } else {
+                    parts.join(" · ")
+                }
+            };
+
+            format!(
+                r#"<tr><td><div>{}</div><div class="cid">{}</div></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                escape_html(
+                    pin.title
+                        .as_deref()
+                        .or(pin.label.as_deref())
+                        .unwrap_or("Local IPFS pin")
+                ),
+                escape_html(&pin.cid),
+                escape_html(
+                    pin.foundation_url
+                        .as_deref()
+                        .or(pin.contract_address.as_deref())
+                        .or(pin.username.as_deref())
+                        .unwrap_or("—")
+                ),
+                status_pill,
+                escape_html(
+                    &pin.last_verified_at
+                        .map(format_timestamp)
+                        .unwrap_or_else(|| "never".to_string())
+                ),
+                links,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_inventory_fallback_table(items: &[PinInventoryItem]) -> String {
+    let rows = render_inventory_table_rows(items, INVENTORY_PAGE_SIZE);
+    if rows.is_empty() {
+        return r#"<div class="empty">No pins yet. Once the archive site hands you something to rescue, it will appear here.</div>"#.to_string();
+    }
+
+    format!(
+        r#"<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Item</th>
+        <th>Context</th>
+        <th>Status</th>
+        <th>Last verified</th>
+        <th>Gateway</th>
+      </tr>
+    </thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>"#,
+        rows = rows
+    )
+}
+
 async fn root_page(
     State(state): State<AppState>,
     Query(query): Query<RootPageQuery>,
@@ -1007,80 +1312,7 @@ async fn root_page(
         .await
         .map_err(AppError::internal)?;
 
-    let rows = if inventory.items.is_empty() {
-        String::new()
-    } else {
-        inventory
-            .items
-            .iter()
-            .take(24)
-            .map(|pin| {
-                let status_pill = if pin.pinned {
-                    format!(
-                        r#"<span class="pill ok">{}</span>"#,
-                        escape_html(pin.pin_type.as_deref().unwrap_or("pinned"))
-                    )
-                } else {
-                    r#"<span class="pill warn">Repair needed</span>"#.to_string()
-                };
-
-                let links = {
-                    let mut parts = Vec::new();
-                    if let Some(url) = pin.local_gateway_url.as_deref() {
-                        parts.push(format!(
-                            r#"<a href="{}" target="_blank" rel="noreferrer">local</a>"#,
-                            escape_html(url)
-                        ));
-                    }
-                    if let Some(url) = pin.public_gateway_url.as_deref() {
-                        parts.push(format!(
-                            r#"<a href="{}" target="_blank" rel="noreferrer">public</a>"#,
-                            escape_html(url)
-                        ));
-                    }
-                    if parts.is_empty() {
-                        r#"<span class="muted">—</span>"#.to_string()
-                    } else {
-                        parts.join(" · ")
-                    }
-                };
-
-                format!(
-                    r#"<tr><td><div>{}</div><div class="cid">{}</div></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
-                    escape_html(
-                        pin.title
-                            .as_deref()
-                            .or(pin.label.as_deref())
-                            .unwrap_or("Local IPFS pin")
-                    ),
-                    escape_html(&pin.cid),
-                    escape_html(
-                        pin.foundation_url
-                            .as_deref()
-                            .or(pin.contract_address.as_deref())
-                            .or(pin.username.as_deref())
-                            .unwrap_or("—")
-                    ),
-                    status_pill,
-                    escape_html(
-                        &pin.last_verified_at
-                            .map(format_timestamp)
-                            .unwrap_or_else(|| "never".to_string())
-                    ),
-                    links,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    };
-
-    let relay_connected = config.relay_enabled
-        && !config
-            .relay_device_token
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty();
+    let relay_connected = relay_is_connected(&config);
 
     let connection_block = if relay_connected {
         format!(
@@ -1135,7 +1367,12 @@ async fn root_page(
     </div>
   </form>
 </section>"#,
-            server = escape_html(query.relay_server_url.as_deref().unwrap_or("")),
+            server = escape_html(
+                query
+                    .relay_server_url
+                    .as_deref()
+                    .unwrap_or(config.relay_server_url.as_str())
+            ),
             code = escape_html(query.pairing_code.as_deref().unwrap_or("")),
             name = escape_html(
                 query
@@ -1183,25 +1420,28 @@ async fn root_page(
     };
     let connection_pill_class = if relay_connected { "pill ok" } else { "pill" };
 
-    let inventory_body = if rows.is_empty() {
+    let inventory_body = if inventory.items.is_empty() {
         r#"<div class="empty">No pins yet. Once the archive site hands you something to rescue, it will appear here.</div>"#.to_string()
     } else {
+        let fallback_table = render_inventory_fallback_table(&inventory.items);
         format!(
-            r#"<div class="table-wrap">
-  <table>
-    <thead>
-      <tr>
-        <th>Item</th>
-        <th>Context</th>
-        <th>Status</th>
-        <th>Last verified</th>
-        <th>Gateway</th>
-      </tr>
-    </thead>
-    <tbody>{rows}</tbody>
-  </table>
-</div>"#,
-            rows = rows
+            r#"<div class="inventory-browser-head">
+  <p class="muted">Live previews load {page_size} pins at a time so the bridge doesn&apos;t hit every gateway all at once.</p>
+</div>
+<div id="inventory-browser" class="inventory-browser" data-page-size="{page_size}">
+  <div id="inventory-grid" class="pin-grid" aria-live="polite"></div>
+  <div id="inventory-empty" class="empty" hidden>No pins are available right now.</div>
+  <div class="inventory-load-row">
+    <button type="button" id="inventory-load-more" class="btn ghost" hidden>Load more pins</button>
+    <p id="inventory-status" class="muted inventory-status">Loading previews…</p>
+  </div>
+  <div id="inventory-sentinel" class="inventory-sentinel" aria-hidden="true"></div>
+</div>
+<noscript>{fallback}</noscript>
+<script>{script}</script>"#,
+            page_size = INVENTORY_PAGE_SIZE,
+            fallback = fallback_table,
+            script = INVENTORY_BROWSER_SCRIPT,
         )
     };
 
@@ -1217,12 +1457,13 @@ async fn root_page(
         r##"<main class="shell">
   <div class="stack">
     <section class="section-head">
-      <p class="eyebrow">Foundation share bridge</p>
+      <p class="eyebrow">Agorix · Share bridge</p>
       <h1>Keep rescued IPFS roots pinned and self-repaired.</h1>
-      <p class="lead">This Rust companion app keeps a local memory of watched CIDs, re-checks them forever, and re-pins anything your IPFS node drops. Pair it with the archive site once, then leave it running.</p>
+      <p class="lead">This local companion app for the Agorix Foundation archive keeps a memory of watched CIDs, re-checks them forever, and re-pins anything your IPFS node drops. Pair it with the archive site once, then leave it running.</p>
       <div class="btn-row">
         <a class="pill {conn_pill}" href="#connection">{conn_status}</a>
         <span class="pill">{repair_interval}s repair cadence</span>
+        <a class="btn ghost" href="/settings">Open settings</a>
       </div>
     </section>
 
@@ -1262,12 +1503,12 @@ async fn root_page(
       <div class="section-head" style="border-bottom: 0; padding-bottom: 0;">
         <p class="eyebrow">Local inventory</p>
         <h2 style="margin-top: 8px;">Everything this node has pinned</h2>
-        <p class="lead">Foundation-linked roots keep their rescue context. Other IPFS items show up here too.</p>
+        <p class="lead">Foundation-linked roots keep their rescue context. Other IPFS items show up here too. "Open pinned" uses your external gateway base URL, and every card also includes a separate public IPFS link for quick sharing.</p>
       </div>
       <div style="margin-top: 20px;">{inventory_body}</div>
     </section>
 
-    <p class="footer">Local bridge · {repair_interval}s repair interval · last cycle {last_repair}</p>
+    <p class="footer">Agorix share bridge · local-only · {repair_interval}s repair interval · last cycle {last_repair}</p>
   </div>
 </main>"##,
         conn_pill = connection_pill_class,
@@ -1283,6 +1524,254 @@ async fn root_page(
     );
 
     Ok(Html(render_page("Foundation Share Bridge", &body)))
+}
+
+async fn settings_page(
+    State(state): State<AppState>,
+    Query(query): Query<SettingsPageQuery>,
+) -> Result<Html<String>, AppError> {
+    let config = state.config.read().await.clone();
+    let relay_connected = relay_is_connected(&config);
+    let relay_status_label = if relay_connected {
+        "Connected"
+    } else if config.relay_enabled {
+        "Waiting to link"
+    } else {
+        "Not linked"
+    };
+    let relay_status_class = if relay_connected { "pill ok" } else { "pill" };
+    let sync_checked = if config.sync_enabled { "checked" } else { "" };
+    let relay_checked = if config.relay_enabled { "checked" } else { "" };
+
+    let flash_block = if query.saved.as_deref() == Some("1") {
+        r#"<div class="flash ok">Settings saved. The helper updated its YAML config file for you.</div>"#
+            .to_string()
+    } else if let Some(error) = query.error.as_deref() {
+        format!(r#"<div class="flash err">{}</div>"#, escape_html(error))
+    } else {
+        String::new()
+    };
+
+    let relay_note = config
+        .relay_last_error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|message| {
+            format!(
+                r#"<div class="flash warn">Relay note: {}</div>"#,
+                escape_html(message)
+            )
+        })
+        .unwrap_or_default();
+
+    let linked_device = config
+        .relay_device_label
+        .as_deref()
+        .or(config.relay_device_id.as_deref())
+        .unwrap_or("None yet");
+    let linked_at = config
+        .relay_last_connected_at
+        .map(format_timestamp)
+        .unwrap_or_else(|| "Not linked yet".to_string());
+    let yaml_path = state.config_file.display().to_string();
+    let detected_public_ipv4 = detect_public_ipv4(&state).await;
+    let current_external_gateway = escape_html(&config.public_gateway_base_url);
+
+    let gateway_helper = {
+        let hostname_help = match detected_public_ipv4.as_deref() {
+            Some(ip) => format!(
+                "If you own a hostname, point an A record like <code>ipfs.example.com</code> at <code>{}</code>, then click \"Use hostname\".",
+                escape_html(ip)
+            ),
+            None => "Type a DDNS or custom hostname here, then click \"Use hostname\" to fill the gateway URL below.".to_string(),
+        };
+
+        let ip_action = detected_public_ipv4
+            .as_deref()
+            .map(|ip| {
+                format!(
+                    r#"<button type="button" class="btn ghost" id="gateway_fill_ip" data-gateway-url="{}">Use detected IP</button>"#,
+                    escape_html(&build_direct_ip_gateway_base_url(ip))
+                )
+            })
+            .unwrap_or_else(|| {
+                r#"<span class="muted gateway-helper-note">Public IPv4 detection is unavailable right now. You can still type a hostname or edit the full URL manually.</span>"#.to_string()
+            });
+
+        format!(
+            r#"<div class="gateway-helper">
+  <p class="eyebrow">Quick fill</p>
+  <h3>Hostname first, IP if needed</h3>
+  <p class="muted settings-copy">Use a hostname if you have one. If not, you can fill the external gateway with your detected public IP and adjust the full URL below if your gateway uses a different port or protocol.</p>
+  <label class="field">
+    <span>Gateway hostname</span>
+    <input type="text" id="gateway_hostname_input" placeholder="ipfs.example.com or studio.ddns.net" />
+    <small class="field-help">{hostname_help}</small>
+  </label>
+  <div class="btn-row gateway-helper-actions">
+    <button type="button" class="btn ghost" id="gateway_fill_hostname">Use hostname</button>
+    {ip_action}
+  </div>
+  <p class="muted gateway-helper-preview">Next pinned gateway base: <code id="gateway_helper_preview_value">{current_external_gateway}</code></p>
+</div>"#,
+            hostname_help = hostname_help,
+            ip_action = ip_action,
+            current_external_gateway = current_external_gateway,
+        )
+    };
+
+    let gateway_dns_card = match detected_public_ipv4.as_deref() {
+        Some(ip) => {
+            let direct_ip_gateway = build_direct_ip_gateway_base_url(ip);
+            format!(
+                r#"<section class="card">
+          <p class="eyebrow">Gateway DNS</p>
+          <h2>Point a hostname at this helper</h2>
+          <p class="muted settings-copy">If you want cleaner pinned links, create an A record for something like <code>ipfs.example.com</code> and point it at your public IP. If you do not have a hostname yet, the detected IP button above fills a direct gateway URL for you.</p>
+          <dl class="kv" style="margin-top: 16px;">
+            <dt>Detected public IP</dt><dd><code>{ip}</code></dd>
+            <dt>Example A record</dt><dd><code>ipfs.example.com → {ip}</code></dd>
+            <dt>Direct IP fallback</dt><dd><code>{direct_ip_gateway}</code></dd>
+          </dl>
+        </section>"#,
+                ip = escape_html(ip),
+                direct_ip_gateway = escape_html(&direct_ip_gateway),
+            )
+        }
+        None => r#"<section class="card">
+          <p class="eyebrow">Gateway DNS</p>
+          <h2>Hostname or direct IP</h2>
+          <p class="muted settings-copy">We could not detect a public IPv4 address right now, but the quick-fill controls still help: type a hostname you control to build the external gateway URL automatically, or edit the full URL manually if you already know your public IP.</p>
+        </section>"#
+            .to_string(),
+    };
+
+    let body = format!(
+        r#"<main class="shell">
+  <div class="stack">
+    <section class="section-head">
+      <p class="eyebrow">Bridge settings</p>
+      <h1>Configure how this helper saves, tests, and opens pinned media.</h1>
+      <p class="lead">These inputs edit the bridge&apos;s YAML config file behind the scenes. People should use this page, not hand-edit YAML, unless they want the advanced path.</p>
+      <div class="btn-row">
+        <a class="btn ghost" href="/">Back to dashboard</a>
+        <span class="{relay_class}">{relay_label}</span>
+      </div>
+    </section>
+
+    {flash}
+    {relay_note}
+
+    <section class="settings-layout">
+      <form action="/settings/form" method="post" class="card settings-form">
+        <div class="settings-block">
+          <p class="eyebrow">Storage</p>
+          <h2>Saved copies on disk</h2>
+          <p class="muted settings-copy">Choose where synced copies live and whether the helper should maintain an on-disk mirror in addition to the IPFS pin.</p>
+          <label class="field">
+            <span>Download folder</span>
+            <input type="text" name="download_root_dir" value="{download_root_dir}" placeholder="/Users/you/Archive Pins" />
+            <small class="field-help">When sync is enabled, each watched CID is mirrored into this folder.</small>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" name="sync_enabled" value="1" {sync_checked} />
+            <span>
+              <strong>Keep synced copies on disk</strong>
+              <small>Turn this on if you want the helper to write rescued media into your download folder too.</small>
+            </span>
+          </label>
+        </div>
+
+        <div class="settings-block">
+          <p class="eyebrow">Gateways</p>
+          <h2>Preview and share links</h2>
+          <p class="muted settings-copy">The helper uses the local gateway for on-machine previews and the external gateway for the "Open pinned" button. Inventory cards also show a separate public IPFS link for quick sharing.</p>
+          <label class="field">
+            <span>Local gateway base URL</span>
+            <input type="url" name="local_gateway_base_url" value="{local_gateway_base_url}" placeholder="http://127.0.0.1:8080" />
+            <small class="field-help">Used by the local browser UI when it can reach your own gateway.</small>
+          </label>
+          <label class="field">
+            <span>External pinned gateway URL</span>
+            <input type="url" id="public_gateway_base_url" name="public_gateway_base_url" value="{public_gateway_base_url}" placeholder="https://ipfs.io" />
+            <small class="field-help">Point this at your own hostname, DDNS name, reverse proxy, or direct public IP gateway so "Open pinned" uses your route.</small>
+          </label>
+          {gateway_helper}
+        </div>
+
+        <div class="settings-block">
+          <p class="eyebrow">Relay</p>
+          <h2>Archive connection</h2>
+          <p class="muted settings-copy">These settings control how this helper pairs with the archive site and how it identifies itself when linked.</p>
+          <label class="checkbox-row">
+            <input type="checkbox" name="relay_enabled" value="1" {relay_checked} />
+            <span>
+              <strong>Enable archive relay link</strong>
+              <small>Leave this on for normal use so archive pages can hand work to this helper.</small>
+            </span>
+          </label>
+          <label class="field">
+            <span>Archive server URL</span>
+            <input type="url" name="relay_server_url" value="{relay_server_url}" placeholder="https://foundation.agorix.io" />
+            <small class="field-help">Changing this resets the current relay pairing so the helper can link to the new server cleanly.</small>
+          </label>
+          <label class="field">
+            <span>Desktop name</span>
+            <input type="text" name="relay_device_name" value="{relay_device_name}" placeholder="Studio MacBook" />
+            <small class="field-help">This is what the archive site shows when choosing where to send saved works.</small>
+          </label>
+        </div>
+
+        <div class="btn-row settings-actions">
+          <button type="submit" class="btn">Save settings</button>
+          <a class="btn ghost" href="/">Cancel</a>
+        </div>
+      </form>
+
+      <aside class="settings-side">
+        <section class="card">
+          <p class="eyebrow">Saved backend</p>
+          <h2>Still YAML underneath</h2>
+          <p class="muted settings-copy">The helper still stores everything in <code>bridge-config.yaml</code>. This page simply edits that file for the user.</p>
+          <dl class="kv" style="margin-top: 16px;">
+            <dt>Config file</dt><dd><code>{yaml_path}</code></dd>
+            <dt>Relay status</dt><dd>{relay_label}</dd>
+            <dt>Linked device</dt><dd>{linked_device}</dd>
+            <dt>Last linked</dt><dd>{linked_at}</dd>
+          </dl>
+        </section>
+
+        <section class="card">
+          <p class="eyebrow">External URLs</p>
+          <h2>Friendly pinned links</h2>
+          <p class="muted settings-copy">If you want the helper to open media through your own hostname, point DNS at this machine and use that hostname for the external gateway. If you do not have a hostname yet, the helper can fill a direct external-IP URL instead. The inventory UI keeps that route separate from the public IPFS fallback link.</p>
+        </section>
+        {gateway_dns_card}
+      </aside>
+    </section>
+  </div>
+</main>
+<script>{settings_gateway_script}</script>"#,
+        relay_class = relay_status_class,
+        relay_label = escape_html(relay_status_label),
+        flash = flash_block,
+        relay_note = relay_note,
+        download_root_dir = escape_html(&config.download_root_dir),
+        sync_checked = sync_checked,
+        local_gateway_base_url = escape_html(&config.local_gateway_base_url),
+        public_gateway_base_url = escape_html(&config.public_gateway_base_url),
+        relay_checked = relay_checked,
+        relay_server_url = escape_html(&config.relay_server_url),
+        relay_device_name = escape_html(&config.relay_device_name),
+        yaml_path = escape_html(&yaml_path),
+        linked_device = escape_html(linked_device),
+        linked_at = escape_html(&linked_at),
+        gateway_helper = gateway_helper,
+        gateway_dns_card = gateway_dns_card,
+        settings_gateway_script = SETTINGS_GATEWAY_HELPER_SCRIPT,
+    );
+
+    Ok(Html(render_page("Bridge settings", &body)))
 }
 
 async fn list_sessions(
@@ -1326,27 +1815,44 @@ async fn session_by_id(
 
 async fn get_config(State(state): State<AppState>) -> Result<Json<BridgeConfigResponse>, AppError> {
     let config = state.config.read().await;
-
-    Ok(Json(BridgeConfigResponse {
-        download_root_dir: config.download_root_dir.clone(),
-        sync_enabled: config.sync_enabled,
-        local_gateway_base_url: config.local_gateway_base_url.clone(),
-        public_gateway_base_url: config.public_gateway_base_url.clone(),
-        relay_enabled: config.relay_enabled,
-        relay_server_url: config.relay_server_url.clone(),
-        relay_device_name: config.relay_device_name.clone(),
-        relay_device_id: config.relay_device_id.clone(),
-        relay_device_label: config.relay_device_label.clone(),
-        relay_last_connected_at: config.relay_last_connected_at,
-        relay_last_error: config.relay_last_error.clone(),
-        config_file: state.config_file.display().to_string(),
-    }))
+    Ok(Json(build_config_response(&state, &config)))
 }
 
 async fn update_config(
     State(state): State<AppState>,
     Json(input): Json<UpdateBridgeConfigRequest>,
 ) -> Result<Json<BridgeConfigResponse>, AppError> {
+    let updated = apply_config_update(&state, input).await?;
+    Ok(Json(updated))
+}
+
+async fn update_config_form(
+    State(state): State<AppState>,
+    Form(input): Form<UpdateBridgeConfigFormRequest>,
+) -> Result<Redirect, AppError> {
+    let request = UpdateBridgeConfigRequest {
+        download_root_dir: Some(input.download_root_dir),
+        sync_enabled: Some(input.sync_enabled.is_some()),
+        local_gateway_base_url: Some(input.local_gateway_base_url),
+        public_gateway_base_url: Some(input.public_gateway_base_url),
+        relay_enabled: Some(input.relay_enabled.is_some()),
+        relay_server_url: Some(input.relay_server_url),
+        relay_device_name: Some(input.relay_device_name),
+    };
+
+    match apply_config_update(&state, request).await {
+        Ok(_) => Ok(Redirect::to("/settings?saved=1")),
+        Err(error) => Ok(Redirect::to(&format!(
+            "/settings?error={}",
+            encode_query_component(&error.message)
+        ))),
+    }
+}
+
+async fn apply_config_update(
+    state: &AppState,
+    input: UpdateBridgeConfigRequest,
+) -> Result<BridgeConfigResponse, AppError> {
     {
         let mut config = state.config.write().await;
 
@@ -1387,7 +1893,20 @@ async fn update_config(
         }
 
         if let Some(relay_server_url) = input.relay_server_url {
-            config.relay_server_url = relay_server_url.trim().to_string();
+            let trimmed = relay_server_url.trim();
+            if trimmed.is_empty() {
+                return Err(AppError::bad_request("relay_server_url cannot be empty"));
+            }
+            if trimmed != config.relay_server_url.trim() {
+                config.relay_enabled = false;
+                config.relay_device_id = None;
+                config.relay_device_label = None;
+                config.relay_device_token = None;
+                config.relay_last_connected_at = None;
+                config.relay_last_error =
+                    Some("Relay server changed. Pair this desktop app again.".to_string());
+            }
+            config.relay_server_url = trimmed.to_string();
         }
 
         if let Some(relay_device_name) = input.relay_device_name {
@@ -1399,11 +1918,12 @@ async fn update_config(
         }
     }
 
-    persist_bridge_config(&state)
+    persist_bridge_config(state)
         .await
         .map_err(AppError::internal)?;
 
-    get_config(State(state)).await
+    let config = state.config.read().await;
+    Ok(build_config_response(state, &config))
 }
 
 async fn link_relay_device(
@@ -1618,6 +2138,19 @@ async fn list_pins(State(state): State<AppState>) -> Result<Json<PinsResponse>, 
     Ok(Json(response))
 }
 
+async fn list_pins_page(
+    State(state): State<AppState>,
+    Query(query): Query<PinsPageQuery>,
+) -> Result<Json<PinsPageResponse>, AppError> {
+    let response = list_local_pin_inventory(&state)
+        .await
+        .map_err(AppError::internal)?;
+    let cursor = parse_inventory_cursor(query.cursor.as_deref());
+    let limit = resolve_inventory_page_size(query.limit);
+
+    Ok(Json(build_pins_page_response(response, cursor, limit)))
+}
+
 async fn repair_now(State(state): State<AppState>) -> Result<Json<RepairNowResponse>, AppError> {
     let outcome = repair_watched_pins(&state)
         .await
@@ -1640,6 +2173,7 @@ async fn verify_pins(
 
     for cid in targets {
         let result = check_cid_network_providers(&state, &cid).await;
+        remember_pin_verification(&state, &result).await?;
         results.push(result);
     }
 
@@ -1647,6 +2181,15 @@ async fn verify_pins(
         checked_at: Utc::now(),
         results,
     }))
+}
+
+async fn verify_single_pin(
+    AxumPath(cid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<PinVerification>, AppError> {
+    let result = check_cid_network_providers(&state, &cid).await;
+    remember_pin_verification(&state, &result).await?;
+    Ok(Json(result))
 }
 
 async fn resolve_verify_targets(state: &AppState, requested: Option<&[String]>) -> Vec<String> {
@@ -1661,6 +2204,42 @@ async fn resolve_verify_targets(state: &AppState, requested: Option<&[String]>) 
 
     let persistent = state.persistent.read().await;
     persistent.watched_pins.keys().cloned().collect()
+}
+
+fn parse_inventory_cursor(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn resolve_inventory_page_size(raw: Option<usize>) -> usize {
+    raw.unwrap_or(INVENTORY_PAGE_SIZE)
+        .clamp(1, INVENTORY_MAX_PAGE_SIZE)
+}
+
+fn build_pins_page_response(
+    response: PinsResponse,
+    cursor: usize,
+    limit: usize,
+) -> PinsPageResponse {
+    let total = response.total;
+    let start = cursor.min(total);
+    let end = start.saturating_add(limit).min(total);
+    let items = response.items[start..end].to_vec();
+
+    PinsPageResponse {
+        total,
+        pinned_count: response.pinned_count,
+        managed_count: response.managed_count,
+        next_cursor: (end < total).then(|| end.to_string()),
+        items,
+    }
+}
+
+async fn remember_pin_verification(
+    state: &AppState,
+    result: &PinVerification,
+) -> Result<(), AppError> {
+    mark_pin_checked(state, &result.cid, result.error.clone()).await
 }
 
 async fn check_cid_network_providers(state: &AppState, cid: &str) -> PinVerification {
@@ -1726,7 +2305,7 @@ async fn fetch_provider_count(
         request = request.header("Authorization", header);
     }
 
-    let response = request.send().await?;
+    let mut response = request.send().await?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -1738,7 +2317,23 @@ async fn fetch_provider_count(
     // The findprovs endpoint streams ndjson. Each line is a JSON object with
     // a `Responses` array that contains peer IDs. A non-empty peer list on any
     // line means at least one provider was found for this CID.
-    let body = response.text().await?;
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) => break,
+            Err(error) => {
+                if body.is_empty() {
+                    return Err(anyhow!(
+                        "Unable to read IPFS {endpoint} response body: {error}"
+                    ));
+                }
+                break;
+            }
+        }
+    }
+
+    let body = String::from_utf8_lossy(&body);
     let mut unique_providers = std::collections::HashSet::new();
     for line in body.lines() {
         let trimmed = line.trim();
@@ -2285,6 +2880,37 @@ fn build_gateway_url(base: &str, cid: &str) -> String {
     format!("{}/ipfs/{}", trim_trailing_slash(base), cid.trim())
 }
 
+fn build_public_utility_gateway_url(cid: &str) -> String {
+    build_gateway_url(PUBLIC_UTILITY_GATEWAY_BASE_URL, cid)
+}
+
+fn build_direct_ip_gateway_base_url(ip: &str) -> String {
+    format!("http://{}:8080", ip.trim())
+}
+
+async fn detect_public_ipv4(state: &AppState) -> Option<String> {
+    #[derive(Debug, Deserialize)]
+    struct IpifyResponse {
+        ip: String,
+    }
+
+    let response = state
+        .http
+        .get("https://api4.ipify.org?format=json")
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let payload = response.json::<IpifyResponse>().await.ok()?;
+    let parsed = payload.ip.parse::<Ipv4Addr>().ok()?;
+    Some(parsed.to_string())
+}
+
 fn encode_query_component(value: &str) -> String {
     value
         .bytes()
@@ -2334,114 +2960,884 @@ async fn list_kubo_pinset(state: &AppState) -> anyhow::Result<HashMap<String, St
     Ok(pins)
 }
 
+#[derive(Debug, Clone)]
+struct InventorySourcePin {
+    cid: String,
+    pinned: bool,
+    pin_type: Option<String>,
+    watched: WatchedPin,
+}
+
+#[derive(Debug, Default)]
+struct ResolvedWorkDisplay {
+    local_open_url: Option<String>,
+    public_open_url: Option<String>,
+    preview_local_url: Option<String>,
+    preview_public_url: Option<String>,
+    media_kind: Option<String>,
+    metadata_view: Option<PinMetadataView>,
+}
+
+fn inventory_work_group_key(pin: &WatchedPin) -> Option<String> {
+    if pin.source_kind != "work" {
+        return None;
+    }
+
+    if let (Some(contract_address), Some(token_id)) =
+        (pin.contract_address.as_deref(), pin.token_id.as_deref())
+    {
+        let contract = contract_address.trim().to_ascii_lowercase();
+        let token = token_id.trim();
+        if !contract.is_empty() && !token.is_empty() {
+            return Some(format!("work:{contract}:{token}"));
+        }
+    }
+
+    if let Some(foundation_url) = pin.foundation_url.as_deref() {
+        let trimmed = foundation_url.trim();
+        if !trimmed.is_empty() {
+            return Some(format!("work-url:{trimmed}"));
+        }
+    }
+
+    if let Some(title) = pin.title.as_deref() {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            return Some(format!(
+                "work-title:{}:{}",
+                trimmed.to_ascii_lowercase(),
+                pin.artist_username
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+            ));
+        }
+    }
+
+    None
+}
+
+fn first_present_string<I>(values: I) -> Option<String>
+where
+    I: IntoIterator<Item = Option<String>>,
+{
+    values
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty())
+}
+
+fn max_timestamp_by<F>(members: &[InventorySourcePin], accessor: F) -> Option<DateTime<Utc>>
+where
+    F: Fn(&InventorySourcePin) -> Option<DateTime<Utc>>,
+{
+    members.iter().filter_map(accessor).max()
+}
+
+fn first_present_error<F>(members: &[InventorySourcePin], accessor: F) -> Option<String>
+where
+    F: Fn(&InventorySourcePin) -> Option<&String>,
+{
+    members
+        .iter()
+        .filter_map(accessor)
+        .find(|value| !value.trim().is_empty())
+        .cloned()
+}
+
+fn related_cids_from_members(members: &[InventorySourcePin]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    members
+        .iter()
+        .map(|member| member.cid.clone())
+        .filter(|cid| seen.insert(cid.clone()))
+        .collect()
+}
+
+fn parse_ipfs_path(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = trimmed.strip_prefix("ipfs/").unwrap_or(trimmed);
+    let mut parts = normalized.splitn(2, '/');
+    let cid = parts.next()?.trim();
+    if cid.is_empty() {
+        return None;
+    }
+
+    let relative_path = parts.next().unwrap_or("").trim_matches('/').to_string();
+    Some((cid.to_string(), relative_path))
+}
+
+fn parse_ipfs_reference(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("ipfs://") {
+        return parse_ipfs_path(rest);
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("/ipfs/") {
+        return parse_ipfs_path(rest);
+    }
+
+    let url = Url::parse(trimmed).ok()?;
+    if let Some(host) = url.host_str() {
+        if let Some((cid, _)) = host.split_once(".ipfs.") {
+            return Some((cid.to_string(), url.path().trim_matches('/').to_string()));
+        }
+    }
+
+    let path = url.path();
+    let index = path.find("/ipfs/")?;
+    parse_ipfs_path(&path[(index + "/ipfs/".len())..])
+}
+
+fn build_gateway_asset_url(base: &str, cid: &str, relative_path: &str) -> String {
+    let cleaned = relative_path.trim().trim_matches('/');
+    if cleaned.is_empty() {
+        return build_gateway_url(base, cid);
+    }
+
+    format!(
+        "{}/ipfs/{}/{}",
+        trim_trailing_slash(base),
+        cid.trim(),
+        cleaned
+    )
+}
+
+fn normalize_asset_url_for_gateway(raw: &str, gateway_base: &str) -> String {
+    if let Some((cid, relative_path)) = parse_ipfs_reference(raw) {
+        return build_gateway_asset_url(gateway_base, &cid, &relative_path);
+    }
+
+    raw.to_string()
+}
+
+fn json_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(|entry| entry.as_str())
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn nested_json_value<'a>(
+    value: &'a serde_json::Value,
+    path: &[&str],
+) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for segment in path {
+        current = current.as_object()?.get(*segment)?;
+    }
+    Some(current)
+}
+
+fn collect_url_candidates(value: Option<&serde_json::Value>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let entries = match value {
+        Some(serde_json::Value::Array(items)) => items.iter().collect::<Vec<_>>(),
+        Some(other) => vec![other],
+        None => Vec::new(),
+    };
+
+    for entry in entries {
+        let Some(record) = entry.as_object() else {
+            continue;
+        };
+
+        for key in [
+            "uri",
+            "url",
+            "src",
+            "href",
+            "animation_url",
+            "animation",
+            "image",
+            "image_url",
+        ] {
+            let candidate = json_string(record.get(key));
+            if let Some(candidate) = candidate.filter(|value| !candidates.contains(value)) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn metadata_image_url(metadata: &serde_json::Value) -> Option<String> {
+    first_present_string([
+        json_string(metadata.get("image")),
+        json_string(metadata.get("image_url")),
+        json_string(nested_json_value(metadata, &["properties", "image"])),
+        json_string(nested_json_value(metadata, &["properties", "image_url"])),
+        json_string(nested_json_value(metadata, &["displayUri"])),
+        json_string(nested_json_value(metadata, &["display_uri"])),
+        json_string(nested_json_value(metadata, &["thumbnailUri"])),
+        json_string(nested_json_value(metadata, &["thumbnail_uri"])),
+    ])
+}
+
+fn metadata_file_url(metadata: &serde_json::Value) -> Option<String> {
+    first_present_string(
+        collect_url_candidates(nested_json_value(metadata, &["media", "files"]))
+            .into_iter()
+            .map(Some)
+            .chain(
+                collect_url_candidates(nested_json_value(metadata, &["properties", "files"]))
+                    .into_iter()
+                    .map(Some),
+            )
+            .chain(
+                collect_url_candidates(nested_json_value(metadata, &["files"]))
+                    .into_iter()
+                    .map(Some),
+            )
+            .chain(
+                collect_url_candidates(nested_json_value(metadata, &["formats"]))
+                    .into_iter()
+                    .map(Some),
+            ),
+    )
+}
+
+fn metadata_primary_media_url(metadata: &serde_json::Value) -> Option<String> {
+    first_present_string([
+        json_string(metadata.get("animation_url")),
+        json_string(metadata.get("animation")),
+        json_string(nested_json_value(metadata, &["media", "uri"])),
+        json_string(nested_json_value(metadata, &["media", "url"])),
+        json_string(nested_json_value(
+            metadata,
+            &["properties", "animation_url"],
+        )),
+        json_string(nested_json_value(metadata, &["properties", "animation"])),
+        json_string(nested_json_value(metadata, &["artifactUri"])),
+        json_string(nested_json_value(metadata, &["artifact_uri"])),
+        json_string(nested_json_value(metadata, &["content", "uri"])),
+        json_string(nested_json_value(metadata, &["content", "url"])),
+    ])
+}
+
+fn json_display_value(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(boolean) => Some(boolean.to_string()),
+        serde_json::Value::Array(values) => {
+            let joined = values
+                .iter()
+                .filter_map(|entry| json_display_value(Some(entry)))
+                .collect::<Vec<_>>();
+            (!joined.is_empty()).then(|| joined.join(", "))
+        }
+        serde_json::Value::Object(record) => serde_json::to_string(record)
+            .ok()
+            .filter(|value| !value.is_empty()),
+    }
+}
+
+fn metadata_description(metadata: &serde_json::Value) -> Option<String> {
+    first_present_string([
+        json_string(metadata.get("description")),
+        json_string(nested_json_value(metadata, &["properties", "description"])),
+        json_string(nested_json_value(metadata, &["content", "description"])),
+    ])
+}
+
+fn metadata_external_url(metadata: &serde_json::Value) -> Option<String> {
+    first_present_string([
+        json_string(metadata.get("external_url")),
+        json_string(metadata.get("externalUrl")),
+        json_string(nested_json_value(metadata, &["properties", "external_url"])),
+        json_string(nested_json_value(metadata, &["properties", "externalUrl"])),
+    ])
+}
+
+fn metadata_mime_type(metadata: &serde_json::Value) -> Option<String> {
+    first_present_string([
+        json_string(metadata.get("mimeType")),
+        json_string(metadata.get("mime_type")),
+        json_string(nested_json_value(metadata, &["content", "mimeType"])),
+        json_string(nested_json_value(metadata, &["content", "mime_type"])),
+        json_string(nested_json_value(metadata, &["properties", "mimeType"])),
+        json_string(nested_json_value(metadata, &["properties", "mime_type"])),
+    ])
+}
+
+fn build_metadata_summary_fields(
+    metadata: &serde_json::Value,
+    image_raw: Option<&str>,
+    media_raw: Option<&str>,
+) -> Vec<PinMetadataField> {
+    let mut fields = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut push_field = |label: &str, value: Option<String>| {
+        let Some(value) = value.filter(|entry| !entry.trim().is_empty()) else {
+            return;
+        };
+        let dedupe_key = format!("{}:{}", label.to_ascii_lowercase(), value);
+        if seen.insert(dedupe_key) {
+            fields.push(PinMetadataField {
+                label: label.to_string(),
+                value,
+            });
+        }
+    };
+
+    push_field("Metadata title", json_string(metadata.get("name")));
+    push_field("External URL", metadata_external_url(metadata));
+    push_field("Preview image", image_raw.map(ToOwned::to_owned));
+    push_field(
+        "Primary media",
+        media_raw
+            .filter(|entry| Some(*entry) != image_raw)
+            .map(ToOwned::to_owned),
+    );
+    push_field("Mime type", metadata_mime_type(metadata));
+
+    fields
+}
+
+fn build_metadata_attribute_fields(metadata: &serde_json::Value) -> Vec<PinMetadataField> {
+    let mut attributes = Vec::new();
+    let mut seen = HashSet::new();
+
+    for candidate in [
+        metadata.get("attributes"),
+        nested_json_value(metadata, &["properties", "attributes"]),
+        metadata.get("traits"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(entries) = candidate.as_array() else {
+            continue;
+        };
+
+        for (index, entry) in entries.iter().enumerate() {
+            let Some(record) = entry.as_object() else {
+                continue;
+            };
+
+            let label = first_present_string([
+                json_string(record.get("trait_type")),
+                json_string(record.get("type")),
+                json_string(record.get("name")),
+                json_string(record.get("key")),
+            ])
+            .unwrap_or_else(|| format!("Trait {}", index + 1));
+
+            let value = first_present_string([
+                json_display_value(record.get("value")),
+                json_display_value(record.get("display_value")),
+                json_display_value(record.get("trait_value")),
+            ]);
+            let Some(value) = value.filter(|entry| !entry.trim().is_empty()) else {
+                continue;
+            };
+
+            let dedupe_key = format!("{}:{}", label.to_ascii_lowercase(), value);
+            if seen.insert(dedupe_key) {
+                attributes.push(PinMetadataField { label, value });
+            }
+        }
+    }
+
+    attributes
+}
+
+fn build_metadata_view(
+    metadata: &serde_json::Value,
+    image_raw: Option<&str>,
+    media_raw: Option<&str>,
+) -> Option<PinMetadataView> {
+    const MAX_METADATA_JSON_CHARS: usize = 24_000;
+
+    let mut raw_json = serde_json::to_string_pretty(metadata).ok()?;
+    let mut raw_json_truncated = false;
+    if raw_json.chars().count() > MAX_METADATA_JSON_CHARS {
+        raw_json = raw_json.chars().take(MAX_METADATA_JSON_CHARS).collect();
+        raw_json.push_str("\n…");
+        raw_json_truncated = true;
+    }
+
+    let description = metadata_description(metadata);
+    let fields = build_metadata_summary_fields(metadata, image_raw, media_raw);
+    let attributes = build_metadata_attribute_fields(metadata);
+
+    if description.is_none() && fields.is_empty() && attributes.is_empty() && raw_json.is_empty() {
+        return None;
+    }
+
+    Some(PinMetadataView {
+        description,
+        fields,
+        attributes,
+        raw_json,
+        raw_json_truncated,
+    })
+}
+
+fn detect_media_kind_from_text(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let markers: [(&str, &[&str]); 6] = [
+        ("VIDEO", &[".mp4", ".mov", ".webm", "video"]),
+        ("AUDIO", &[".mp3", ".wav", ".ogg", ".aac", "audio"]),
+        (
+            "IMAGE",
+            &[".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", "image"],
+        ),
+        ("HTML", &[".html", "text/html"]),
+        (
+            "MODEL",
+            &[
+                ".glb",
+                ".gltf",
+                ".usdz",
+                "model",
+                "model/gltf",
+                "model/vnd.usdz",
+                "3d",
+            ],
+        ),
+        ("JSON", &[".json", "application/json", "text/json"]),
+    ];
+
+    markers.iter().find_map(|(kind, entries)| {
+        entries
+            .iter()
+            .any(|marker| lower.contains(marker))
+            .then(|| (*kind).to_string())
+    })
+}
+
+async fn detect_media_kind_for_url(
+    state: &AppState,
+    local_url: Option<&str>,
+    hints: &[Option<String>],
+) -> Option<String> {
+    for value in hints.iter().flatten() {
+        if let Some(kind) = detect_media_kind_from_text(value) {
+            return Some(kind);
+        }
+    }
+
+    let url = local_url?.trim();
+    if url.is_empty() {
+        return None;
+    }
+
+    let response = state
+        .http
+        .head(url)
+        .timeout(Duration::from_secs(6))
+        .send()
+        .await
+        .ok()?;
+
+    if let Some(content_type) = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(detect_media_kind_from_text)
+    {
+        return Some(content_type);
+    }
+
+    detect_media_kind_from_text(response.url().as_str())
+}
+
+async fn fetch_ipfs_json(
+    state: &AppState,
+    ipfs_path: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let endpoint = format!("{}/api/v0/cat", state.ipfs_api_url.trim_end_matches('/'));
+    let mut request = state.http.post(endpoint).query(&[("arg", ipfs_path)]);
+    if let Some(header) = &state.ipfs_api_auth_header {
+        request = request.header("Authorization", header);
+    }
+
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+
+    let body = response.bytes().await?;
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    Ok(parsed)
+}
+
+async fn resolve_single_child_path(
+    state: &AppState,
+    cid: &str,
+    required_suffixes: &[&str],
+) -> Option<String> {
+    let links = list_ipfs_links(state, &format!("/ipfs/{}", cid.trim()))
+        .await
+        .ok()?;
+    if links.is_empty() {
+        return None;
+    }
+
+    let mut names = links
+        .iter()
+        .filter_map(|link| link.get("Name").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| {
+            required_suffixes.is_empty()
+                || required_suffixes
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+        })
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    names.dedup();
+    (names.len() == 1).then(|| names.remove(0))
+}
+
+async fn load_work_metadata_record(
+    state: &AppState,
+    metadata_cid: &str,
+    token_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut candidates = Vec::new();
+    let cid = metadata_cid.trim();
+
+    if let Some(token_id) = token_id.map(str::trim).filter(|value| !value.is_empty()) {
+        candidates.push(format!("/ipfs/{cid}/{token_id}.json"));
+        candidates.push(format!("/ipfs/{cid}/{token_id}"));
+    }
+
+    candidates.push(format!("/ipfs/{cid}/metadata.json"));
+    if let Some(single_json_child) = resolve_single_child_path(state, cid, &[".json"]).await {
+        candidates.push(format!("/ipfs/{cid}/{single_json_child}"));
+    }
+    candidates.push(format!("/ipfs/{cid}"));
+
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+        if let Ok(Some(metadata)) = fetch_ipfs_json(state, &candidate).await {
+            return Some(metadata);
+        }
+    }
+
+    None
+}
+
+async fn resolve_work_display(
+    state: &AppState,
+    config: &BridgeConfig,
+    metadata_cid: Option<&str>,
+    media_cid: Option<&str>,
+    token_id: Option<&str>,
+) -> ResolvedWorkDisplay {
+    let mut display = ResolvedWorkDisplay::default();
+
+    let metadata = if let Some(metadata_cid) = metadata_cid.filter(|value| !value.trim().is_empty())
+    {
+        load_work_metadata_record(state, metadata_cid, token_id).await
+    } else {
+        None
+    };
+
+    let image_raw = metadata.as_ref().and_then(metadata_image_url);
+    let media_raw = metadata.as_ref().and_then(|record| {
+        let image = image_raw.clone();
+        metadata_primary_media_url(record)
+            .or_else(|| metadata_file_url(record))
+            .or(image)
+    });
+    display.metadata_view = metadata
+        .as_ref()
+        .and_then(|record| build_metadata_view(record, image_raw.as_deref(), media_raw.as_deref()));
+
+    if let Some(raw) = media_raw
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        display.local_open_url = Some(normalize_asset_url_for_gateway(
+            raw,
+            &config.local_gateway_base_url,
+        ));
+        display.public_open_url = Some(normalize_asset_url_for_gateway(
+            raw,
+            &config.public_gateway_base_url,
+        ));
+    } else if let Some(media_cid) = media_cid.filter(|value| !value.trim().is_empty()) {
+        if let Some(child) = resolve_single_child_path(state, media_cid, &[]).await {
+            display.local_open_url = Some(build_gateway_asset_url(
+                &config.local_gateway_base_url,
+                media_cid,
+                &child,
+            ));
+            display.public_open_url = Some(build_gateway_asset_url(
+                &config.public_gateway_base_url,
+                media_cid,
+                &child,
+            ));
+        } else {
+            display.local_open_url =
+                Some(build_gateway_url(&config.local_gateway_base_url, media_cid));
+            display.public_open_url = Some(build_gateway_url(
+                &config.public_gateway_base_url,
+                media_cid,
+            ));
+        }
+    } else if let Some(metadata_cid) = metadata_cid.filter(|value| !value.trim().is_empty()) {
+        display.local_open_url = Some(build_gateway_url(
+            &config.local_gateway_base_url,
+            metadata_cid,
+        ));
+        display.public_open_url = Some(build_gateway_url(
+            &config.public_gateway_base_url,
+            metadata_cid,
+        ));
+    }
+
+    if let Some(raw) = image_raw
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        display.preview_local_url = Some(normalize_asset_url_for_gateway(
+            raw,
+            &config.local_gateway_base_url,
+        ));
+        display.preview_public_url = Some(normalize_asset_url_for_gateway(
+            raw,
+            &config.public_gateway_base_url,
+        ));
+    }
+
+    display.media_kind = detect_media_kind_for_url(
+        state,
+        display
+            .local_open_url
+            .as_deref()
+            .or(display.preview_local_url.as_deref()),
+        &[
+            media_raw.clone(),
+            image_raw.clone(),
+            display.local_open_url.clone(),
+            display.preview_local_url.clone(),
+        ],
+    )
+    .await;
+
+    if display.preview_local_url.is_none()
+        && matches!(
+            display.media_kind.as_deref(),
+            Some("IMAGE") | Some("VIDEO") | Some("HTML") | Some("MODEL")
+        )
+    {
+        display.preview_local_url = display.local_open_url.clone();
+        display.preview_public_url = display.public_open_url.clone();
+    }
+
+    display
+}
+
+fn build_single_inventory_item(
+    config: &BridgeConfig,
+    source: InventorySourcePin,
+) -> PinInventoryItem {
+    let cid = source.cid.clone();
+
+    PinInventoryItem {
+        cid: cid.clone(),
+        pinned: source.pinned,
+        pin_type: source.pin_type.clone(),
+        managed: true,
+        label: source.watched.label.clone(),
+        source_kind: Some(source.watched.source_kind.clone()),
+        title: source.watched.title.clone(),
+        contract_address: source.watched.contract_address.clone(),
+        token_id: source.watched.token_id.clone(),
+        foundation_url: source.watched.foundation_url.clone(),
+        artist_username: source.watched.artist_username.clone(),
+        account_address: source.watched.account_address.clone(),
+        username: source.watched.username.clone(),
+        added_at: Some(source.watched.added_at),
+        last_verified_at: source.watched.last_verified_at,
+        last_repaired_at: source.watched.last_repaired_at,
+        last_error: source.watched.last_error.clone(),
+        pin_reference: source.watched.pin_reference.clone(),
+        verify_count: source.watched.verify_count,
+        repair_count: source.watched.repair_count,
+        sync_path: source.watched.sync_path.clone(),
+        local_gateway_url: Some(build_gateway_url(&config.local_gateway_base_url, &cid)),
+        public_gateway_url: Some(build_gateway_url(&config.public_gateway_base_url, &cid)),
+        preview_local_gateway_url: Some(build_gateway_url(&config.local_gateway_base_url, &cid)),
+        preview_public_gateway_url: Some(build_gateway_url(&config.public_gateway_base_url, &cid)),
+        media_kind: None,
+        metadata_view: None,
+        metadata_cid: None,
+        media_cid: None,
+        related_cids: vec![cid],
+        last_synced_at: source.watched.last_synced_at,
+        last_sync_error: source.watched.last_sync_error.clone(),
+        sync_count: source.watched.sync_count,
+    }
+}
+
+async fn build_work_inventory_item(
+    state: &AppState,
+    config: &BridgeConfig,
+    members: &[InventorySourcePin],
+) -> PinInventoryItem {
+    let metadata_member = members
+        .iter()
+        .find(|member| matches!(member.watched.label.as_deref(), Some("metadata")));
+    let media_member = members
+        .iter()
+        .find(|member| matches!(member.watched.label.as_deref(), Some("media")));
+    let primary_member = media_member
+        .or(metadata_member)
+        .or_else(|| members.first())
+        .expect("work groups always contain at least one member");
+
+    let metadata_cid = metadata_member.map(|member| member.cid.clone());
+    let media_cid = media_member.map(|member| member.cid.clone());
+    let display = resolve_work_display(
+        state,
+        config,
+        metadata_cid.as_deref(),
+        media_cid.as_deref(),
+        primary_member.watched.token_id.as_deref(),
+    )
+    .await;
+
+    let primary_cid = media_cid
+        .clone()
+        .or(metadata_cid.clone())
+        .unwrap_or_else(|| primary_member.cid.clone());
+
+    PinInventoryItem {
+        cid: primary_cid.clone(),
+        pinned: members.iter().all(|member| member.pinned),
+        pin_type: members
+            .iter()
+            .find_map(|member| member.pin_type.clone())
+            .or_else(|| Some("watched".to_string())),
+        managed: true,
+        label: None,
+        source_kind: Some("work".to_string()),
+        title: first_present_string(members.iter().map(|member| member.watched.title.clone())),
+        contract_address: first_present_string(
+            members
+                .iter()
+                .map(|member| member.watched.contract_address.clone()),
+        ),
+        token_id: first_present_string(
+            members.iter().map(|member| member.watched.token_id.clone()),
+        ),
+        foundation_url: first_present_string(
+            members
+                .iter()
+                .map(|member| member.watched.foundation_url.clone()),
+        ),
+        artist_username: first_present_string(
+            members
+                .iter()
+                .map(|member| member.watched.artist_username.clone()),
+        ),
+        account_address: first_present_string(
+            members
+                .iter()
+                .map(|member| member.watched.account_address.clone()),
+        ),
+        username: first_present_string(
+            members.iter().map(|member| member.watched.username.clone()),
+        ),
+        added_at: max_timestamp_by(members, |member| Some(member.watched.added_at)),
+        last_verified_at: max_timestamp_by(members, |member| member.watched.last_verified_at),
+        last_repaired_at: max_timestamp_by(members, |member| member.watched.last_repaired_at),
+        last_error: first_present_error(members, |member| member.watched.last_error.as_ref()),
+        pin_reference: primary_member.watched.pin_reference.clone(),
+        verify_count: members
+            .iter()
+            .map(|member| member.watched.verify_count)
+            .sum(),
+        repair_count: members
+            .iter()
+            .map(|member| member.watched.repair_count)
+            .sum(),
+        sync_path: media_member
+            .and_then(|member| member.watched.sync_path.clone())
+            .or_else(|| metadata_member.and_then(|member| member.watched.sync_path.clone()))
+            .or_else(|| primary_member.watched.sync_path.clone()),
+        local_gateway_url: display.local_open_url.clone().or_else(|| {
+            Some(build_gateway_url(
+                &config.local_gateway_base_url,
+                &primary_cid,
+            ))
+        }),
+        public_gateway_url: display.public_open_url.clone().or_else(|| {
+            Some(build_gateway_url(
+                &config.public_gateway_base_url,
+                &primary_cid,
+            ))
+        }),
+        preview_local_gateway_url: display.preview_local_url.clone(),
+        preview_public_gateway_url: display.preview_public_url.clone(),
+        media_kind: display.media_kind.clone(),
+        metadata_view: display.metadata_view.clone(),
+        metadata_cid,
+        media_cid,
+        related_cids: related_cids_from_members(members),
+        last_synced_at: max_timestamp_by(members, |member| member.watched.last_synced_at),
+        last_sync_error: first_present_error(members, |member| {
+            member.watched.last_sync_error.as_ref()
+        }),
+        sync_count: members.iter().map(|member| member.watched.sync_count).sum(),
+    }
+}
+
 async fn list_local_pin_inventory(state: &AppState) -> anyhow::Result<PinsResponse> {
     let pinset = list_kubo_pinset(state).await?;
     let persistent = state.persistent.read().await.clone();
     let config = state.config.read().await.clone();
 
+    let mut grouped_work_members = HashMap::<String, Vec<InventorySourcePin>>::new();
     let mut items = Vec::new();
 
-    for (cid, pin_type) in pinset.iter() {
-        let is_top_level_pin = pin_type != "indirect";
+    for watched in persistent.watched_pins.values() {
+        let source = InventorySourcePin {
+            cid: watched.cid.clone(),
+            pinned: pinset.contains_key(&watched.cid),
+            pin_type: pinset.get(&watched.cid).cloned(),
+            watched: watched.clone(),
+        };
 
-        if !is_top_level_pin && !persistent.watched_pins.contains_key(cid) {
-            continue;
-        }
-
-        if let Some(pin) = persistent.watched_pins.get(cid) {
-            items.push(PinInventoryItem {
-                cid: cid.clone(),
-                pinned: true,
-                pin_type: Some(pin_type.clone()),
-                managed: true,
-                label: pin.label.clone(),
-                source_kind: Some(pin.source_kind.clone()),
-                title: pin.title.clone(),
-                contract_address: pin.contract_address.clone(),
-                token_id: pin.token_id.clone(),
-                foundation_url: pin.foundation_url.clone(),
-                artist_username: pin.artist_username.clone(),
-                account_address: pin.account_address.clone(),
-                username: pin.username.clone(),
-                added_at: Some(pin.added_at),
-                last_verified_at: pin.last_verified_at,
-                last_repaired_at: pin.last_repaired_at,
-                last_error: pin.last_error.clone(),
-                pin_reference: pin.pin_reference.clone(),
-                verify_count: pin.verify_count,
-                repair_count: pin.repair_count,
-                sync_path: pin.sync_path.clone(),
-                local_gateway_url: Some(build_gateway_url(&config.local_gateway_base_url, cid)),
-                public_gateway_url: Some(build_gateway_url(&config.public_gateway_base_url, cid)),
-                last_synced_at: pin.last_synced_at,
-                last_sync_error: pin.last_sync_error.clone(),
-                sync_count: pin.sync_count,
-            });
+        if let Some(group_key) = inventory_work_group_key(&source.watched) {
+            grouped_work_members
+                .entry(group_key)
+                .or_default()
+                .push(source);
         } else {
-            items.push(PinInventoryItem {
-                cid: cid.clone(),
-                pinned: true,
-                pin_type: Some(pin_type.clone()),
-                managed: false,
-                label: None,
-                source_kind: None,
-                title: None,
-                contract_address: None,
-                token_id: None,
-                foundation_url: None,
-                artist_username: None,
-                account_address: None,
-                username: None,
-                added_at: None,
-                last_verified_at: None,
-                last_repaired_at: None,
-                last_error: None,
-                pin_reference: None,
-                verify_count: 0,
-                repair_count: 0,
-                sync_path: None,
-                local_gateway_url: Some(build_gateway_url(&config.local_gateway_base_url, cid)),
-                public_gateway_url: Some(build_gateway_url(&config.public_gateway_base_url, cid)),
-                last_synced_at: None,
-                last_sync_error: None,
-                sync_count: 0,
-            });
+            items.push(build_single_inventory_item(&config, source));
         }
     }
 
-    for (cid, pin) in persistent.watched_pins.iter() {
-        if pinset.contains_key(cid) {
-            continue;
-        }
-
-        items.push(PinInventoryItem {
-            cid: cid.clone(),
-            pinned: false,
-            pin_type: None,
-            managed: true,
-            label: pin.label.clone(),
-            source_kind: Some(pin.source_kind.clone()),
-            title: pin.title.clone(),
-            contract_address: pin.contract_address.clone(),
-            token_id: pin.token_id.clone(),
-            foundation_url: pin.foundation_url.clone(),
-            artist_username: pin.artist_username.clone(),
-            account_address: pin.account_address.clone(),
-            username: pin.username.clone(),
-            added_at: Some(pin.added_at),
-            last_verified_at: pin.last_verified_at,
-            last_repaired_at: pin.last_repaired_at,
-            last_error: pin.last_error.clone(),
-            pin_reference: pin.pin_reference.clone(),
-            verify_count: pin.verify_count,
-            repair_count: pin.repair_count,
-            sync_path: pin.sync_path.clone(),
-            local_gateway_url: Some(build_gateway_url(&config.local_gateway_base_url, cid)),
-            public_gateway_url: Some(build_gateway_url(&config.public_gateway_base_url, cid)),
-            last_synced_at: pin.last_synced_at,
-            last_sync_error: pin.last_sync_error.clone(),
-            sync_count: pin.sync_count,
-        });
+    for members in grouped_work_members.values() {
+        items.push(build_work_inventory_item(state, &config, members).await);
     }
 
     items.sort_by(|left, right| {
@@ -2685,6 +4081,12 @@ fn build_relay_socket_url(relay_server_url: &str, device_token: &str) -> anyhow:
 
     url.set_scheme(next_scheme)
         .map_err(|_| anyhow!("Unable to convert relay server URL to websocket scheme"))?;
+
+    if matches!(url.host_str(), Some(FOUNDATION_SITE_HOSTNAME)) {
+        url.set_host(Some(FOUNDATION_SOCKET_HOSTNAME))
+            .map_err(|_| anyhow!("Unable to route relay websocket to the socket host"))?;
+    }
+
     url.set_path("/desktop-relay");
     url.query_pairs_mut()
         .clear()
@@ -2701,6 +4103,7 @@ async fn clear_relay_link(state: &AppState) -> anyhow::Result<()> {
         config.relay_device_id = None;
         config.relay_device_label = None;
         config.relay_device_token = None;
+        config.relay_last_connected_at = None;
         config.relay_last_error = None;
     }
 
@@ -3114,6 +4517,11 @@ const PAGE_STYLE: &str = r#"
   --tint-ok: #e8f1ea;
   --tint-warn: #f3efe4;
   --tint-err: #f3e5e5;
+  --brand-green: #2e6f4a;
+  --brand-green-bright: #3d8c5d;
+  --brand-green-soft: #e4efe7;
+  --noise-blend: multiply;
+  --noise-opacity: 0.5;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -3133,20 +4541,66 @@ const PAGE_STYLE: &str = r#"
     --tint-ok: #1c2a22;
     --tint-warn: #2a241a;
     --tint-err: #2c1e1e;
+    --brand-green: #7fbf97;
+    --brand-green-bright: #a6e0ba;
+    --brand-green-soft: #1c2a22;
+    --noise-blend: screen;
+    --noise-opacity: 0.35;
   }
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; }
+html { overflow-x: clip; }
 body {
+  position: relative;
+  min-height: 100vh;
   background: var(--bg);
   color: var(--body);
-  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-family: var(--font-inter), "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   font-size: 15px;
   line-height: 1.55;
+  font-feature-settings: "ss01", "cv11";
   -webkit-font-smoothing: antialiased;
+  overflow-x: clip;
 }
+/* Paper grain (multiply on light, screen on dark) */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.06 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  opacity: var(--noise-opacity);
+  mix-blend-mode: var(--noise-blend);
+}
+/* Ambient brand-green wash */
+body::after {
+  content: "";
+  position: fixed;
+  inset: -20vmax;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(38vmax 38vmax at 22% 28%, color-mix(in oklab, var(--brand-green) 10%, transparent), transparent 70%),
+    radial-gradient(42vmax 42vmax at 78% 72%, color-mix(in oklab, var(--ink) 6%, transparent), transparent 70%);
+  filter: blur(40px);
+  opacity: 0.6;
+  animation: ambient-drift 90s ease-in-out infinite alternate;
+  will-change: transform;
+}
+@media (prefers-color-scheme: dark) {
+  body::after { opacity: 0.45; }
+}
+@keyframes ambient-drift {
+  0%   { transform: translate3d(-2%, -1%, 0) scale(1); }
+  50%  { transform: translate3d(1.5%, 2%, 0) scale(1.04); }
+  100% { transform: translate3d(2%, -1.5%, 0) scale(1); }
+}
+.page-wrap { position: relative; z-index: 1; min-height: 100vh; display: flex; flex-direction: column; }
+::selection { background: var(--ink); color: var(--bg); }
 h1, h2, h3 {
-  font-family: ui-serif, Georgia, "Times New Roman", serif;
+  font-family: var(--font-fraunces), ui-serif, Georgia, "Times New Roman", serif;
   color: var(--ink);
   letter-spacing: -0.01em;
   margin: 0;
@@ -3178,15 +4632,17 @@ code {
 }
 .site-nav {
   border-bottom: 1px solid var(--line);
-  background: var(--bg);
+  background: color-mix(in oklab, var(--bg) 85%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
   position: sticky;
   top: 0;
-  z-index: 10;
+  z-index: 40;
 }
 .site-nav-inner {
   max-width: 1100px;
   margin: 0 auto;
-  padding: 14px 24px;
+  padding: 16px 24px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -3194,27 +4650,134 @@ code {
   flex-wrap: wrap;
 }
 .brand {
-  font-family: ui-serif, Georgia, serif;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
   color: var(--ink);
   text-decoration: none;
-  font-size: 1.05rem;
   letter-spacing: -0.01em;
+  min-width: 0;
 }
-.brand small {
+.brand-mark {
+  display: inline-flex;
+  flex: 0 0 auto;
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.brand:hover .brand-mark { transform: rotate(-12deg); }
+.brand-word {
+  font-family: var(--font-fraunces), ui-serif, Georgia, serif;
+  font-size: 1.15rem;
+  line-height: 1.05;
+  color: var(--ink);
+  font-weight: 500;
+}
+.brand-eyebrow {
+  display: inline-block;
+  margin-left: 10px;
   color: var(--muted);
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 0.68rem;
+  font-size: 0.62rem;
   text-transform: uppercase;
-  letter-spacing: 0.22em;
-  margin-left: 10px;
+  letter-spacing: 0.26em;
+  border-left: 1px solid var(--line);
+  padding-left: 10px;
 }
 .nav-links { display: flex; gap: 22px; align-items: center; }
 .nav-links a {
+  position: relative;
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 0.88rem;
+}
+.nav-links a::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: -3px;
+  height: 1px;
+  background: currentColor;
+  transform: scaleX(0);
+  transform-origin: right center;
+  transition: transform 320ms cubic-bezier(0.65, 0, 0.35, 1);
+}
+.nav-links a:hover { color: var(--ink); }
+.nav-links a:hover::after {
+  transform: scaleX(1);
+  transform-origin: left center;
+}
+@media (max-width: 640px) {
+  .brand-eyebrow { display: none; }
+  .nav-links { gap: 14px; }
+  .nav-links a { font-size: 0.82rem; }
+}
+
+/* Site footer (Agorix) */
+.site-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--line);
+  background: var(--surface-quiet);
+  position: relative;
+  z-index: 1;
+}
+.site-footer-inner {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 56px 24px 28px;
+  display: grid;
+  gap: 32px;
+}
+@media (min-width: 720px) {
+  .site-footer-inner { grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
+}
+.site-footer .brand-row { display: flex; align-items: center; gap: 10px; }
+.site-footer .brand-row .brand-word { font-size: 1.05rem; }
+.site-footer p.about {
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.55;
+  max-width: 52ch;
+}
+.site-footer p.tagline {
+  margin-top: 12px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--subtle);
+}
+.site-footer .footer-meta {
+  border-top: 1px solid var(--line);
+  margin-top: 12px;
+}
+.site-footer .footer-meta-inner {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 18px 24px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: space-between;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.22em;
+  color: var(--subtle);
+}
+.site-footer ul.foot-links { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+.site-footer ul.foot-links a {
   color: var(--body);
   text-decoration: none;
   font-size: 0.88rem;
 }
-.nav-links a:hover { color: var(--ink); }
+.site-footer ul.foot-links a:hover { color: var(--brand-green); }
+.site-footer .foot-col-label {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--subtle);
+  margin: 0 0 14px;
+}
 main.shell {
   max-width: 1100px;
   margin: 0 auto;
@@ -3241,8 +4804,8 @@ main.shell.narrow { max-width: 720px; }
 }
 .stat .eyebrow { margin-bottom: 10px; }
 .stat-value {
-  font-family: ui-serif, Georgia, serif;
-  color: var(--ink);
+  font-family: var(--font-fraunces), ui-serif, Georgia, serif;
+  color: var(--brand-green);
   font-size: 2rem;
   line-height: 1.05;
   margin: 0 0 6px;
@@ -3281,6 +4844,91 @@ input[type="url"] {
   font-size: 0.9rem;
 }
 input:focus { outline: 2px solid var(--ink); outline-offset: 1px; border-color: var(--ink); }
+.field-help {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+.settings-layout {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: 1fr;
+}
+.settings-form {
+  display: grid;
+  gap: 22px;
+}
+.settings-side {
+  display: grid;
+  gap: 18px;
+}
+.settings-block {
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--line);
+}
+.settings-block:last-of-type {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+.settings-copy {
+  margin-top: 10px;
+  max-width: 60ch;
+}
+.checkbox-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-quiet);
+}
+.checkbox-row input {
+  margin-top: 3px;
+}
+.checkbox-row strong {
+  display: block;
+  color: var(--ink);
+  font-size: 0.92rem;
+}
+.checkbox-row small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+.settings-actions {
+  margin-top: 6px;
+}
+.gateway-helper {
+  margin-top: 16px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-quiet);
+}
+.gateway-helper h3 {
+  margin-top: 8px;
+  font-size: 1.05rem;
+}
+.gateway-helper-actions {
+  align-items: center;
+}
+.gateway-helper-preview {
+  margin-top: 14px;
+  font-size: 0.82rem;
+}
+.gateway-helper-preview code {
+  word-break: break-all;
+}
+.gateway-helper-note {
+  font-size: 0.82rem;
+}
 .btn {
   display: inline-flex;
   align-items: center;
@@ -3333,6 +4981,291 @@ input:focus { outline: 2px solid var(--ink); outline-offset: 1px; border-color: 
   border-radius: 6px;
   overflow-x: auto;
   background: var(--surface);
+}
+.inventory-browser-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.inventory-browser {
+  margin-top: 20px;
+}
+.pin-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+.pin-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+.pin-preview {
+  aspect-ratio: 16 / 10;
+  background: var(--surface-alt);
+  border-bottom: 1px solid var(--line);
+  position: relative;
+  overflow: hidden;
+}
+.pin-preview-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+  background: var(--surface-quiet);
+}
+.pin-preview-media {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+  background: var(--surface-quiet);
+}
+.pin-preview-model {
+  width: 100%;
+  height: 100%;
+  display: block;
+  background: var(--surface-quiet);
+  --poster-color: transparent;
+}
+.pin-preview-ar {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--surface-quiet);
+}
+.pin-preview-ar img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+}
+.pin-preview-audio {
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: linear-gradient(180deg, rgba(18, 67, 79, 0.26), rgba(18, 67, 79, 0.05));
+}
+.pin-preview-audio audio {
+  width: min(100%, 280px);
+}
+.pin-preview-empty {
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+.pin-card-body {
+  padding: 18px;
+  display: grid;
+  gap: 14px;
+}
+.pin-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.pin-title {
+  font-family: var(--font-fraunces), ui-serif, Georgia, serif;
+  color: var(--ink);
+  font-size: 1.15rem;
+  line-height: 1.15;
+}
+.pin-context {
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+.pin-meta {
+  display: grid;
+  gap: 8px;
+}
+.pin-meta-line {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  font-size: 0.84rem;
+}
+.pin-meta-line strong {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--muted);
+  font-weight: 500;
+}
+.pin-note {
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 0.82rem;
+  border: 1px solid var(--line);
+  background: var(--surface-quiet);
+}
+.pin-note.err {
+  border-color: rgba(154,42,42,0.25);
+  background: var(--tint-err);
+  color: var(--err);
+}
+.pin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.pin-meta-toggle {
+  justify-content: space-between;
+  min-width: min(100%, 220px);
+}
+.pin-metadata-inline {
+  flex: 1 1 100%;
+}
+.pin-meta-toggle-copy {
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 400;
+}
+.pin-metadata-viewer {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.pin-metadata-viewer.is-open {
+  grid-template-rows: 1fr;
+}
+.pin-metadata-viewer-inner {
+  overflow: hidden;
+}
+.pin-metadata-panel {
+  margin-top: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-quiet);
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity 220ms ease, transform 220ms ease;
+}
+.pin-metadata-viewer.is-open .pin-metadata-panel {
+  opacity: 1;
+  transform: translateY(0);
+}
+.pin-metadata-description {
+  margin: 0 0 14px;
+  color: var(--body);
+  font-size: 0.84rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.pin-metadata-lines {
+  display: grid;
+  gap: 8px;
+}
+.pin-metadata-line {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  font-size: 0.82rem;
+}
+.pin-metadata-line strong,
+.pin-metadata-json-head {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--muted);
+  font-weight: 500;
+}
+.pin-metadata-value {
+  color: var(--body);
+  word-break: break-word;
+}
+.pin-metadata-traits {
+  margin-top: 14px;
+}
+.pin-metadata-trait-grid {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.pin-metadata-trait {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  max-width: 100%;
+}
+.pin-metadata-trait strong {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--muted);
+  font-weight: 500;
+}
+.pin-metadata-trait span {
+  color: var(--ink);
+  font-size: 0.82rem;
+  word-break: break-word;
+}
+.pin-metadata-json-wrap {
+  margin-top: 14px;
+}
+.pin-metadata-json-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.pin-metadata-json-note {
+  color: var(--muted);
+  font-size: 0.76rem;
+  letter-spacing: normal;
+  text-transform: none;
+}
+.pin-metadata-json {
+  margin: 10px 0 0;
+  padding: 14px;
+  max-height: 280px;
+  overflow: auto;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--body);
+  font-size: 0.74rem;
+  line-height: 1.55;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.pin-test-status {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+.inventory-load-row {
+  margin-top: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.inventory-status {
+  font-size: 0.84rem;
+}
+.inventory-sentinel {
+  height: 1px;
 }
 table { width: 100%; border-collapse: collapse; }
 th, td {
@@ -3390,30 +5323,863 @@ hr.sep { border: 0; border-top: 1px solid var(--line); margin: 36px 0; }
   letter-spacing: 0.2em;
 }
 .kv dd { margin: 0; color: var(--body); }
+@media (max-width: 640px) {
+  .pin-meta-line {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .pin-metadata-line {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .checkbox-row {
+    grid-template-columns: 1fr;
+  }
+}
+@media (min-width: 980px) {
+  .settings-layout {
+    grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
+    align-items: start;
+  }
+  .settings-side {
+    position: sticky;
+    top: 96px;
+  }
+}
 "#;
 
+const INVENTORY_BROWSER_SCRIPT: &str = r####"
+(() => {
+  const browser = document.getElementById("inventory-browser");
+  if (!browser) return;
+
+  const grid = document.getElementById("inventory-grid");
+  const emptyState = document.getElementById("inventory-empty");
+  const loadMoreButton = document.getElementById("inventory-load-more");
+  const statusNode = document.getElementById("inventory-status");
+  const sentinel = document.getElementById("inventory-sentinel");
+  const pageSize = Number(browser.getAttribute("data-page-size") || "12");
+  const state = {
+    loading: false,
+    nextCursor: null,
+    done: false,
+    loadedAny: false,
+    error: false,
+  };
+
+  const previewObserver = "IntersectionObserver" in window
+    ? new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const node = entry.target;
+          if (!node.getAttribute("src")) {
+            loadPreviewCandidate(node, 0);
+          }
+          previewObserver.unobserve(node);
+        }
+      }, { rootMargin: "220px 0px" })
+    : null;
+
+  const paginationObserver = sentinel && "IntersectionObserver" in window
+    ? new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            void loadNextPage();
+          }
+        }
+      }, { rootMargin: "320px 0px" })
+    : null;
+
+  if (paginationObserver && sentinel) {
+    paginationObserver.observe(sentinel);
+  }
+
+  const escapeHtml = (value) =>
+    String(value ?? "").replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      "\"": "&quot;",
+      "'": "&#39;",
+    }[char] || char));
+
+  const formatTimestamp = (value) => {
+    if (!value) return "Never";
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return String(value);
+    return parsed.toLocaleString(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+  };
+
+  const shortAddress = (value) => {
+    const text = String(value ?? "").trim();
+    if (text.length <= 12) return text;
+    return `${text.slice(0, 6)}…${text.slice(-4)}`;
+  };
+
+  const uniqueStrings = (values) =>
+    Array.from(
+      new Set(
+        values
+          .map((value) => String(value ?? "").trim())
+          .filter((value) => value.length > 0),
+      ),
+    );
+
+  const guessKindFromUrl = (value) => {
+    const text = String(value ?? "").toLowerCase();
+    if (!text) return "UNKNOWN";
+    if (text.includes(".mp4") || text.includes(".mov") || text.includes(".webm") || text.includes("video")) {
+      return "VIDEO";
+    }
+    if (text.includes(".mp3") || text.includes(".wav") || text.includes(".ogg") || text.includes(".aac") || text.includes("audio")) {
+      return "AUDIO";
+    }
+    if (
+      text.includes(".png") ||
+      text.includes(".jpg") ||
+      text.includes(".jpeg") ||
+      text.includes(".gif") ||
+      text.includes(".svg") ||
+      text.includes(".webp") ||
+      text.includes("image")
+    ) {
+      return "IMAGE";
+    }
+    if (text.includes(".html") || text.includes("text/html")) {
+      return "HTML";
+    }
+    if (
+      text.includes(".glb") ||
+      text.includes(".gltf") ||
+      text.includes(".usdz") ||
+      text.includes("model/gltf") ||
+      text.includes("model/vnd.usdz") ||
+      text.includes("model")
+    ) {
+      return "MODEL";
+    }
+    return "UNKNOWN";
+  };
+
+  const normalizeKind = (value) => {
+    const text = String(value ?? "").trim().toUpperCase();
+    if (text === "IMAGE" || text === "VIDEO" || text === "AUDIO" || text === "HTML" || text === "MODEL") {
+      return text;
+    }
+    return "UNKNOWN";
+  };
+
+  const stripQueryString = (value) => {
+    const raw = String(value ?? "");
+    const cut = raw.indexOf("?");
+    return cut === -1 ? raw : raw.slice(0, cut);
+  };
+
+  const isUsdzUrl = (value) =>
+    stripQueryString(value).toLowerCase().endsWith(".usdz");
+
+  const supportsInlineModelPreview = (value) => !isUsdzUrl(value);
+
+  const previewKindForPreviewUrl = (url, fallbackKind, openUrl) => {
+    if (openUrl && url !== openUrl) return "IMAGE";
+
+    const fromUrl = guessKindFromUrl(url);
+    if (fromUrl !== "UNKNOWN") return fromUrl;
+    return fallbackKind;
+  };
+
+  const getRelatedCids = (item) =>
+    uniqueStrings([
+      item?.cid,
+      item?.metadataCid,
+      item?.mediaCid,
+      ...(Array.isArray(item?.relatedCids) ? item.relatedCids : []),
+    ]);
+
+  const buildPublicGatewayUrl = (item) =>
+    item?.cid ? `https://dweb.link/ipfs/${encodeURIComponent(String(item.cid).trim())}` : "";
+
+  const buildPreviewCandidates = (item) => {
+    const previewEntries = [
+      item?.previewLocalGatewayUrl
+        ? {
+            url: item.previewLocalGatewayUrl,
+            kind: previewKindForPreviewUrl(
+              item.previewLocalGatewayUrl,
+              normalizeKind(item.mediaKind),
+              item.localGatewayUrl,
+            ),
+          }
+        : null,
+      item?.previewPublicGatewayUrl
+        ? {
+            url: item.previewPublicGatewayUrl,
+            kind: previewKindForPreviewUrl(
+              item.previewPublicGatewayUrl,
+              normalizeKind(item.mediaKind),
+              item.publicGatewayUrl,
+            ),
+          }
+        : null,
+      item?.localGatewayUrl
+        ? { url: item.localGatewayUrl, kind: normalizeKind(item.mediaKind) }
+        : null,
+      item?.publicGatewayUrl
+        ? { url: item.publicGatewayUrl, kind: normalizeKind(item.mediaKind) }
+        : null,
+      buildPublicGatewayUrl(item)
+        ? { url: buildPublicGatewayUrl(item), kind: normalizeKind(item.mediaKind) }
+        : null,
+    ].filter((value) => value && value.url);
+
+    const seen = new Set();
+    return previewEntries.filter((entry) => {
+      if (seen.has(entry.url)) return false;
+      seen.add(entry.url);
+      return true;
+    });
+  };
+
+  const choosePinnedUrl = (item) =>
+    item.publicGatewayUrl || item.localGatewayUrl || buildPublicGatewayUrl(item) || "";
+
+  const choosePublicUrl = (item) => buildPublicGatewayUrl(item);
+
+  const buildContextHtml = (item) => {
+    if (item.foundationUrl) {
+      return `<a href="${escapeHtml(item.foundationUrl)}" target="_blank" rel="noreferrer">Open work page</a>`;
+    }
+    if (item.contractAddress && item.tokenId) {
+      return `${escapeHtml(shortAddress(item.contractAddress))} #${escapeHtml(item.tokenId)}`;
+    }
+    if (item.username) return `@${escapeHtml(item.username)}`;
+    if (item.artistUsername) return `@${escapeHtml(item.artistUsername)}`;
+    if (item.sourceKind) return escapeHtml(item.sourceKind);
+    return "Pinned on this computer";
+  };
+
+  const buildPreviewHtml = (item, title) => {
+    const candidates = buildPreviewCandidates(item);
+    const primary = candidates[0] ?? null;
+    if (!primary) {
+      return `<div class="pin-preview-empty">No preview URL yet for this CID.</div>`;
+    }
+
+    const encodedCandidates = escapeHtml(
+      candidates.map((entry) => `${entry.kind}|${entry.url}`).join("\n"),
+    );
+
+    if (primary.kind === "IMAGE") {
+      return `<img class="pin-preview-media pin-preview-loadable" alt="${escapeHtml(title)}" data-preview-candidates="${encodedCandidates}" loading="lazy" />`;
+    }
+
+    if (primary.kind === "VIDEO") {
+      return `<video class="pin-preview-media pin-preview-loadable" aria-label="Preview for ${escapeHtml(title)}" data-preview-candidates="${encodedCandidates}" muted playsinline controls preload="metadata"></video>`;
+    }
+
+    if (primary.kind === "AUDIO") {
+      return `<div class="pin-preview-audio"><audio class="pin-preview-loadable" aria-label="Preview for ${escapeHtml(title)}" data-preview-candidates="${encodedCandidates}" controls preload="metadata"></audio></div>`;
+    }
+
+    if (primary.kind === "MODEL") {
+      const modelCandidates = candidates.filter(
+        (entry) => entry.kind === "MODEL" && supportsInlineModelPreview(entry.url),
+      );
+      const usdzCandidate = candidates.find(
+        (entry) => entry.kind === "MODEL" && isUsdzUrl(entry.url),
+      );
+      const posterCandidate = candidates.find((entry) => entry.kind === "IMAGE");
+
+      if (modelCandidates.length === 0 && usdzCandidate) {
+        const posterSrc = posterCandidate ? posterCandidate.url : usdzCandidate.url;
+        return `<a class="pin-preview-ar" rel="ar" href="${escapeHtml(usdzCandidate.url)}"><img alt="${escapeHtml(title)}" src="${escapeHtml(posterSrc)}" /></a>`;
+      }
+
+      const inlineCandidatesEncoded = escapeHtml(
+        modelCandidates.map((entry) => `${entry.kind}|${entry.url}`).join("\n"),
+      );
+      const iosSrcAttr = usdzCandidate
+        ? ` ios-src="${escapeHtml(usdzCandidate.url)}"`
+        : "";
+      const posterAttr = posterCandidate
+        ? ` poster="${escapeHtml(posterCandidate.url)}"`
+        : "";
+      return `<model-viewer class="pin-preview-model pin-preview-loadable" alt="${escapeHtml(title)}" data-preview-candidates="${inlineCandidatesEncoded}"${iosSrcAttr}${posterAttr} ar ar-modes="webxr scene-viewer quick-look" camera-controls touch-action="pan-y" interaction-prompt="none" shadow-intensity="0.85" exposure="1" environment-image="neutral"><div class="pin-preview-empty">Loading 3D preview…</div></model-viewer>`;
+    }
+
+    return `<iframe class="pin-preview-frame pin-preview-loadable" title="Preview for ${escapeHtml(title)}" data-preview-candidates="${encodedCandidates}" referrerpolicy="no-referrer" allowfullscreen></iframe>`;
+  };
+
+  const buildVerificationSummary = (item) => {
+    if (!item.lastVerifiedAt) {
+      return "Network visibility has not been checked yet.";
+    }
+    const detail = item.lastError
+      ? ` · ${escapeHtml(item.lastError)}`
+      : "";
+    return `Last checked ${escapeHtml(formatTimestamp(item.lastVerifiedAt))}${detail}`;
+  };
+
+  const buildNoteHtml = (item) => {
+    if (item.lastError) {
+      return `<p class="pin-note err">${escapeHtml(item.lastError)}</p>`;
+    }
+    if (item.lastSyncError) {
+      return `<p class="pin-note err">${escapeHtml(item.lastSyncError)}</p>`;
+    }
+    return "";
+  };
+
+  const formatRootsSummary = (item) => {
+    const totalRoots = getRelatedCids(item).length;
+    if (totalRoots <= 1) return "1 linked root";
+    return `${totalRoots} linked roots`;
+  };
+
+  const buildMetadataViewerId = (item) =>
+    `pin-metadata-${encodeURIComponent(String(item?.cid ?? "").trim()).replace(/[^a-zA-Z0-9_-]+/g, "")}`;
+
+  const metadataToggleCopy = (metadataView) => {
+    if (!metadataView) return "";
+    const fieldCount = Array.isArray(metadataView.fields) ? metadataView.fields.length : 0;
+    const attributeCount = Array.isArray(metadataView.attributes) ? metadataView.attributes.length : 0;
+    const pieces = [];
+    if (fieldCount > 0) pieces.push(`${fieldCount} detail${fieldCount === 1 ? "" : "s"}`);
+    if (attributeCount > 0) pieces.push(`${attributeCount} trait${attributeCount === 1 ? "" : "s"}`);
+    if (pieces.length === 0) return "raw JSON";
+    return pieces.join(" · ");
+  };
+
+  const renderMetadataLines = (entries) =>
+    entries
+      .filter((entry) => entry && entry.label && entry.value)
+      .map((entry) => `
+        <div class="pin-metadata-line">
+          <strong>${escapeHtml(entry.label)}</strong>
+          <span class="pin-metadata-value">${escapeHtml(entry.value)}</span>
+        </div>
+      `)
+      .join("");
+
+  const renderMetadataTraits = (entries) => {
+    if (!Array.isArray(entries) || entries.length === 0) return "";
+
+    return `
+      <div class="pin-metadata-traits">
+        <div class="pin-metadata-json-head">
+          <strong>Traits</strong>
+        </div>
+        <div class="pin-metadata-trait-grid">
+          ${entries
+            .filter((entry) => entry && entry.label && entry.value)
+            .map((entry) => `
+              <div class="pin-metadata-trait">
+                <strong>${escapeHtml(entry.label)}</strong>
+                <span>${escapeHtml(entry.value)}</span>
+              </div>
+            `)
+            .join("")}
+        </div>
+      </div>
+    `;
+  };
+
+  const renderMetadataViewer = (item) => {
+    const metadataView = item?.metadataView;
+    if (!metadataView) return "";
+
+    const viewerId = buildMetadataViewerId(item);
+    const detailEntries = [
+      item?.metadataCid ? { label: "Metadata CID", value: item.metadataCid } : null,
+      item?.mediaCid ? { label: "Media CID", value: item.mediaCid } : null,
+      ...(Array.isArray(metadataView.fields) ? metadataView.fields : []),
+    ].filter(Boolean);
+
+    const description = metadataView.description
+      ? `<p class="pin-metadata-description">${escapeHtml(metadataView.description)}</p>`
+      : "";
+    const detailLines = detailEntries.length
+      ? `<div class="pin-metadata-lines">${renderMetadataLines(detailEntries)}</div>`
+      : "";
+    const traits = renderMetadataTraits(metadataView.attributes);
+    const rawJson = metadataView.rawJson
+      ? `
+        <div class="pin-metadata-json-wrap">
+          <div class="pin-metadata-json-head">
+            <strong>Raw JSON</strong>
+            ${
+              metadataView.rawJsonTruncated
+                ? '<span class="pin-metadata-json-note">trimmed for speed</span>'
+                : ""
+            }
+          </div>
+          <pre class="pin-metadata-json"><code>${escapeHtml(metadataView.rawJson)}</code></pre>
+        </div>
+      `
+      : "";
+
+    return `
+      <div class="pin-metadata-inline">
+        <button
+          type="button"
+          class="btn ghost pin-meta-toggle"
+          data-toggle-metadata
+          data-metadata-target="${escapeHtml(viewerId)}"
+          data-open-label="Hide metadata"
+          data-closed-label="Show metadata"
+          aria-expanded="false"
+          aria-controls="${escapeHtml(viewerId)}"
+        >
+          <span data-toggle-label>Show metadata</span>
+          <span class="pin-meta-toggle-copy">${escapeHtml(metadataToggleCopy(metadataView))}</span>
+        </button>
+        <div class="pin-metadata-viewer" id="${escapeHtml(viewerId)}" aria-hidden="true">
+          <div class="pin-metadata-viewer-inner">
+            <div class="pin-metadata-panel">
+              ${description}
+              ${detailLines}
+              ${traits}
+              ${rawJson}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  };
+
+  const renderCard = (item) => {
+    const title = item.title || item.label || "Local IPFS pin";
+    const statusLabel = item.pinned ? (item.pinType || "pinned") : "repair needed";
+    const statusClass = item.pinned ? "ok" : "warn";
+    const pinnedUrl = choosePinnedUrl(item);
+    const publicUrl = choosePublicUrl(item);
+    const localUrl = item.localGatewayUrl || "";
+    const relatedCids = getRelatedCids(item);
+    const syncedValue = item.syncPath
+      ? escapeHtml(item.syncPath)
+      : "Not synced to disk";
+
+    return `
+      <article class="pin-card" data-cid="${escapeHtml(item.cid)}" data-related-cids="${escapeHtml(relatedCids.join(","))}">
+        <div class="pin-preview">
+          ${buildPreviewHtml(item, title)}
+        </div>
+        <div class="pin-card-body">
+          <div class="pin-card-head">
+            <div>
+              <p class="pin-title">${escapeHtml(title)}</p>
+              <p class="cid">${escapeHtml(item.cid)}</p>
+            </div>
+            <span class="pill ${statusClass}">${escapeHtml(statusLabel)}</span>
+          </div>
+
+          <p class="pin-context">${buildContextHtml(item)}</p>
+
+          <div class="pin-meta">
+            <div class="pin-meta-line">
+              <strong>Source</strong>
+              <span>${escapeHtml(item.label || item.sourceKind || "watched pin")}</span>
+            </div>
+            <div class="pin-meta-line">
+              <strong>Verified</strong>
+              <span>${escapeHtml(formatTimestamp(item.lastVerifiedAt))}</span>
+            </div>
+            <div class="pin-meta-line">
+              <strong>Synced</strong>
+              <span>${syncedValue}</span>
+            </div>
+            <div class="pin-meta-line">
+              <strong>Roots</strong>
+              <span>${escapeHtml(formatRootsSummary(item))}</span>
+            </div>
+          </div>
+
+          ${buildNoteHtml(item)}
+
+          <div class="pin-actions">
+            <button type="button" class="btn ghost" data-verify-cids="${escapeHtml(relatedCids.join(","))}">Test on network</button>
+            ${pinnedUrl ? `<a class="btn" href="${escapeHtml(pinnedUrl)}" target="_blank" rel="noreferrer">Open pinned</a>` : ""}
+            ${publicUrl ? `<a class="btn ghost" href="${escapeHtml(publicUrl)}" target="_blank" rel="noreferrer">Open public</a>` : ""}
+            ${localUrl ? `<a class="btn ghost" href="${escapeHtml(localUrl)}" target="_blank" rel="noreferrer">Open local</a>` : ""}
+            ${renderMetadataViewer(item)}
+          </div>
+
+          <p class="pin-test-status">${buildVerificationSummary(item)}</p>
+        </div>
+      </article>
+    `;
+  };
+
+  const readPreviewCandidates = (node) =>
+    String(node.getAttribute("data-preview-candidates") || "")
+      .split("\n")
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) => {
+        const divider = entry.indexOf("|");
+        if (divider === -1) return { kind: "UNKNOWN", url: entry };
+        return {
+          kind: entry.slice(0, divider) || "UNKNOWN",
+          url: entry.slice(divider + 1),
+        };
+      })
+      .filter((entry) => entry.url);
+
+  const loadPreviewCandidate = (node, index) => {
+    const candidates = readPreviewCandidates(node);
+    const next = candidates[index] ?? null;
+    if (!next) return false;
+
+    if (
+      node.tagName === "IMG" ||
+      node.tagName === "IFRAME" ||
+      node.tagName === "VIDEO" ||
+      node.tagName === "AUDIO" ||
+      node.tagName === "MODEL-VIEWER"
+    ) {
+      node.setAttribute("src", next.url);
+    }
+    if ((node.tagName === "VIDEO" || node.tagName === "AUDIO") && typeof node.load === "function") {
+      node.load();
+    }
+
+    node.setAttribute("data-preview-index", String(index));
+    return true;
+  };
+
+  const advancePreviewCandidate = (node) => {
+    const currentIndex = Number(node.getAttribute("data-preview-index") || "0");
+    return loadPreviewCandidate(node, currentIndex + 1);
+  };
+
+  const hydratePreviewMedia = () => {
+    const nodes = grid.querySelectorAll(".pin-preview-loadable[data-preview-candidates]");
+    for (const node of nodes) {
+      if (node.getAttribute("src")) continue;
+
+      if (!node.hasAttribute("data-preview-error-bound")) {
+        node.setAttribute("data-preview-error-bound", "true");
+        node.addEventListener("error", () => {
+          const advanced = advancePreviewCandidate(node);
+          if (!advanced) {
+            const container = node.closest(".pin-preview");
+            if (container) {
+              container.innerHTML = `<div class="pin-preview-empty">Preview unavailable right now.</div>`;
+            }
+          }
+        });
+      }
+
+      if (!previewObserver) {
+        loadPreviewCandidate(node, 0);
+        continue;
+      }
+      previewObserver.observe(node);
+    }
+  };
+
+  const setStatus = (message) => {
+    if (statusNode) {
+      statusNode.textContent = message;
+    }
+  };
+
+  const syncControls = () => {
+    if (!loadMoreButton) return;
+    loadMoreButton.disabled = state.loading;
+    loadMoreButton.hidden = !state.nextCursor && !state.error;
+    loadMoreButton.textContent = state.error ? "Retry load" : "Load more works";
+  };
+
+  const loadNextPage = async () => {
+    if (state.loading || (state.done && !state.error)) return;
+
+    state.loading = true;
+    state.error = false;
+    syncControls();
+    setStatus(state.loadedAny ? "Loading more works…" : "Loading saved works…");
+
+    try {
+      const url = new URL("/pins/page", window.location.origin);
+      url.searchParams.set("limit", String(pageSize));
+      if (state.nextCursor) {
+        url.searchParams.set("cursor", state.nextCursor);
+      }
+
+      const response = await fetch(url.toString(), {
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) {
+        throw new Error(`Inventory request failed (${response.status})`);
+      }
+
+      const payload = await response.json();
+      const items = Array.isArray(payload.items) ? payload.items : [];
+
+      if (items.length > 0) {
+        grid.insertAdjacentHTML("beforeend", items.map(renderCard).join(""));
+        hydratePreviewMedia();
+        state.loadedAny = true;
+        if (emptyState) emptyState.hidden = true;
+      } else if (!state.loadedAny && emptyState) {
+        emptyState.hidden = false;
+      }
+
+      state.nextCursor = payload.nextCursor || null;
+      state.done = !state.nextCursor;
+      state.error = false;
+      syncControls();
+
+      if (state.done) {
+        setStatus(state.loadedAny ? `Showing ${grid.children.length} works.` : "No saved works available.");
+      } else {
+        setStatus(`Showing ${grid.children.length} of ${payload.total} works.`);
+      }
+    } catch (error) {
+      state.done = true;
+      state.error = true;
+      syncControls();
+      setStatus(error instanceof Error ? error.message : "Unable to load saved works.");
+    } finally {
+      state.loading = false;
+      syncControls();
+    }
+  };
+
+  const toggleMetadataViewer = (button) => {
+    const targetId = String(button.getAttribute("data-metadata-target") || "").trim();
+    if (!targetId) return;
+
+    const viewer = document.getElementById(targetId);
+    if (!viewer) return;
+
+    const isOpen = !viewer.classList.contains("is-open");
+    viewer.classList.toggle("is-open", isOpen);
+    viewer.setAttribute("aria-hidden", String(!isOpen));
+    button.setAttribute("aria-expanded", String(isOpen));
+
+    const labelNode = button.querySelector("[data-toggle-label]");
+    const nextLabel = isOpen
+      ? button.getAttribute("data-open-label")
+      : button.getAttribute("data-closed-label");
+    if (labelNode && nextLabel) {
+      labelNode.textContent = nextLabel;
+    }
+  };
+
+  browser.addEventListener("click", async (event) => {
+    const metadataButton = event.target.closest("[data-toggle-metadata]");
+    if (metadataButton) {
+      toggleMetadataViewer(metadataButton);
+      return;
+    }
+
+    const button = event.target.closest("[data-verify-cids]");
+    if (!button) return;
+
+    const cids = uniqueStrings(
+      String(button.getAttribute("data-verify-cids") || "").split(","),
+    );
+    const card = button.closest(".pin-card");
+    const resultNode = card ? card.querySelector(".pin-test-status") : null;
+    if (cids.length === 0 || !resultNode) return;
+
+    button.setAttribute("disabled", "disabled");
+    resultNode.textContent = `Checking ${cids.length} linked root${cids.length === 1 ? "" : "s"} on the network…`;
+
+    try {
+      const response = await fetch("/pins/verify", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ cids }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Verification failed (${response.status})`);
+      }
+
+      const payload = await response.json();
+      const results = Array.isArray(payload.results) ? payload.results : [];
+      const visible = results.filter(
+        (entry) => entry && entry.reachable && entry.providerCount > 0,
+      );
+      const checkedAt =
+        payload.checkedAt ||
+        results
+          .map((entry) => entry?.checkedAt)
+          .filter(Boolean)
+          .sort()
+          .at(-1) ||
+        null;
+      const firstError =
+        results.find((entry) => entry?.error)?.error ||
+        null;
+
+      if (visible.length === results.length && visible.length > 0) {
+        const providerCount = Math.min(
+          ...visible.map((entry) => Number(entry.providerCount) || 0),
+        );
+        resultNode.textContent = `Visible on the network for all ${visible.length} linked root${visible.length === 1 ? "" : "s"} via at least ${providerCount} provider${providerCount === 1 ? "" : "s"} · checked ${formatTimestamp(checkedAt)}`;
+      } else if (visible.length > 0) {
+        resultNode.textContent = `Only ${visible.length} of ${results.length} linked roots are visible on the network yet${firstError ? ` · ${firstError}` : ""}${checkedAt ? ` · checked ${formatTimestamp(checkedAt)}` : ""}`;
+      } else if (firstError) {
+        resultNode.textContent = firstError;
+      } else {
+        resultNode.textContent = `No linked roots are visible on the network yet${checkedAt ? ` · checked ${formatTimestamp(checkedAt)}` : ""}`;
+      }
+    } catch (error) {
+      resultNode.textContent = error instanceof Error ? error.message : "Unable to verify this pin right now.";
+    } finally {
+      button.removeAttribute("disabled");
+    }
+  });
+
+  if (loadMoreButton) {
+    loadMoreButton.addEventListener("click", () => {
+      void loadNextPage();
+    });
+  }
+
+  void loadNextPage();
+})();
+"####;
+
+const SETTINGS_GATEWAY_HELPER_SCRIPT: &str = r####"
+(() => {
+  const target = document.getElementById("public_gateway_base_url");
+  if (!target) return;
+
+  const hostnameInput = document.getElementById("gateway_hostname_input");
+  const hostnameButton = document.getElementById("gateway_fill_hostname");
+  const ipButton = document.getElementById("gateway_fill_ip");
+  const previewValue = document.getElementById("gateway_helper_preview_value");
+
+  const escapeHtml = (value) =>
+    String(value ?? "").replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      "\"": "&quot;",
+      "'": "&#39;",
+    }[char] || char));
+
+  const updatePreview = (value) => {
+    if (!previewValue) return;
+    previewValue.innerHTML = escapeHtml(value || "");
+  };
+
+  const normalizeHost = (value) => {
+    const trimmed = String(value ?? "").trim();
+    if (!trimmed) return "";
+    const withoutScheme = trimmed.replace(/^https?:\/\//i, "");
+    return withoutScheme.replace(/\/+.*$/, "").replace(/\/+$/g, "");
+  };
+
+  if (hostnameButton) {
+    hostnameButton.addEventListener("click", () => {
+      const host = normalizeHost(hostnameInput ? hostnameInput.value : "");
+      if (!host) {
+        if (hostnameInput) hostnameInput.focus();
+        return;
+      }
+      target.value = `https://${host}`;
+      updatePreview(target.value);
+      target.focus();
+    });
+  }
+
+  if (ipButton) {
+    ipButton.addEventListener("click", () => {
+      const gatewayUrl = ipButton.getAttribute("data-gateway-url");
+      if (!gatewayUrl) return;
+      target.value = gatewayUrl;
+      updatePreview(target.value);
+      target.focus();
+    });
+  }
+
+  target.addEventListener("input", () => {
+    updatePreview(target.value);
+  });
+
+  updatePreview(target.value);
+})();
+"####;
+
+const LOGO_MARK_SVG: &str = r##"<svg class="brand-mark" role="img" aria-label="Agorix mark" width="28" height="28" viewBox="0 0 64 64"><g fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="square" style="color: var(--ink); opacity: 0.78"><path d="M6 18V6h12"/><path d="M58 18V6H46"/><path d="M6 46v12h12"/><path d="M58 46v12H46"/></g><path d="M32 16 C 32 24, 40 32, 48 32 C 40 32, 32 40, 32 48 C 32 40, 24 32, 16 32 C 24 32, 32 24, 32 16 Z" fill="var(--brand-green)"/></svg>"##;
+
 fn render_page(title: &str, body_html: &str) -> String {
-    let mut out = String::with_capacity(6144 + body_html.len());
+    let year = Utc::now().format("%Y").to_string();
+    let mut out = String::with_capacity(8192 + body_html.len());
     out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n");
     out.push_str("  <meta charset=\"utf-8\" />\n");
     out.push_str("  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n");
     out.push_str("  <title>");
     out.push_str(&escape_html(title));
-    out.push_str("</title>\n  <style>");
+    out.push_str(" · Agorix Share Bridge</title>\n");
+    out.push_str("  <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\" />\n");
+    out.push_str("  <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin />\n");
+    out.push_str("  <link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Inter:wght@400;500;600&display=swap\" />\n");
+    out.push_str("  <script type=\"module\" src=\"https://cdn.jsdelivr.net/npm/@google/model-viewer/dist/model-viewer.min.js\"></script>\n");
+    out.push_str("  <style>:root{--font-inter:'Inter';--font-fraunces:'Fraunces';}");
     out.push_str(PAGE_STYLE);
     out.push_str("</style>\n</head>\n<body>\n");
+    out.push_str("<div class=\"page-wrap\">\n");
+    out.push_str("  <nav class=\"site-nav\"><div class=\"site-nav-inner\">");
+    out.push_str("<a class=\"brand\" href=\"/\" aria-label=\"Agorix home\">");
+    out.push_str(LOGO_MARK_SVG);
+    out.push_str("<span class=\"brand-word\">Agorix</span>");
+    out.push_str("<span class=\"brand-eyebrow\">share bridge</span>");
+    out.push_str("</a>");
     out.push_str(
-        "  <nav class=\"site-nav\"><div class=\"site-nav-inner\">\
-         <a class=\"brand\" href=\"/\">Foundation Share Bridge<small>pin companion</small></a>\
-         <div class=\"nav-links\">\
+        "<div class=\"nav-links\">\
          <a href=\"/#status\">Status</a>\
          <a href=\"/#inventory\">Pins</a>\
          <a href=\"/#connection\">Connection</a>\
-         </div>\
-         </div></nav>\n",
+         <a href=\"/settings\">Settings</a>\
+         </div>",
     );
+    out.push_str("</div></nav>\n");
     out.push_str(body_html);
-    out.push_str("\n</body>\n</html>");
+    out.push_str(
+        "\n  <footer class=\"site-footer\"><div class=\"site-footer-inner\">\
+        <div>\
+          <div class=\"brand-row\">",
+    );
+    out.push_str(LOGO_MARK_SVG);
+    out.push_str(
+        "<span class=\"brand-word\">Agorix</span>\
+          </div>\
+          <p class=\"about\">Agorix is the broader preservation project. This local companion app keeps rescued Foundation roots pinned on your IPFS node and self-repairs anything that drops. Not affiliated with Foundation.</p>\
+          <p class=\"tagline\">Local pin companion · Forever repair · Artist-aligned</p>\
+        </div>\
+        <div>\
+          <p class=\"foot-col-label\">Bridge</p>\
+          <ul class=\"foot-links\">\
+            <li><a href=\"/#status\">Status</a></li>\
+            <li><a href=\"/#inventory\">Local pins</a></li>\
+            <li><a href=\"/#connection\">Connection</a></li>\
+            <li><a href=\"/settings\">Settings</a></li>\
+          </ul>\
+        </div>\
+      </div>\
+      <div class=\"footer-meta\"><div class=\"footer-meta-inner\">\
+        <p>© ",
+    );
+    out.push_str(&year);
+    out.push_str(
+        " Agorix</p>\
+        <p>Independent · Decentralized · Artist-aligned</p>\
+      </div></div>\
+    </footer>\n",
+    );
+    out.push_str("</div>\n</body>\n</html>");
     out
 }
 
