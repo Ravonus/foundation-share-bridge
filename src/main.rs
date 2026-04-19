@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -20,7 +20,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
@@ -45,6 +45,10 @@ const FOUNDATION_SOCKET_HOSTNAME: &str = "socket-foundation.agorix.io";
 const INVENTORY_PAGE_SIZE: usize = 12;
 const INVENTORY_MAX_PAGE_SIZE: usize = 24;
 const PUBLIC_UTILITY_GATEWAY_BASE_URL: &str = "https://dweb.link";
+const VERIFY_CONCURRENCY: usize = 6;
+const MAX_DISCOVERY_TEXT_BYTES: usize = 512 * 1024;
+const MAX_DEPENDENCY_DISCOVERY_DEPTH: usize = 2;
+const MAX_DEPENDENCY_SCAN_CIDS: usize = 24;
 
 #[derive(Clone)]
 struct AppState {
@@ -57,6 +61,44 @@ struct AppState {
     sessions: Arc<RwLock<HashMap<String, BridgeSession>>>,
     persistent: Arc<RwLock<BridgePersistentState>>,
     config: Arc<RwLock<BridgeConfig>>,
+    operation: Arc<RwLock<OperationStatus>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationStatus {
+    phase: String,
+    detail: Option<String>,
+    progress_current: Option<usize>,
+    progress_total: Option<usize>,
+    started_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl OperationStatus {
+    fn idle() -> Self {
+        let now = Utc::now();
+        Self {
+            phase: "idle".to_string(),
+            detail: None,
+            progress_current: None,
+            progress_total: None,
+            started_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn busy(phase: &str, detail: Option<String>, total: Option<usize>) -> Self {
+        let now = Utc::now();
+        Self {
+            phase: phase.to_string(),
+            detail,
+            progress_current: Some(0),
+            progress_total: total,
+            started_at: now,
+            updated_at: now,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +116,8 @@ struct BridgeSession {
 struct WatchedPin {
     cid: String,
     label: Option<String>,
+    #[serde(default)]
+    preferred_file_name: Option<String>,
     source_kind: String,
     title: Option<String>,
     contract_address: Option<String>,
@@ -98,6 +142,28 @@ struct WatchedPin {
     last_sync_error: Option<String>,
     #[serde(default)]
     sync_count: u64,
+    #[serde(default)]
+    retry_attempts: u32,
+    #[serde(default)]
+    next_retry_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    error_category: Option<String>,
+    #[serde(default)]
+    provider_count: Option<usize>,
+    #[serde(default)]
+    provider_checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    custom_tags: Vec<String>,
+    #[serde(default)]
+    remote_pinned: bool,
+    #[serde(default)]
+    remote_pin_service: Option<String>,
+    #[serde(default)]
+    remote_pin_last_attempt_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    remote_pin_last_error: Option<String>,
+    #[serde(default)]
+    final_failure_reported_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -122,9 +188,24 @@ struct BridgeConfig {
     relay_device_token: Option<String>,
     relay_last_connected_at: Option<DateTime<Utc>>,
     relay_last_error: Option<String>,
+    #[serde(default)]
+    storage_quota_gb: Option<f64>,
+    #[serde(default)]
+    max_retry_attempts: Option<u32>,
+    #[serde(default)]
+    remote_pinning_enabled: bool,
+    #[serde(default)]
+    remote_pinning_service_name: Option<String>,
+    #[serde(default)]
+    remote_pinning_service_url: Option<String>,
+    #[serde(default)]
+    remote_pinning_access_token: Option<String>,
+    #[serde(default)]
+    onboarded_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct HealthResponse {
     status: &'static str,
     service: &'static str,
@@ -147,6 +228,23 @@ struct HealthResponse {
     relay_last_connected_at: Option<DateTime<Utc>>,
     relay_last_error: Option<String>,
     now: DateTime<Utc>,
+    storage: StorageSnapshot,
+    operation: OperationStatus,
+    remote_pinning_enabled: bool,
+    onboarded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageSnapshot {
+    repo_size_bytes: Option<u64>,
+    storage_max_bytes: Option<u64>,
+    num_objects: Option<u64>,
+    synced_bytes_on_disk: u64,
+    quota_gb: Option<f64>,
+    quota_used_fraction: Option<f64>,
+    ipfs_daemon_reachable: bool,
+    checked_at: DateTime<Utc>,
 }
 
 async fn add_private_network_access_header(mut response: Response) -> Response {
@@ -345,6 +443,24 @@ struct PinInventoryItem {
     last_synced_at: Option<DateTime<Utc>>,
     last_sync_error: Option<String>,
     sync_count: u64,
+    #[serde(default)]
+    retry_attempts: u32,
+    #[serde(default)]
+    next_retry_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    error_category: Option<String>,
+    #[serde(default)]
+    provider_count: Option<usize>,
+    #[serde(default)]
+    provider_checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    custom_tags: Vec<String>,
+    #[serde(default)]
+    remote_pinned: bool,
+    #[serde(default)]
+    remote_pin_service: Option<String>,
+    #[serde(default)]
+    remote_pin_last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -359,6 +475,11 @@ struct RepairNowResponse {
 struct VerifyPinsRequest {
     #[serde(default)]
     cids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnwatchPinsRequest {
+    cids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -379,6 +500,13 @@ struct VerifyPinsResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct UnwatchPinsResponse {
+    removed: usize,
+    missing: usize,
+    message: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct SyncNowResponse {
     synced: usize,
     failed: usize,
@@ -387,6 +515,7 @@ struct SyncNowResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BridgeConfigResponse {
     download_root_dir: String,
     sync_enabled: bool,
@@ -400,6 +529,13 @@ struct BridgeConfigResponse {
     relay_last_connected_at: Option<DateTime<Utc>>,
     relay_last_error: Option<String>,
     config_file: String,
+    storage_quota_gb: Option<f64>,
+    max_retry_attempts: Option<u32>,
+    remote_pinning_enabled: bool,
+    remote_pinning_service_name: Option<String>,
+    remote_pinning_service_url: Option<String>,
+    remote_pinning_access_token_configured: bool,
+    onboarded_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,6 +547,18 @@ struct UpdateBridgeConfigRequest {
     relay_enabled: Option<bool>,
     relay_server_url: Option<String>,
     relay_device_name: Option<String>,
+    #[serde(default)]
+    storage_quota_gb: Option<Option<f64>>,
+    #[serde(default)]
+    max_retry_attempts: Option<Option<u32>>,
+    #[serde(default)]
+    remote_pinning_enabled: Option<bool>,
+    #[serde(default)]
+    remote_pinning_service_name: Option<Option<String>>,
+    #[serde(default)]
+    remote_pinning_service_url: Option<Option<String>>,
+    #[serde(default)]
+    remote_pinning_access_token: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,6 +570,18 @@ struct UpdateBridgeConfigFormRequest {
     relay_enabled: Option<String>,
     relay_server_url: String,
     relay_device_name: String,
+    #[serde(default)]
+    storage_quota_gb: Option<String>,
+    #[serde(default)]
+    max_retry_attempts: Option<String>,
+    #[serde(default)]
+    remote_pinning_enabled: Option<String>,
+    #[serde(default)]
+    remote_pinning_service_name: Option<String>,
+    #[serde(default)]
+    remote_pinning_service_url: Option<String>,
+    #[serde(default)]
+    remote_pinning_access_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -661,6 +821,7 @@ struct RelayJobMessage {
 struct WatchPinInput {
     cid: String,
     label: Option<String>,
+    preferred_file_name: Option<String>,
     source_kind: String,
     title: Option<String>,
     contract_address: Option<String>,
@@ -759,6 +920,7 @@ async fn main() -> anyhow::Result<()> {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         persistent: Arc::new(RwLock::new(persistent)),
         config: Arc::new(RwLock::new(config)),
+        operation: Arc::new(RwLock::new(OperationStatus::idle())),
     };
 
     if should_seed_config_file {
@@ -786,7 +948,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/pins/page", get(list_pins_page))
         .route("/pins/repair", post(repair_now))
         .route("/pins/verify", post(verify_pins))
+        .route("/pins/unwatch", post(unwatch_pins))
         .route("/pins/item/{cid}/verify", post(verify_single_pin))
+        .route("/pins/item/{cid}/diagnose", post(diagnose_single_pin))
+        .route("/pins/item/{cid}/retry", post(retry_pin_now))
+        .route("/pins/item/{cid}/retry-sync", post(retry_sync_single))
+        .route("/pins/item/{cid}/tags", post(set_pin_tags))
+        .route("/pins/export", get(export_pins_handler))
+        .route("/gateway/health", get(gateway_health_handler))
+        .route("/storage/stats", get(storage_stats_handler))
+        .route("/status/live", get(live_status_handler))
+        .route("/artists/summary", get(artist_summary_handler))
         .route("/sync/run", post(sync_now))
         .route("/ipfs/pin", post(pin_cid))
         .route("/share/work", post(share_work))
@@ -934,6 +1106,32 @@ fn default_bridge_config(state_file: &Path) -> BridgeConfig {
         relay_device_token: None,
         relay_last_connected_at: None,
         relay_last_error: None,
+        storage_quota_gb: env::var("BRIDGE_STORAGE_QUOTA_GB")
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| *value > 0.0),
+        max_retry_attempts: env::var("BRIDGE_MAX_RETRY_ATTEMPTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok()),
+        remote_pinning_enabled: env::var("BRIDGE_REMOTE_PINNING_ENABLED")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false),
+        remote_pinning_service_name: env::var("BRIDGE_REMOTE_PINNING_SERVICE_NAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        remote_pinning_service_url: env::var("BRIDGE_REMOTE_PINNING_SERVICE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        remote_pinning_access_token: env::var("BRIDGE_REMOTE_PINNING_ACCESS_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        onboarded_at: None,
     }
 }
 
@@ -1140,9 +1338,45 @@ fn spawn_relay_socket_loop(state: AppState) {
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    let sessions = state.sessions.read().await;
-    let persistent = state.persistent.read().await;
-    let config = state.config.read().await;
+    let (active_sessions, watched_pin_count, last_repair_cycle_at) = {
+        let sessions = state.sessions.read().await;
+        let persistent = state.persistent.read().await;
+        (sessions.len(), persistent.watched_pins.len(), persistent.last_repair_cycle_at)
+    };
+    let (
+        download_root_dir,
+        sync_enabled,
+        local_gateway_base_url,
+        public_gateway_base_url,
+        relay_enabled,
+        relay_server_url,
+        relay_device_name,
+        relay_device_id,
+        relay_device_label,
+        relay_last_connected_at,
+        relay_last_error,
+        remote_pinning_enabled,
+        onboarded,
+    ) = {
+        let config = state.config.read().await;
+        (
+            config.download_root_dir.clone(),
+            config.sync_enabled,
+            config.local_gateway_base_url.clone(),
+            config.public_gateway_base_url.clone(),
+            config.relay_enabled,
+            config.relay_server_url.clone(),
+            config.relay_device_name.clone(),
+            config.relay_device_id.clone(),
+            config.relay_device_label.clone(),
+            config.relay_last_connected_at,
+            config.relay_last_error.clone(),
+            config.remote_pinning_enabled,
+            config.onboarded_at.is_some(),
+        )
+    };
+    let storage = build_storage_snapshot(&state).await;
+    let operation = state.operation.read().await.clone();
 
     Json(HealthResponse {
         status: "ok",
@@ -1150,22 +1384,26 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         ipfs_api_url: state.ipfs_api_url.clone(),
         state_file: state.state_file.display().to_string(),
         config_file: state.config_file.display().to_string(),
-        active_sessions: sessions.len(),
-        watched_pin_count: persistent.watched_pins.len(),
+        active_sessions,
+        watched_pin_count,
         repair_interval_seconds: state.repair_interval_seconds,
-        last_repair_cycle_at: persistent.last_repair_cycle_at,
-        download_root_dir: config.download_root_dir.clone(),
-        sync_enabled: config.sync_enabled,
-        local_gateway_base_url: config.local_gateway_base_url.clone(),
-        public_gateway_base_url: config.public_gateway_base_url.clone(),
-        relay_enabled: config.relay_enabled,
-        relay_server_url: config.relay_server_url.clone(),
-        relay_device_name: config.relay_device_name.clone(),
-        relay_device_id: config.relay_device_id.clone(),
-        relay_device_label: config.relay_device_label.clone(),
-        relay_last_connected_at: config.relay_last_connected_at,
-        relay_last_error: config.relay_last_error.clone(),
+        last_repair_cycle_at,
+        download_root_dir,
+        sync_enabled,
+        local_gateway_base_url,
+        public_gateway_base_url,
+        relay_enabled,
+        relay_server_url,
+        relay_device_name,
+        relay_device_id,
+        relay_device_label,
+        relay_last_connected_at,
+        relay_last_error,
         now: Utc::now(),
+        storage,
+        operation,
+        remote_pinning_enabled,
+        onboarded,
     })
 }
 
@@ -1199,6 +1437,17 @@ fn build_config_response(state: &AppState, config: &BridgeConfig) -> BridgeConfi
         relay_last_connected_at: config.relay_last_connected_at,
         relay_last_error: config.relay_last_error.clone(),
         config_file: state.config_file.display().to_string(),
+        storage_quota_gb: config.storage_quota_gb,
+        max_retry_attempts: config.max_retry_attempts,
+        remote_pinning_enabled: config.remote_pinning_enabled,
+        remote_pinning_service_name: config.remote_pinning_service_name.clone(),
+        remote_pinning_service_url: config.remote_pinning_service_url.clone(),
+        remote_pinning_access_token_configured: config
+            .remote_pinning_access_token
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        onboarded_at: config.onboarded_at,
     }
 }
 
@@ -1861,6 +2110,51 @@ async fn update_config_form(
     State(state): State<AppState>,
     Form(input): Form<UpdateBridgeConfigFormRequest>,
 ) -> Result<Redirect, AppError> {
+    let quota = input.storage_quota_gb.as_deref().map(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            trimmed.parse::<f64>().ok().filter(|value| *value > 0.0)
+        }
+    });
+
+    let retries = input.max_retry_attempts.as_deref().map(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            trimmed.parse::<u32>().ok()
+        }
+    });
+
+    let name = input.remote_pinning_service_name.as_deref().map(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    let url = input.remote_pinning_service_url.as_deref().map(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    let token = input.remote_pinning_access_token.as_deref().map(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
     let request = UpdateBridgeConfigRequest {
         download_root_dir: Some(input.download_root_dir),
         sync_enabled: Some(input.sync_enabled.is_some()),
@@ -1869,6 +2163,12 @@ async fn update_config_form(
         relay_enabled: Some(input.relay_enabled.is_some()),
         relay_server_url: Some(input.relay_server_url),
         relay_device_name: Some(input.relay_device_name),
+        storage_quota_gb: quota,
+        max_retry_attempts: retries,
+        remote_pinning_enabled: Some(input.remote_pinning_enabled.is_some()),
+        remote_pinning_service_name: name,
+        remote_pinning_service_url: url,
+        remote_pinning_access_token: token,
     };
 
     match apply_config_update(&state, request).await {
@@ -1946,6 +2246,34 @@ async fn apply_config_update(
                 return Err(AppError::bad_request("relay_device_name cannot be empty"));
             }
             config.relay_device_name = trimmed.to_string();
+        }
+
+        if let Some(quota) = input.storage_quota_gb {
+            config.storage_quota_gb = quota;
+        }
+
+        if let Some(retries) = input.max_retry_attempts {
+            config.max_retry_attempts = retries;
+        }
+
+        if let Some(enabled) = input.remote_pinning_enabled {
+            config.remote_pinning_enabled = enabled;
+        }
+
+        if let Some(name) = input.remote_pinning_service_name {
+            config.remote_pinning_service_name = name.filter(|value| !value.trim().is_empty());
+        }
+
+        if let Some(url) = input.remote_pinning_service_url {
+            config.remote_pinning_service_url = url.filter(|value| !value.trim().is_empty());
+        }
+
+        if let Some(token) = input.remote_pinning_access_token {
+            config.remote_pinning_access_token = token.filter(|value| !value.trim().is_empty());
+        }
+
+        if config.onboarded_at.is_none() {
+            config.onboarded_at = Some(Utc::now());
         }
     }
 
@@ -2180,13 +2508,12 @@ async fn list_pins_page(
     State(state): State<AppState>,
     Query(query): Query<PinsPageQuery>,
 ) -> Result<Json<PinsPageResponse>, AppError> {
-    let response = list_local_pin_inventory(&state)
-        .await
-        .map_err(AppError::internal)?;
     let cursor = parse_inventory_cursor(query.cursor.as_deref());
     let limit = resolve_inventory_page_size(query.limit);
-
-    Ok(Json(build_pins_page_response(response, cursor, limit)))
+    let response = list_local_pin_inventory_page(&state, cursor, limit)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(response))
 }
 
 async fn repair_now(State(state): State<AppState>) -> Result<Json<RepairNowResponse>, AppError> {
@@ -2207,17 +2534,61 @@ async fn verify_pins(
     Json(input): Json<VerifyPinsRequest>,
 ) -> Result<Json<VerifyPinsResponse>, AppError> {
     let targets = resolve_verify_targets(&state, input.cids.as_deref()).await;
-    let mut results = Vec::with_capacity(targets.len());
+    let mut results = stream::iter(targets.into_iter().enumerate().map(|(index, cid)| {
+        let state = state.clone();
+        async move { (index, check_cid_network_providers(&state, &cid).await) }
+    }))
+    .buffer_unordered(VERIFY_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    results.sort_by_key(|(index, _)| *index);
 
-    for cid in targets {
-        let result = check_cid_network_providers(&state, &cid).await;
+    let mut ordered_results = Vec::with_capacity(results.len());
+    for (_, result) in results {
         remember_pin_verification(&state, &result).await?;
-        results.push(result);
+        ordered_results.push(result);
     }
 
     Ok(Json(VerifyPinsResponse {
         checked_at: Utc::now(),
-        results,
+        results: ordered_results,
+    }))
+}
+
+async fn unwatch_pins(
+    State(state): State<AppState>,
+    Json(input): Json<UnwatchPinsRequest>,
+) -> Result<Json<UnwatchPinsResponse>, AppError> {
+    let cids = unique_trimmed_strings(input.cids);
+    if cids.is_empty() {
+        return Err(AppError::bad_request(
+            "Provide at least one CID to remove from the forever-watch list.",
+        ));
+    }
+
+    let mut removed = 0_usize;
+    let mut missing = 0_usize;
+    {
+        let mut persistent = state.persistent.write().await;
+        persistent.updated_at = Some(Utc::now());
+
+        for cid in cids {
+            if persistent.watched_pins.remove(&cid).is_some() {
+                removed += 1;
+            } else {
+                missing += 1;
+            }
+        }
+    }
+
+    persist_bridge_state(&state)
+        .await
+        .map_err(AppError::internal)?;
+
+    Ok(Json(UnwatchPinsResponse {
+        removed,
+        missing,
+        message: "Removed these roots from the forever-watch list. Existing IPFS pins were left alone.",
     }))
 }
 
@@ -2254,6 +2625,15 @@ fn resolve_inventory_page_size(raw: Option<usize>) -> usize {
         .clamp(1, INVENTORY_MAX_PAGE_SIZE)
 }
 
+fn unique_trimmed_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && seen.insert(value.clone()))
+        .collect()
+}
+
 fn build_pins_page_response(
     response: PinsResponse,
     cursor: usize,
@@ -2270,6 +2650,51 @@ fn build_pins_page_response(
         managed_count: response.managed_count,
         next_cursor: (end < total).then(|| end.to_string()),
         items,
+    }
+}
+
+fn collect_inventory_descriptors(
+    pinset: &HashMap<String, String>,
+    persistent: &BridgePersistentState,
+) -> Vec<InventoryEntryDescriptor> {
+    let mut grouped_work_members = HashMap::<String, Vec<InventorySourcePin>>::new();
+    let mut descriptors = Vec::new();
+
+    for watched in persistent.watched_pins.values() {
+        let source = InventorySourcePin {
+            cid: watched.cid.clone(),
+            pinned: pinset.contains_key(&watched.cid),
+            pin_type: pinset.get(&watched.cid).cloned(),
+            watched: watched.clone(),
+        };
+
+        if let Some(group_key) = inventory_work_group_key(&source.watched) {
+            grouped_work_members.entry(group_key).or_default().push(source);
+        } else {
+            descriptors.push(InventoryEntryDescriptor::Single(source));
+        }
+    }
+
+    for members in grouped_work_members.into_values() {
+        descriptors.push(InventoryEntryDescriptor::Work(members));
+    }
+
+    descriptors.sort_by(|left, right| right.added_at().cmp(&left.added_at()));
+    descriptors
+}
+
+async fn build_inventory_item_from_descriptor(
+    state: &AppState,
+    config: &BridgeConfig,
+    descriptor: &InventoryEntryDescriptor,
+) -> PinInventoryItem {
+    match descriptor {
+        InventoryEntryDescriptor::Single(source) => {
+            build_single_inventory_item(config, source.clone())
+        }
+        InventoryEntryDescriptor::Work(members) => {
+            build_work_inventory_item(state, config, members).await
+        }
     }
 }
 
@@ -2422,6 +2847,7 @@ async fn pin_cid(
         WatchPinInput {
             cid: input.cid.clone(),
             label: input.label.clone(),
+            preferred_file_name: None,
             source_kind: "manual".to_string(),
             title: None,
             contract_address: None,
@@ -2654,6 +3080,7 @@ async fn pin_work_payload(
                 WatchPinInput {
                     cid: cid.to_string(),
                     label: Some("metadata".to_string()),
+                    preferred_file_name: None,
                     source_kind: "work".to_string(),
                     title: Some(input.title.clone()),
                     contract_address: Some(input.contract_address.clone()),
@@ -2679,6 +3106,7 @@ async fn pin_work_payload(
                 WatchPinInput {
                     cid: cid.to_string(),
                     label: Some("media".to_string()),
+                    preferred_file_name: None,
                     source_kind: "work".to_string(),
                     title: Some(input.title.clone()),
                     contract_address: Some(input.contract_address.clone()),
@@ -2719,6 +3147,7 @@ async fn share_profile_inner(
                 WatchPinInput {
                     cid,
                     label,
+                    preferred_file_name: None,
                     source_kind: "profile".to_string(),
                     title: input.label.clone(),
                     contract_address: None,
@@ -2791,6 +3220,8 @@ async fn remember_watched_pin(
 
         if let Some(existing) = persistent.watched_pins.get_mut(&input.cid) {
             existing.label = input.label.or(existing.label.clone());
+            existing.preferred_file_name =
+                input.preferred_file_name.or(existing.preferred_file_name.clone());
             existing.title = input.title.or(existing.title.clone());
             existing.contract_address =
                 input.contract_address.or(existing.contract_address.clone());
@@ -2808,6 +3239,10 @@ async fn remember_watched_pin(
             if just_repaired {
                 existing.last_repaired_at = Some(now);
                 existing.repair_count += 1;
+                existing.retry_attempts = 0;
+                existing.next_retry_at = None;
+                existing.error_category = None;
+                existing.final_failure_reported_at = None;
             }
         } else {
             persistent.watched_pins.insert(
@@ -2815,6 +3250,7 @@ async fn remember_watched_pin(
                 WatchedPin {
                     cid: input.cid,
                     label: input.label,
+                    preferred_file_name: input.preferred_file_name,
                     source_kind: input.source_kind,
                     title: input.title,
                     contract_address: input.contract_address,
@@ -2836,6 +3272,17 @@ async fn remember_watched_pin(
                     last_synced_at: None,
                     last_sync_error: None,
                     sync_count: 0,
+                    retry_attempts: 0,
+                    next_retry_at: None,
+                    error_category: None,
+                    provider_count: None,
+                    provider_checked_at: None,
+                    custom_tags: Vec::new(),
+                    remote_pinned: false,
+                    remote_pin_service: None,
+                    remote_pin_last_attempt_at: None,
+                    remote_pin_last_error: None,
+                    final_failure_reported_at: None,
                 },
             );
         }
@@ -3004,6 +3451,32 @@ struct InventorySourcePin {
     pinned: bool,
     pin_type: Option<String>,
     watched: WatchedPin,
+}
+
+#[derive(Debug, Clone)]
+enum InventoryEntryDescriptor {
+    Single(InventorySourcePin),
+    Work(Vec<InventorySourcePin>),
+}
+
+impl InventoryEntryDescriptor {
+    fn added_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Single(source) => source.watched.added_at,
+            Self::Work(members) => members
+                .iter()
+                .map(|member| member.watched.added_at)
+                .max()
+                .unwrap_or_else(Utc::now),
+        }
+    }
+
+    fn pinned(&self) -> bool {
+        match self {
+            Self::Single(source) => source.pinned,
+            Self::Work(members) => members.iter().all(|member| member.pinned),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3732,6 +4205,15 @@ fn build_single_inventory_item(
         last_synced_at: source.watched.last_synced_at,
         last_sync_error: source.watched.last_sync_error.clone(),
         sync_count: source.watched.sync_count,
+        retry_attempts: source.watched.retry_attempts,
+        next_retry_at: source.watched.next_retry_at,
+        error_category: source.watched.error_category.clone(),
+        provider_count: source.watched.provider_count,
+        provider_checked_at: source.watched.provider_checked_at,
+        custom_tags: source.watched.custom_tags.clone(),
+        remote_pinned: source.watched.remote_pinned,
+        remote_pin_service: source.watched.remote_pin_service.clone(),
+        remote_pin_last_error: source.watched.remote_pin_last_error.clone(),
     }
 }
 
@@ -3845,6 +4327,46 @@ async fn build_work_inventory_item(
             member.watched.last_sync_error.as_ref()
         }),
         sync_count: members.iter().map(|member| member.watched.sync_count).sum(),
+        retry_attempts: members
+            .iter()
+            .map(|member| member.watched.retry_attempts)
+            .max()
+            .unwrap_or(0),
+        next_retry_at: members
+            .iter()
+            .filter_map(|member| member.watched.next_retry_at)
+            .min(),
+        error_category: first_present_error(members, |member| {
+            member.watched.error_category.as_ref()
+        }),
+        provider_count: members
+            .iter()
+            .filter_map(|member| member.watched.provider_count)
+            .min(),
+        provider_checked_at: max_timestamp_by(members, |member| {
+            member.watched.provider_checked_at
+        }),
+        custom_tags: {
+            let mut tags = Vec::new();
+            let mut seen = HashSet::new();
+            for member in members {
+                for tag in &member.watched.custom_tags {
+                    if seen.insert(tag.clone()) {
+                        tags.push(tag.clone());
+                    }
+                }
+            }
+            tags
+        },
+        remote_pinned: members.iter().any(|member| member.watched.remote_pinned),
+        remote_pin_service: first_present_string(
+            members
+                .iter()
+                .map(|member| member.watched.remote_pin_service.clone()),
+        ),
+        remote_pin_last_error: first_present_error(members, |member| {
+            member.watched.remote_pin_last_error.as_ref()
+        }),
     }
 }
 
@@ -3852,43 +4374,46 @@ async fn list_local_pin_inventory(state: &AppState) -> anyhow::Result<PinsRespon
     let pinset = list_kubo_pinset(state).await?;
     let persistent = state.persistent.read().await.clone();
     let config = state.config.read().await.clone();
-
-    let mut grouped_work_members = HashMap::<String, Vec<InventorySourcePin>>::new();
-    let mut items = Vec::new();
-
-    for watched in persistent.watched_pins.values() {
-        let source = InventorySourcePin {
-            cid: watched.cid.clone(),
-            pinned: pinset.contains_key(&watched.cid),
-            pin_type: pinset.get(&watched.cid).cloned(),
-            watched: watched.clone(),
-        };
-
-        if let Some(group_key) = inventory_work_group_key(&source.watched) {
-            grouped_work_members
-                .entry(group_key)
-                .or_default()
-                .push(source);
-        } else {
-            items.push(build_single_inventory_item(&config, source));
-        }
+    let descriptors = collect_inventory_descriptors(&pinset, &persistent);
+    let mut items = Vec::with_capacity(descriptors.len());
+    for descriptor in &descriptors {
+        items.push(build_inventory_item_from_descriptor(state, &config, descriptor).await);
     }
-
-    for members in grouped_work_members.values() {
-        items.push(build_work_inventory_item(state, &config, members).await);
-    }
-
-    items.sort_by(|left, right| {
-        let left_added = left.added_at.unwrap_or_else(Utc::now);
-        let right_added = right.added_at.unwrap_or_else(Utc::now);
-        right_added.cmp(&left_added)
-    });
 
     Ok(PinsResponse {
-        total: items.len(),
-        pinned_count: items.iter().filter(|item| item.pinned).count(),
-        managed_count: items.iter().filter(|item| item.managed).count(),
+        total: descriptors.len(),
+        pinned_count: descriptors.iter().filter(|descriptor| descriptor.pinned()).count(),
+        managed_count: descriptors.len(),
         last_repair_cycle_at: persistent.last_repair_cycle_at,
+        items,
+    })
+}
+
+async fn list_local_pin_inventory_page(
+    state: &AppState,
+    cursor: usize,
+    limit: usize,
+) -> anyhow::Result<PinsPageResponse> {
+    let pinset = list_kubo_pinset(state).await?;
+    let persistent = state.persistent.read().await.clone();
+    let config = state.config.read().await.clone();
+    let descriptors = collect_inventory_descriptors(&pinset, &persistent);
+
+    let total = descriptors.len();
+    let start = cursor.min(total);
+    let end = start.saturating_add(limit).min(total);
+    let pinned_count = descriptors.iter().filter(|descriptor| descriptor.pinned()).count();
+
+    let mut items = Vec::with_capacity(end.saturating_sub(start));
+    for descriptor in &descriptors[start..end] {
+        items.push(build_inventory_item_from_descriptor(state, &config, descriptor).await);
+    }
+
+    Ok(PinsPageResponse {
+        total,
+        pinned_count,
+        managed_count: total,
+        next_cursor: (end < total).then(|| end.to_string()),
         items,
     })
 }
@@ -4372,27 +4897,64 @@ async fn repair_watched_pins(state: &AppState) -> anyhow::Result<RepairCycleOutc
             .collect::<Vec<_>>()
     };
 
-    let mut outcome = RepairCycleOutcome::default();
+    let total = watched.len();
+    set_current_operation(
+        state,
+        OperationStatus::busy(
+            "repairing",
+            Some(format!("Checking {total} watched pin{}", if total == 1 { "" } else { "s" })),
+            Some(total),
+        ),
+    )
+    .await;
 
-    for pin in watched {
+    let max_attempts = {
+        state
+            .config
+            .read()
+            .await
+            .max_retry_attempts
+            .unwrap_or(10)
+    };
+
+    let mut outcome = RepairCycleOutcome::default();
+    let now = Utc::now();
+
+    for (index, pin) in watched.into_iter().enumerate() {
+        update_current_operation(
+            state,
+            Some(format!(
+                "Checking {} ({} of {total})",
+                pin.title.clone().unwrap_or_else(|| pin.cid.clone()),
+                index + 1
+            )),
+            Some(index),
+        )
+        .await;
+
+        if let Some(next_retry_at) = pin.next_retry_at {
+            if next_retry_at > now {
+                outcome.healthy += 1;
+                continue;
+            }
+        }
+
         match is_cid_pinned(state, &pin.cid).await {
             Ok(true) => {
-                mark_pin_checked(state, &pin.cid, None)
-                    .await
-                    .map_err(|error| anyhow!(error.message))?;
+                record_pin_repaired(state, &pin).await?;
                 outcome.healthy += 1;
             }
             Ok(false) => {
                 warn!("cid {} missing from ipfs pinset, repairing", pin.cid);
 
-                let label = pin.label.clone();
-                match pin_single_cid(state, &pin.cid, label.clone()).await {
+                match pin_single_cid(state, &pin.cid, pin.label.clone()).await {
                     Ok(result) => {
                         remember_watched_pin(
                             state,
                             WatchPinInput {
                                 cid: pin.cid.clone(),
-                                label,
+                                label: pin.label.clone(),
+                                preferred_file_name: pin.preferred_file_name.clone(),
                                 source_kind: pin.source_kind.clone(),
                                 title: pin.title.clone(),
                                 contract_address: pin.contract_address.clone(),
@@ -4412,16 +4974,14 @@ async fn repair_watched_pins(state: &AppState) -> anyhow::Result<RepairCycleOutc
                     }
                     Err(error) => {
                         let message = error.message.clone();
-                        mark_pin_checked(state, &pin.cid, Some(message.clone()))
-                            .await
-                            .map_err(|write_error| anyhow!(write_error.message))?;
+                        record_pin_failure(state, &pin, &message, max_attempts).await?;
                         outcome.failed += 1;
                     }
                 }
             }
             Err(error) => {
                 let message = error.to_string();
-                let _ = mark_pin_checked(state, &pin.cid, Some(message.clone())).await;
+                record_pin_failure(state, &pin, &message, max_attempts).await?;
                 outcome.failed += 1;
             }
         }
@@ -4435,7 +4995,101 @@ async fn repair_watched_pins(state: &AppState) -> anyhow::Result<RepairCycleOutc
     }
 
     persist_bridge_state(state).await?;
+    clear_current_operation(state).await;
     Ok(outcome)
+}
+
+async fn record_pin_repaired(state: &AppState, pin: &WatchedPin) -> anyhow::Result<()> {
+    let cid = pin.cid.clone();
+    {
+        let mut persistent = state.persistent.write().await;
+        let now = Utc::now();
+        if let Some(existing) = persistent.watched_pins.get_mut(&cid) {
+            existing.last_verified_at = Some(now);
+            existing.last_error = None;
+            existing.error_category = None;
+            existing.retry_attempts = 0;
+            existing.next_retry_at = None;
+            existing.final_failure_reported_at = None;
+            existing.verify_count += 1;
+        }
+        persistent.updated_at = Some(now);
+    }
+    persist_bridge_state(state).await
+}
+
+async fn record_pin_failure(
+    state: &AppState,
+    pin: &WatchedPin,
+    message: &str,
+    max_attempts: u32,
+) -> anyhow::Result<()> {
+    let (category_label, _hint) = categorize_pin_error(message);
+    let next_attempt = pin.retry_attempts.saturating_add(1);
+    let next_retry_at = compute_next_retry_at(state, next_attempt).await;
+    let should_try_remote = next_attempt >= max_attempts
+        && category_label != "invalid_cid"
+        && category_label != "unauthorized";
+
+    let mut remote_service: Option<String> = None;
+    let mut remote_error: Option<String> = None;
+
+    if should_try_remote {
+        let hint = pin.title.clone().or_else(|| Some(pin.cid.clone()));
+        match submit_to_remote_pinning_service(state, &pin.cid, hint.as_deref()).await {
+            Ok(Some(service)) => {
+                info!("remote pin service accepted {} via {}", pin.cid, service);
+                remote_service = Some(service);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!("remote pin service rejected {}: {}", pin.cid, error);
+                remote_error = Some(error.to_string());
+            }
+        }
+    }
+
+    let mut should_notify_relay = false;
+    {
+        let mut persistent = state.persistent.write().await;
+        let now = Utc::now();
+        if let Some(existing) = persistent.watched_pins.get_mut(&pin.cid) {
+            existing.last_verified_at = Some(now);
+            existing.last_error = Some(message.to_string());
+            existing.error_category = Some(category_label.to_string());
+            existing.retry_attempts = next_attempt;
+            existing.next_retry_at = Some(next_retry_at);
+            existing.verify_count += 1;
+
+            if let Some(service) = &remote_service {
+                existing.remote_pinned = true;
+                existing.remote_pin_service = Some(service.clone());
+                existing.remote_pin_last_attempt_at = Some(now);
+                existing.remote_pin_last_error = None;
+            } else if let Some(err) = &remote_error {
+                existing.remote_pin_last_error = Some(err.clone());
+                existing.remote_pin_last_attempt_at = Some(now);
+            }
+
+            if next_attempt >= max_attempts && existing.final_failure_reported_at.is_none() {
+                existing.final_failure_reported_at = Some(now);
+                should_notify_relay = true;
+            }
+        }
+        persistent.updated_at = Some(now);
+    }
+
+    persist_bridge_state(state).await?;
+
+    if should_notify_relay {
+        if let Some(latest) = state.persistent.read().await.watched_pins.get(&pin.cid).cloned() {
+            if let Err(error) = send_relay_pin_failure(state, &latest, message).await {
+                warn!("relay pin-failure callback failed for {}: {error}", pin.cid);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn is_cid_pinned(state: &AppState, cid: &str) -> anyhow::Result<bool> {
@@ -4525,6 +5179,695 @@ async fn pin_single_cid(
         provider: "kubo",
         pin_reference,
         requested_at: Utc::now(),
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct KuboRepoStat {
+    #[serde(rename = "RepoSize")]
+    repo_size: Option<u64>,
+    #[serde(rename = "StorageMax")]
+    storage_max: Option<u64>,
+    #[serde(rename = "NumObjects")]
+    num_objects: Option<u64>,
+    #[serde(rename = "RepoPath")]
+    repo_path: Option<String>,
+}
+
+async fn fetch_kubo_repo_stat(state: &AppState) -> anyhow::Result<KuboRepoStat> {
+    let endpoint = format!("{}/api/v0/repo/stat", state.ipfs_api_url.trim_end_matches('/'));
+    let mut request = state.http.post(endpoint).timeout(Duration::from_secs(8));
+    if let Some(header) = &state.ipfs_api_auth_header {
+        request = request.header("Authorization", header);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("Unable to read IPFS repo/stat: {body}"));
+    }
+    Ok(response.json::<KuboRepoStat>().await?)
+}
+
+#[async_recursion]
+async fn sum_dir_size(path: &Path) -> u64 {
+    let Ok(metadata) = fs::metadata(path).await else { return 0; };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+    let Ok(mut entries) = fs::read_dir(path).await else { return 0; };
+    let mut total = 0u64;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let child = entry.path();
+        total = total.saturating_add(sum_dir_size(&child).await);
+    }
+    total
+}
+
+async fn measure_synced_bytes_on_disk(state: &AppState) -> u64 {
+    let paths = {
+        state
+            .persistent
+            .read()
+            .await
+            .watched_pins
+            .values()
+            .filter_map(|pin| pin.sync_path.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut total = 0u64;
+    for path in paths {
+        total = total.saturating_add(sum_dir_size(&PathBuf::from(path)).await);
+    }
+    total
+}
+
+async fn build_storage_snapshot(state: &AppState) -> StorageSnapshot {
+    let (repo_size, storage_max, num_objects, ipfs_daemon_reachable) =
+        match fetch_kubo_repo_stat(state).await {
+            Ok(stat) => (stat.repo_size, stat.storage_max, stat.num_objects, true),
+            Err(_) => (None, None, None, false),
+        };
+    let synced_bytes = measure_synced_bytes_on_disk(state).await;
+    let quota_gb = { state.config.read().await.storage_quota_gb };
+    let quota_used_fraction = match (quota_gb, repo_size) {
+        (Some(gb), Some(bytes)) if gb > 0.0 => {
+            let max_bytes = gb * 1_000_000_000.0;
+            if max_bytes > 0.0 { Some((bytes as f64) / max_bytes) } else { None }
+        }
+        _ => None,
+    };
+    StorageSnapshot {
+        repo_size_bytes: repo_size,
+        storage_max_bytes: storage_max,
+        num_objects,
+        synced_bytes_on_disk: synced_bytes,
+        quota_gb,
+        quota_used_fraction,
+        ipfs_daemon_reachable,
+        checked_at: Utc::now(),
+    }
+}
+
+fn categorize_pin_error(message: &str) -> (&'static str, &'static str) {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("connection refused")
+        || lower.contains("failed to reach ipfs")
+        || lower.contains("failed to connect")
+        || lower.contains("connection reset")
+        || lower.contains("dial tcp")
+    {
+        return (
+            "daemon_unreachable",
+            "The local IPFS daemon is not responding. Start Kubo and retry.",
+        );
+    }
+    if lower.contains("deadline exceeded")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+    {
+        return (
+            "timeout",
+            "The IPFS network took too long to answer. Try again in a minute.",
+        );
+    }
+    if lower.contains("no providers")
+        || lower.contains("could not find provider")
+        || lower.contains("no route to host")
+    {
+        return (
+            "no_providers",
+            "No peers know about this CID yet. A remote pinning service can keep a copy.",
+        );
+    }
+    if lower.contains("not pinned") {
+        return ("not_pinned", "The CID is not pinned locally. The next cycle will pin it.");
+    }
+    if lower.contains("invalid") || lower.contains("not a valid cid") {
+        return ("invalid_cid", "The CID looks malformed. Re-request the share.");
+    }
+    if lower.contains("unauthorized") || lower.contains("forbidden") || lower.contains("401") || lower.contains("403") {
+        return ("unauthorized", "The IPFS API rejected the request. Verify IPFS_API_AUTH_HEADER.");
+    }
+    if lower.contains("disk") || lower.contains("no space") || lower.contains("quota") {
+        return ("disk_full", "The IPFS datastore cannot accept more data. Free space or raise the quota.");
+    }
+    ("unknown", "Cause not recognized. Check the detail for the raw message.")
+}
+
+async fn compute_next_retry_at(state: &AppState, attempt: u32) -> DateTime<Utc> {
+    let cap_attempts = {
+        state.config.read().await.max_retry_attempts.unwrap_or(10)
+    };
+    let effective = attempt.min(cap_attempts).min(14);
+    let base = 30u64.saturating_mul(1u64 << effective.min(10));
+    let capped = base.min(60 * 60 * 6);
+    Utc::now() + chrono::Duration::seconds(capped as i64)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnoseResponse {
+    cid: String,
+    pinned_locally: bool,
+    provider_count: usize,
+    reachable_on_dht: bool,
+    error_category: Option<String>,
+    error_hint: Option<String>,
+    last_error: Option<String>,
+    raw_error: Option<String>,
+    checked_at: DateTime<Utc>,
+    gateway_local_ok: Option<bool>,
+    gateway_public_ok: Option<bool>,
+}
+
+async fn probe_gateway(client: &Client, url: &str) -> Option<bool> {
+    let response = client
+        .head(url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+    Some(response.status().is_success() || response.status().is_redirection())
+}
+
+async fn check_gateway_reachability(state: &AppState, cid: &str) -> (Option<bool>, Option<bool>) {
+    let (local_base, public_base) = {
+        let config = state.config.read().await;
+        (config.local_gateway_base_url.clone(), config.public_gateway_base_url.clone())
+    };
+    let local = probe_gateway(&state.http, &build_gateway_url(&local_base, cid)).await;
+    let public = probe_gateway(&state.http, &build_gateway_url(&public_base, cid)).await;
+    (local, public)
+}
+
+async fn diagnose_pin(state: &AppState, cid: &str) -> DiagnoseResponse {
+    let checked_at = Utc::now();
+    let pinned_locally = matches!(is_cid_pinned(state, cid).await, Ok(true));
+    let provider_result = check_cid_network_providers(state, cid).await;
+    let _ = remember_pin_verification(state, &provider_result).await;
+
+    let (last_error, stored_category) = {
+        let persistent = state.persistent.read().await;
+        persistent
+            .watched_pins
+            .get(cid)
+            .map(|pin| (pin.last_error.clone(), pin.error_category.clone()))
+            .unwrap_or((None, None))
+    };
+
+    let combined_error = provider_result.error.clone().or(last_error.clone());
+    let (category, hint) = combined_error
+        .as_deref()
+        .map(categorize_pin_error)
+        .map(|(cat, hint)| (Some(cat.to_string()), Some(hint.to_string())))
+        .unwrap_or_else(|| (stored_category.clone(), None));
+
+    let (gateway_local_ok, gateway_public_ok) = check_gateway_reachability(state, cid).await;
+
+    DiagnoseResponse {
+        cid: cid.to_string(),
+        pinned_locally,
+        provider_count: provider_result.provider_count,
+        reachable_on_dht: provider_result.reachable,
+        error_category: category,
+        error_hint: hint,
+        last_error,
+        raw_error: provider_result.error,
+        checked_at,
+        gateway_local_ok,
+        gateway_public_ok,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GatewayHealthResponse {
+    local_gateway_base_url: String,
+    public_gateway_base_url: String,
+    utility_gateway_base_url: &'static str,
+    local_ok: Option<bool>,
+    public_ok: Option<bool>,
+    utility_ok: Option<bool>,
+    checked_at: DateTime<Utc>,
+}
+
+async fn gateway_health_probe(state: &AppState) -> GatewayHealthResponse {
+    let (local_base, public_base) = {
+        let config = state.config.read().await;
+        (config.local_gateway_base_url.clone(), config.public_gateway_base_url.clone())
+    };
+    const PROBE_CID: &str = "bafkqaaa";
+    let local_ok = probe_gateway(&state.http, &build_gateway_url(&local_base, PROBE_CID)).await;
+    let public_ok = probe_gateway(&state.http, &build_gateway_url(&public_base, PROBE_CID)).await;
+    let utility_ok = probe_gateway(
+        &state.http,
+        &build_gateway_url(PUBLIC_UTILITY_GATEWAY_BASE_URL, PROBE_CID),
+    ).await;
+    GatewayHealthResponse {
+        local_gateway_base_url: local_base,
+        public_gateway_base_url: public_base,
+        utility_gateway_base_url: PUBLIC_UTILITY_GATEWAY_BASE_URL,
+        local_ok,
+        public_ok,
+        utility_ok,
+        checked_at: Utc::now(),
+    }
+}
+
+async fn submit_to_remote_pinning_service(
+    state: &AppState,
+    cid: &str,
+    name_hint: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let (enabled, service_name, service_url, token) = {
+        let config = state.config.read().await;
+        (
+            config.remote_pinning_enabled,
+            config.remote_pinning_service_name.clone(),
+            config.remote_pinning_service_url.clone(),
+            config.remote_pinning_access_token.clone(),
+        )
+    };
+    if !enabled { return Ok(None); }
+    let service_url = service_url
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("Remote pinning is enabled but service URL is empty"))?;
+    let token = token
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("Remote pinning is enabled but access token is empty"))?;
+    let endpoint = format!("{}/pins", trim_trailing_slash(&service_url));
+    let mut body = serde_json::json!({"cid": cid.trim()});
+    if let Some(name) = name_hint.map(str::trim).filter(|value| !value.is_empty()) {
+        body["name"] = serde_json::Value::String(name.to_string());
+    }
+    let response = state
+        .http
+        .post(endpoint)
+        .bearer_auth(token.trim())
+        .json(&body)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .context("Unable to reach remote pinning service")?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow!("Remote pin failed ({}): {}", status, text.chars().take(300).collect::<String>()));
+    }
+    let _ = response.bytes().await;
+    Ok(Some(service_name.unwrap_or_else(|| "remote".to_string())))
+}
+
+async fn set_current_operation(state: &AppState, status: OperationStatus) {
+    *state.operation.write().await = status;
+}
+
+async fn update_current_operation(
+    state: &AppState,
+    detail: Option<String>,
+    progress_current: Option<usize>,
+) {
+    let mut guard = state.operation.write().await;
+    guard.updated_at = Utc::now();
+    if let Some(d) = detail { guard.detail = Some(d); }
+    if let Some(p) = progress_current { guard.progress_current = Some(p); }
+}
+
+async fn clear_current_operation(state: &AppState) {
+    *state.operation.write().await = OperationStatus::idle();
+}
+
+async fn send_relay_pin_failure(
+    state: &AppState,
+    pin: &WatchedPin,
+    message: &str,
+) -> anyhow::Result<bool> {
+    let (relay_enabled, relay_server_url, device_token) = {
+        let config = state.config.read().await;
+        (config.relay_enabled, config.relay_server_url.clone(), config.relay_device_token.clone())
+    };
+    if !relay_enabled { return Ok(false); }
+    let Some(token) = device_token.filter(|value| !value.trim().is_empty()) else { return Ok(false); };
+    if relay_server_url.trim().is_empty() { return Ok(false); }
+    let endpoint = format!(
+        "{}/api/relay/bridge/pin-failure",
+        trim_trailing_slash(&relay_server_url)
+    );
+    let payload = serde_json::json!({
+        "deviceToken": token,
+        "cid": pin.cid,
+        "title": pin.title,
+        "contractAddress": pin.contract_address,
+        "tokenId": pin.token_id,
+        "artistUsername": pin.artist_username,
+        "errorCategory": pin.error_category,
+        "errorMessage": message,
+        "retryAttempts": pin.retry_attempts,
+        "reportedAt": Utc::now(),
+    });
+    let response = state.http.post(endpoint).json(&payload).timeout(Duration::from_secs(8)).send().await;
+    match response {
+        Ok(resp) if resp.status().is_success() => Ok(true),
+        Ok(resp) => Err(anyhow!("Relay pin-failure callback returned {}", resp.status())),
+        Err(error) => Err(anyhow!(error)),
+    }
+}
+
+fn sanitize_custom_tag(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 48 { return None; }
+    let cleaned: String = trimmed.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.is_empty() { None } else { Some(cleaned) }
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_bytes_human(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    const TB: f64 = GB * 1024.0;
+    let v = bytes as f64;
+    if v >= TB { format!("{:.2} TB", v / TB) }
+    else if v >= GB { format!("{:.2} GB", v / GB) }
+    else if v >= MB { format!("{:.1} MB", v / MB) }
+    else if v >= KB { format!("{:.1} KB", v / KB) }
+    else { format!("{} B", bytes) }
+}
+
+async fn diagnose_single_pin(
+    AxumPath(cid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<DiagnoseResponse>, AppError> {
+    let trimmed = cid.trim();
+    if trimmed.is_empty() { return Err(AppError::bad_request("CID is required")); }
+    Ok(Json(diagnose_pin(&state, trimmed).await))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryPinResponse {
+    cid: String,
+    pinned: bool,
+    used_remote_service: Option<String>,
+    message: String,
+}
+
+async fn retry_pin_now(
+    AxumPath(cid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<RetryPinResponse>, AppError> {
+    let trimmed = cid.trim().to_string();
+    if trimmed.is_empty() { return Err(AppError::bad_request("CID is required")); }
+
+    {
+        let mut persistent = state.persistent.write().await;
+        if let Some(existing) = persistent.watched_pins.get_mut(&trimmed) {
+            existing.next_retry_at = None;
+        } else {
+            return Err(AppError::bad_request("CID is not watched by this bridge"));
+        }
+        persistent.updated_at = Some(Utc::now());
+    }
+
+    let snapshot = {
+        state.persistent.read().await.watched_pins.get(&trimmed).cloned()
+            .ok_or_else(|| AppError::bad_request("CID disappeared during retry"))?
+    };
+
+    match pin_single_cid(&state, &trimmed, snapshot.label.clone()).await {
+        Ok(_) => {
+            remember_watched_pin(
+                &state,
+                WatchPinInput {
+                    cid: snapshot.cid.clone(),
+                    label: snapshot.label.clone(),
+                    preferred_file_name: snapshot.preferred_file_name.clone(),
+                    source_kind: snapshot.source_kind.clone(),
+                    title: snapshot.title.clone(),
+                    contract_address: snapshot.contract_address.clone(),
+                    token_id: snapshot.token_id.clone(),
+                    foundation_url: snapshot.foundation_url.clone(),
+                    artist_username: snapshot.artist_username.clone(),
+                    account_address: snapshot.account_address.clone(),
+                    username: snapshot.username.clone(),
+                },
+                snapshot.pin_reference.clone(),
+                None,
+                true,
+            ).await?;
+            Ok(Json(RetryPinResponse {
+                cid: trimmed,
+                pinned: true,
+                used_remote_service: None,
+                message: "Pin refreshed locally.".to_string(),
+            }))
+        }
+        Err(error) => {
+            let message = error.message.clone();
+            let (_category_label, hint) = categorize_pin_error(&message);
+            let hint_name = snapshot.title.clone().or_else(|| Some(trimmed.clone()));
+            let remote_result = submit_to_remote_pinning_service(&state, &trimmed, hint_name.as_deref()).await;
+            let (used_remote, remote_err) = match remote_result {
+                Ok(Some(service)) => (Some(service), None),
+                Ok(None) => (None, None),
+                Err(err) => (None, Some(err.to_string())),
+            };
+            {
+                let mut persistent = state.persistent.write().await;
+                let now = Utc::now();
+                if let Some(existing) = persistent.watched_pins.get_mut(&trimmed) {
+                    existing.last_error = Some(message.clone());
+                    existing.error_category = Some(_category_label.to_string());
+                    if let Some(service) = &used_remote {
+                        existing.remote_pinned = true;
+                        existing.remote_pin_service = Some(service.clone());
+                        existing.remote_pin_last_attempt_at = Some(now);
+                        existing.remote_pin_last_error = None;
+                    } else if let Some(err) = &remote_err {
+                        existing.remote_pin_last_error = Some(err.clone());
+                        existing.remote_pin_last_attempt_at = Some(now);
+                    }
+                }
+                persistent.updated_at = Some(now);
+            }
+            persist_bridge_state(&state).await.map_err(AppError::internal)?;
+            let reply = if let Some(service) = used_remote.clone() {
+                format!("Local pin failed ({hint}), but the remote pinning service {service} accepted it.")
+            } else {
+                format!("Local pin failed. {hint} Detail: {message}")
+            };
+            Ok(Json(RetryPinResponse {
+                cid: trimmed, pinned: false, used_remote_service: used_remote, message: reply,
+            }))
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RetrySyncResponse {
+    cid: String,
+    synced: bool,
+    path: Option<String>,
+    error: Option<String>,
+}
+
+async fn retry_sync_single(
+    AxumPath(cid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<RetrySyncResponse>, AppError> {
+    let trimmed = cid.trim().to_string();
+    if trimmed.is_empty() { return Err(AppError::bad_request("CID is required")); }
+    let exists = state.persistent.read().await.watched_pins.contains_key(&trimmed);
+    if !exists { return Err(AppError::bad_request("CID is not watched by this bridge")); }
+    match sync_cid_to_download_dir(&state, &trimmed).await {
+        Ok(path) => Ok(Json(RetrySyncResponse {
+            cid: trimmed, synced: true, path: Some(path.display().to_string()), error: None,
+        })),
+        Err(error) => Ok(Json(RetrySyncResponse {
+            cid: trimmed, synced: false, path: None, error: Some(error.to_string()),
+        })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetPinTagsRequest {
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetPinTagsResponse {
+    cid: String,
+    tags: Vec<String>,
+}
+
+async fn set_pin_tags(
+    AxumPath(cid): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(input): Json<SetPinTagsRequest>,
+) -> Result<Json<SetPinTagsResponse>, AppError> {
+    let trimmed = cid.trim().to_string();
+    if trimmed.is_empty() { return Err(AppError::bad_request("CID is required")); }
+    let cleaned: Vec<String> = {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for raw in input.tags {
+            if let Some(tag) = sanitize_custom_tag(&raw) {
+                let key = tag.to_ascii_lowercase();
+                if seen.insert(key) { out.push(tag); }
+            }
+        }
+        out
+    };
+    {
+        let mut persistent = state.persistent.write().await;
+        let existing = persistent.watched_pins.get_mut(&trimmed)
+            .ok_or_else(|| AppError::bad_request("CID is not watched by this bridge"))?;
+        existing.custom_tags = cleaned.clone();
+        persistent.updated_at = Some(Utc::now());
+    }
+    persist_bridge_state(&state).await.map_err(AppError::internal)?;
+    Ok(Json(SetPinTagsResponse { cid: trimmed, tags: cleaned }))
+}
+
+async fn gateway_health_handler(State(state): State<AppState>) -> Json<GatewayHealthResponse> {
+    Json(gateway_health_probe(&state).await)
+}
+
+async fn storage_stats_handler(State(state): State<AppState>) -> Json<StorageSnapshot> {
+    Json(build_storage_snapshot(&state).await)
+}
+
+async fn live_status_handler(State(state): State<AppState>) -> Json<OperationStatus> {
+    Json(state.operation.read().await.clone())
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+}
+
+async fn export_pins_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ExportQuery>,
+) -> Result<Response, AppError> {
+    let snapshot = state.persistent.read().await.clone();
+    let format = query.format.as_deref().map(|v| v.trim().to_ascii_lowercase()).unwrap_or_else(|| "json".to_string());
+    match format.as_str() {
+        "csv" => {
+            let mut body = String::new();
+            body.push_str(
+                "cid,title,artist_username,contract_address,token_id,foundation_url,source_kind,label,added_at,last_verified_at,last_repaired_at,verify_count,repair_count,sync_count,last_error,error_category,retry_attempts,remote_pinned,remote_pin_service,custom_tags,sync_path\n",
+            );
+            for pin in snapshot.watched_pins.values() {
+                body.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                    csv_escape(&pin.cid),
+                    csv_escape(pin.title.as_deref().unwrap_or("")),
+                    csv_escape(pin.artist_username.as_deref().unwrap_or("")),
+                    csv_escape(pin.contract_address.as_deref().unwrap_or("")),
+                    csv_escape(pin.token_id.as_deref().unwrap_or("")),
+                    csv_escape(pin.foundation_url.as_deref().unwrap_or("")),
+                    csv_escape(&pin.source_kind),
+                    csv_escape(pin.label.as_deref().unwrap_or("")),
+                    csv_escape(&pin.added_at.to_rfc3339()),
+                    csv_escape(&pin.last_verified_at.map(|t| t.to_rfc3339()).unwrap_or_default()),
+                    csv_escape(&pin.last_repaired_at.map(|t| t.to_rfc3339()).unwrap_or_default()),
+                    pin.verify_count, pin.repair_count, pin.sync_count,
+                    csv_escape(pin.last_error.as_deref().unwrap_or("")),
+                    csv_escape(pin.error_category.as_deref().unwrap_or("")),
+                    pin.retry_attempts, pin.remote_pinned,
+                    csv_escape(pin.remote_pin_service.as_deref().unwrap_or("")),
+                    csv_escape(&pin.custom_tags.join(";")),
+                    csv_escape(pin.sync_path.as_deref().unwrap_or("")),
+                ));
+            }
+            Ok((
+                StatusCode::OK,
+                [
+                    ("content-type", "text/csv; charset=utf-8"),
+                    ("content-disposition", "attachment; filename=\"foundation-share-bridge-pins.csv\""),
+                ],
+                body,
+            ).into_response())
+        }
+        _ => {
+            let json = serde_json::to_vec_pretty(&snapshot)
+                .map_err(|err| AppError::internal(anyhow!("Unable to encode pins: {err}")))?;
+            Ok((
+                StatusCode::OK,
+                [
+                    ("content-type", "application/json"),
+                    ("content-disposition", "attachment; filename=\"foundation-share-bridge-pins.json\""),
+                ],
+                json,
+            ).into_response())
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtistSummary {
+    total_works_managed: usize,
+    works_by_you: usize,
+    artists_tracked: usize,
+    top_artists: Vec<ArtistEntry>,
+    total_copies_pinned: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ArtistEntry {
+    artist_username: String,
+    works: usize,
+}
+
+async fn artist_summary_handler(State(state): State<AppState>) -> Json<ArtistSummary> {
+    let persistent = state.persistent.read().await.clone();
+    let sessions = state.sessions.read().await.clone();
+    let mut artist_counts: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut works_by_group: HashSet<String> = HashSet::new();
+    let mut total_copies = 0_usize;
+    let current_username = sessions.values().filter_map(|s| s.profile_username.clone()).next();
+    let mut works_by_you = 0_usize;
+    for pin in persistent.watched_pins.values() {
+        total_copies += 1;
+        let group = inventory_work_group_key(pin).unwrap_or_else(|| pin.cid.clone());
+        if works_by_group.insert(group.clone()) {
+            let artist = pin.artist_username.clone().unwrap_or_else(|| "unknown".to_string());
+            artist_counts.entry(artist).or_default().insert(group.clone());
+            if let Some(me) = current_username.as_deref() {
+                if pin.artist_username.as_deref().map(|v| v.eq_ignore_ascii_case(me)).unwrap_or(false) {
+                    works_by_you += 1;
+                }
+            }
+        }
+    }
+    let artists_tracked = artist_counts.len();
+    let mut top_artists: Vec<ArtistEntry> = artist_counts.into_iter()
+        .map(|(username, works)| ArtistEntry { artist_username: username, works: works.len() })
+        .collect();
+    top_artists.sort_by(|a, b| b.works.cmp(&a.works).then_with(|| a.artist_username.cmp(&b.artist_username)));
+    top_artists.truncate(5);
+    Json(ArtistSummary {
+        total_works_managed: works_by_group.len(),
+        works_by_you,
+        artists_tracked,
+        top_artists,
+        total_copies_pinned: total_copies,
     })
 }
 
