@@ -5,7 +5,10 @@
 use anyhow::{Context, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use tokio::time::{Duration, sleep};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
+};
 use tracing::{info, warn};
 
 use crate::{
@@ -25,7 +28,46 @@ use crate::{
         },
         system::service::notify_work_share_success,
     },
+    util::text::is_valid_cid,
 };
+
+/// Prefix matched in `spawn_relay_socket_loop` to detect a server-initiated
+/// force-disconnect. Keep this literal stable with the `anyhow!` message below.
+const FORCE_DISCONNECT_ERROR_PREFIX: &str = "Archive relay disconnected";
+
+/// Enforce hard size limits on relay share-work payload fields before the
+/// pin pipeline sees them. Prevents an attacker who has already compromised
+/// the relay server from pushing oversize / malformed values into the local
+/// filesystem, logs, and notification OS APIs.
+fn validate_share_work_payload(payload: &RelayShareWorkPayload) -> anyhow::Result<()> {
+    if payload.title.len() > 512 {
+        return Err(anyhow!("SHARE_WORK title exceeds 512 bytes"));
+    }
+    if payload.contract_address.len() > 128 {
+        return Err(anyhow!("SHARE_WORK contract_address exceeds 128 bytes"));
+    }
+    if payload.token_id.len() > 128 {
+        return Err(anyhow!("SHARE_WORK token_id exceeds 128 bytes"));
+    }
+    if let Some(artist) = payload.artist_username.as_deref()
+        && artist.len() > 256
+    {
+        return Err(anyhow!("SHARE_WORK artist_username exceeds 256 bytes"));
+    }
+    if let Some(cid) = payload.metadata_cid.as_deref()
+        && !cid.trim().is_empty()
+        && !is_valid_cid(cid)
+    {
+        return Err(anyhow!("SHARE_WORK metadata_cid is not a valid CID"));
+    }
+    if let Some(cid) = payload.media_cid.as_deref()
+        && !cid.trim().is_empty()
+        && !is_valid_cid(cid)
+    {
+        return Err(anyhow!("SHARE_WORK media_cid is not a valid CID"));
+    }
+    Ok(())
+}
 
 pub fn spawn_relay_socket_loop(state: AppState) {
     tokio::spawn(async move {
@@ -49,12 +91,16 @@ pub fn spawn_relay_socket_loop(state: AppState) {
                     sleep(Duration::from_secs(2)).await;
                 }
                 Err(error) => {
+                    let force_disconnect =
+                        error.to_string().starts_with(FORCE_DISCONNECT_ERROR_PREFIX);
                     warn!("relay socket cycle failed: {error}");
                     if state.config.read().await.relay_enabled {
                         let _ = remember_relay_error(&state, error.to_string()).await;
                     }
-                    sleep(Duration::from_secs(backoff_seconds)).await;
-                    backoff_seconds = (backoff_seconds * 2).min(30);
+                    let delay = if force_disconnect { 30 } else { backoff_seconds };
+                    sleep(Duration::from_secs(delay)).await;
+                    backoff_seconds =
+                        if force_disconnect { 2 } else { (backoff_seconds * 2).min(30) };
                 }
             }
         }
@@ -70,9 +116,20 @@ async fn run_relay_socket_session(state: &AppState) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow!("Relay device token is missing"))?;
 
     let socket_url = build_relay_socket_url(&config.relay_server_url, &device_token)?;
-    let (mut socket, response) = connect_async(socket_url.as_str())
-        .await
-        .context("Unable to connect to the archive relay websocket")?;
+    // Defense-in-depth: send the device token both in the query string (for
+    // back-compat with relay servers that still look at `?deviceToken=`) and
+    // in an `Authorization: Bearer` header. A future server-side upgrade can
+    // drop the query-string variant.
+    let mut request = socket_url
+        .as_str()
+        .into_client_request()
+        .context("Unable to build relay websocket client request")?;
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {device_token}").parse().context("Unable to encode relay auth header")?,
+    );
+    let (mut socket, response) =
+        connect_async(request).await.context("Unable to connect to the archive relay websocket")?;
 
     remember_relay_success(
         state,
@@ -109,13 +166,18 @@ async fn run_relay_socket_session(state: &AppState) -> anyhow::Result<()> {
                                 let input = serde_json::from_str::<RelayShareWorkPayload>(
                                     &payload.payload,
                                 )?;
-                                let work_title = input.title.clone();
-                                let pins = pin_work_payload(state, input)
-                                    .await
-                                    .map_err(|error| anyhow!(error.message))?;
-                                notify_work_share_success(&work_title, pins.len());
-                                serde_json::to_string(&serde_json::json!({ "pins": pins }))
-                                    .map_err(anyhow::Error::from)
+                                match validate_share_work_payload(&input) {
+                                    Ok(()) => {
+                                        let work_title = input.title.clone();
+                                        let pins = pin_work_payload(state, input)
+                                            .await
+                                            .map_err(|error| anyhow!(error.message))?;
+                                        notify_work_share_success(&work_title, pins.len());
+                                        serde_json::to_string(&serde_json::json!({ "pins": pins }))
+                                            .map_err(anyhow::Error::from)
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             }
                             "UPDATE_CONFIG" => {
                                 let input = serde_json::from_str::<
@@ -169,7 +231,7 @@ async fn run_relay_socket_session(state: &AppState) -> anyhow::Result<()> {
                         let payload = serde_json::from_value::<RelayForceDisconnectMessage>(value)?;
                         clear_relay_link(state).await?;
                         return Err(anyhow!(
-                            "Archive relay disconnected this desktop app: {}",
+                            "{FORCE_DISCONNECT_ERROR_PREFIX} this desktop app: {}",
                             payload.reason.unwrap_or_else(|| "connection closed".to_string())
                         ));
                     }

@@ -52,3 +52,18 @@ pub fn escape_xml_text(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
+
+/// Defang user-supplied text for `notify-send` on Linux. libnotify does not
+/// interpret body markup unless the `body-markup` hint is set, and `notify-send`
+/// passes args as argv (not a shell), so there is no shell-injection surface.
+/// This helper still strips the three markup-relevant characters and any
+/// control characters so a pathological title renders cleanly on themes that
+/// do enable markup.
+#[cfg(target_os = "linux")]
+pub fn escape_linux_notification_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .filter(|c| !matches!(c, '<' | '>' | '&'))
+        .collect()
+}

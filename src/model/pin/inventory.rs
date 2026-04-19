@@ -131,9 +131,15 @@ pub fn build_single_inventory_item(
         repair_count: source.watched.repair_count,
         sync_path: source.watched.sync_path,
         local_gateway_url: Some(build_gateway_url(&config.local_gateway_base_url, &cid)),
-        public_gateway_url: Some(build_gateway_url(&effective_public_gateway_base_url(config), &cid)),
+        public_gateway_url: Some(build_gateway_url(
+            &effective_public_gateway_base_url(config),
+            &cid,
+        )),
         preview_local_gateway_url: Some(build_gateway_url(&config.local_gateway_base_url, &cid)),
-        preview_public_gateway_url: Some(build_gateway_url(&effective_public_gateway_base_url(config), &cid)),
+        preview_public_gateway_url: Some(build_gateway_url(
+            &effective_public_gateway_base_url(config),
+            &cid,
+        )),
         media_kind: None,
         metadata_view: None,
         metadata_cid: None,

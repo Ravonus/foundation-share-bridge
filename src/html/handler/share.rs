@@ -62,6 +62,8 @@ pub async fn share_work_view(
       {details}
 
       <form method="post" action="/share/work/form" class="btn-row" style="margin-top: 24px;">
+        <!-- session_secret in a hidden field is not CSRF-vulnerable - the attacker
+             would need to already know the secret to inject it into the GET query. -->
         <input type="hidden" name="session_secret" value="{secret}" />
         <input type="hidden" name="title" value="{title_h}" />
         <input type="hidden" name="contract_address" value="{contract}" />

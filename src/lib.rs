@@ -25,6 +25,9 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Serialize;
 use tokio::{net::TcpListener, sync::RwLock};
+use tower_governor::{
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+};
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
     trace::TraceLayer,
@@ -207,6 +210,29 @@ fn bridge_cors_layer() -> CorsLayer {
         .allow_credentials(false)
 }
 
+/// Build the per-IP rate-limit layer. 30-request burst, refilled at 5 rps
+/// per source IP — sized for the archive site's normal call pattern (health
+/// polling + inventory pagination) but choking anything that floods. Uses
+/// [`SmartIpKeyExtractor`] so forwarded headers are honored when the bridge
+/// is reached through a trusted proxy / Cloudflare tunnel, falling back to
+/// the raw connect-info IP otherwise.
+///
+/// Returns the [`GovernorLayer`] ready to plug into an [`axum::Router`]; the
+/// `RespBody` generic is inferred as `axum::body::Body` at the router call
+/// site. `expect` is used on the builder because the hardcoded 5 rps / 30
+/// burst values cannot fail to validate.
+#[allow(clippy::expect_used)]
+fn bridge_governor_layer()
+-> GovernorLayer<SmartIpKeyExtractor, governor::middleware::NoOpMiddleware, axum::body::Body> {
+    let config = GovernorConfigBuilder::default()
+        .per_second(5)
+        .burst_size(30)
+        .key_extractor(SmartIpKeyExtractor)
+        .finish()
+        .expect("governor config is valid");
+    GovernorLayer::new(config)
+}
+
 /// Start the HTTP server. Invoked from `src/main.rs` after tracing init.
 ///
 /// Honours env vars `BRIDGE_HOST`, `BRIDGE_PORT`, `IPFS_API_URL`,
@@ -307,6 +333,9 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/share/work/form", post(share_work_form))
         .route("/share/profile", post(share_profile))
         .layer(bridge_cors_layer())
+        // Per-IP rate limit. Placed after CORS so 429 responses still carry
+        // CORS headers when the archive site gets throttled.
+        .layer(bridge_governor_layer())
         .layer(middleware::map_response(add_private_network_access_header))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -316,7 +345,13 @@ pub async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("Unable to bind bridge listener on {address}"))?;
 
     info!("foundation-share-bridge listening on http://{address}");
-    axum::serve(listener, app).await.context("Bridge server stopped unexpectedly")?;
+    // `into_make_service_with_connect_info::<SocketAddr>()` is required so
+    // the per-IP rate limiter can fall back to the raw connect-info IP when
+    // no `X-Forwarded-For` / `Forwarded` / `X-Real-IP` header is present
+    // (i.e. for direct browser hits to the loopback listener).
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .context("Bridge server stopped unexpectedly")?;
 
     Ok(())
 }

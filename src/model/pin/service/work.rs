@@ -251,10 +251,9 @@ pub async fn build_work_inventory_item(
             .local_open_url
             .clone()
             .or_else(|| Some(build_gateway_url(&config.local_gateway_base_url, &primary_cid))),
-        public_gateway_url: display
-            .public_open_url
-            .clone()
-            .or_else(|| Some(build_gateway_url(&effective_public_gateway_base_url(config), &primary_cid))),
+        public_gateway_url: display.public_open_url.clone().or_else(|| {
+            Some(build_gateway_url(&effective_public_gateway_base_url(config), &primary_cid))
+        }),
         preview_local_gateway_url: display.preview_local_url.clone(),
         preview_public_gateway_url: display.preview_public_url.clone(),
         media_kind: display.media_kind.clone(),

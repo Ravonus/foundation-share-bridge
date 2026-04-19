@@ -95,9 +95,11 @@ pub async fn show_backup_notification(body: &str) -> anyhow::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        let safe_body = crate::util::text::escape_linux_notification_text(body);
         let status = TokioCommand::new("notify-send")
+            .arg("--")
             .arg("Foundation Share Bridge")
-            .arg(body)
+            .arg(&safe_body)
             .status()
             .await
             .context("Unable to launch Linux notification command")?;

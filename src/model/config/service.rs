@@ -94,15 +94,11 @@ pub async fn load_bridge_config(path: &Path, state_file: &Path) -> anyhow::Resul
 /// configured gateway URL — outgoing share links point at the tunnel
 /// automatically.
 pub fn effective_public_gateway_base_url(config: &BridgeConfig) -> String {
-    if config.tunnel_enabled {
-        if let Some(host) = config
-            .tunnel_hostname
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return format!("https://{host}");
-        }
+    if config.tunnel_enabled
+        && let Some(host) =
+            config.tunnel_hostname.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    {
+        return format!("https://{host}");
     }
     config.public_gateway_base_url.clone()
 }

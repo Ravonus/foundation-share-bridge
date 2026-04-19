@@ -10,6 +10,7 @@ use std::{collections::HashMap, path::Path, time::Duration};
 use anyhow::{Context, anyhow};
 use async_recursion::async_recursion;
 use chrono::Utc;
+use futures_util::StreamExt;
 use tokio::fs;
 
 use crate::{
@@ -61,17 +62,33 @@ pub async fn fetch_ipfs_text(state: &AppState, ipfs_path: &str) -> anyhow::Resul
         return Ok(None);
     }
 
-    let body = response.bytes().await?;
-    if body.is_empty() {
+    // Stream rather than `.bytes().await` so a malicious / oversized IPFS blob
+    // can't fill RAM before being truncated. Stop after
+    // `MAX_DISCOVERY_TEXT_BYTES` regardless of how much more is coming.
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::with_capacity(MAX_DISCOVERY_TEXT_BYTES.min(65536));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Unable to read IPFS text response chunk")?;
+        let remaining = MAX_DISCOVERY_TEXT_BYTES.saturating_sub(buffer.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = chunk.len().min(remaining);
+        buffer.extend_from_slice(&chunk[..take]);
+        if buffer.len() >= MAX_DISCOVERY_TEXT_BYTES {
+            break;
+        }
+    }
+
+    if buffer.is_empty() {
         return Ok(None);
     }
 
-    let bounded = &body[..body.len().min(MAX_DISCOVERY_TEXT_BYTES)];
-    if bounded.contains(&0) {
+    if buffer.contains(&0) {
         return Ok(None);
     }
 
-    Ok(Some(String::from_utf8_lossy(bounded).into_owned()))
+    Ok(Some(String::from_utf8_lossy(&buffer).into_owned()))
 }
 
 pub async fn fetch_ipfs_json(
