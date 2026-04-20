@@ -70,7 +70,7 @@ async fn run_tunnel_supervisor(state: AppState) {
     let mut provision_backoff = 2u64;
 
     loop {
-        let (enabled, device_token, relay_server_url, token_in_config, local_service) = {
+        let (enabled, device_token, relay_server_url, token_in_config, local_service, needs_libp2p_refresh) = {
             let config = state.config.read().await;
             (
                 config.tunnel_enabled,
@@ -78,6 +78,10 @@ async fn run_tunnel_supervisor(state: AppState) {
                 config.relay_server_url.clone(),
                 config.tunnel_token.clone(),
                 config.local_gateway_base_url.clone(),
+                // Older tunnels were provisioned before the libp2p hostname
+                // existed — re-hit provision so the archive backfills the
+                // new ingress rule + returns the libp2p hostname.
+                config.libp2p_hostname.is_none(),
             )
         };
 
@@ -118,16 +122,17 @@ async fn run_tunnel_supervisor(state: AppState) {
             continue;
         };
 
-        // Ensure we have a token + hostname. Provision if missing.
-        let tunnel_token = if let Some(existing) = token_in_config {
-            existing
-        } else {
+        // Ensure we have a token + hostname. Provision when missing OR when
+        // the persisted config predates the libp2p hostname — the archive
+        // provisioner is idempotent and returns the full status each call.
+        let need_provision_call = token_in_config.is_none() || needs_libp2p_refresh;
+        let tunnel_token = if need_provision_call {
             match provision_tunnel(&state, &relay_server_url, device_token, &local_service).await {
                 Ok(provisioned) => {
                     apply_provisioned(&state, &provisioned).await;
                     let _ = persist_bridge_config(&state).await;
                     provision_backoff = 2;
-                    match provisioned.tunnel_token {
+                    match provisioned.tunnel_token.or(token_in_config.clone()) {
                         Some(token) => token,
                         None => {
                             sleep(Duration::from_secs(provision_backoff)).await;
@@ -138,11 +143,20 @@ async fn run_tunnel_supervisor(state: AppState) {
                 Err(error) => {
                     warn!("tunnel provision failed: {error}");
                     write_tunnel_error(&state, format!("provision failed: {error}")).await;
-                    sleep(Duration::from_secs(provision_backoff)).await;
-                    provision_backoff = (provision_backoff * 2).min(60);
-                    continue;
+                    // If we already have a token, keep using it — we just
+                    // couldn't refresh libp2p state this cycle.
+                    match token_in_config {
+                        Some(existing) => existing,
+                        None => {
+                            sleep(Duration::from_secs(provision_backoff)).await;
+                            provision_backoff = (provision_backoff * 2).min(60);
+                            continue;
+                        }
+                    }
                 }
             }
+        } else {
+            token_in_config.unwrap_or_default()
         };
 
         // Ensure cloudflared is running.
