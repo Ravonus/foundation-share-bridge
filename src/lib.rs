@@ -45,6 +45,7 @@ use crate::{
         share::{share_work_form, share_work_view},
     },
     model::{
+        catalog::handler::{archive_all_for_artist, archive_all_for_artist_form},
         config::{
             BridgeConfig, BridgePersistentState, bridge_config_uses_yaml,
             handler::{get_config, update_config, update_config_form},
@@ -55,8 +56,8 @@ use crate::{
         },
         pin::service::{
             handler::{
-                add_files, diagnose_single_pin, list_pins, list_pins_page, pin_cid, repair_now,
-                retry_pin_now, retry_sync_single, set_pin_tags, sync_now, unwatch_pins,
+                add_files, add_files_form, diagnose_single_pin, list_pins, list_pins_page, pin_cid,
+                repair_now, retry_pin_now, retry_sync_single, set_pin_tags, sync_now, unwatch_pins,
                 verify_pins, verify_single_pin,
             },
             lifecycle::spawn_repair_loop,
@@ -72,7 +73,10 @@ use crate::{
         },
         session::{
             BridgeSession,
-            handler::{connect_session, disconnect_session, list_sessions, session_by_id},
+            handler::{
+                connect_session, disconnect_session, disconnect_session_by_id,
+                disconnect_session_by_id_form, list_sessions, session_by_id,
+            },
         },
         system::handler::{
             add_private_network_access_header, artist_summary_handler, export_pins_handler,
@@ -272,6 +276,11 @@ pub async fn run() -> anyhow::Result<()> {
     let persistent = load_persistent_state(&state_file).await?;
     let config = load_bridge_config(&config_file, &state_file).await?;
 
+    // Hydrate the in-memory session map from whatever survived the last run
+    // so the archive site's auto-reconnect reuses the deterministic session
+    // instead of minting a fresh one.
+    let sessions = persistent.sessions.clone();
+
     let state = AppState {
         http: Client::builder()
             .user_agent("foundation-share-bridge/0.1")
@@ -282,7 +291,7 @@ pub async fn run() -> anyhow::Result<()> {
         state_file,
         config_file,
         repair_interval_seconds,
-        sessions: Arc::new(RwLock::new(HashMap::new())),
+        sessions: Arc::new(RwLock::new(sessions)),
         persistent: Arc::new(RwLock::new(persistent)),
         config: Arc::new(RwLock::new(config)),
         operation: Arc::new(RwLock::new(OperationStatus::idle())),
@@ -304,6 +313,11 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/session/connect", post(connect_session))
         .route("/session/disconnect", post(disconnect_session))
         .route("/session/{session_id}", get(session_by_id))
+        .route("/session/{session_id}/disconnect", post(disconnect_session_by_id))
+        .route(
+            "/session/{session_id}/disconnect/form",
+            post(disconnect_session_by_id_form),
+        )
         .route("/config", get(get_config).post(update_config))
         .route("/settings/form", post(update_config_form))
         .route("/relay/link", post(link_relay_device))
@@ -328,6 +342,15 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/sync/run", post(sync_now))
         .route("/ipfs/pin", post(pin_cid))
         .route("/ipfs/add", post(add_files).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)))
+        .route(
+            "/ipfs/add/form",
+            post(add_files_form).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
+        .route("/artists/{username}/archive-all", post(archive_all_for_artist))
+        .route(
+            "/artists/archive-all/form",
+            post(archive_all_for_artist_form),
+        )
         .route("/share/work", post(share_work))
         .route("/share/work/view", get(share_work_view))
         .route("/share/work/form", post(share_work_form))

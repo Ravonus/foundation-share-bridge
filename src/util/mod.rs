@@ -7,5 +7,6 @@
 pub mod data;
 pub mod file;
 pub mod format;
+pub mod machine;
 pub mod text;
 pub mod url;

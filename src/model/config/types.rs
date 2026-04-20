@@ -24,7 +24,10 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::model::pin::WatchedPin;
+use crate::{
+    model::{pin::WatchedPin, session::types::BridgeSession},
+    util::machine::default_device_label,
+};
 
 /// Default relay server URL used when nothing else is configured.
 pub const DEFAULT_RELAY_SERVER_URL: &str = "https://foundation.agorix.io";
@@ -35,6 +38,11 @@ pub struct BridgePersistentState {
     pub updated_at: Option<DateTime<Utc>>,
     pub last_repair_cycle_at: Option<DateTime<Utc>>,
     pub repair_cycle_count: u64,
+    /// Sessions keyed by `session_secret`. Persisted so the archive site can
+    /// auto-reconnect to the same session after the bridge restarts instead
+    /// of creating a fresh pair every page load.
+    #[serde(default)]
+    pub sessions: HashMap<String, BridgeSession>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +175,10 @@ pub struct RootPageQuery {
     pub linked: Option<String>,
     pub unlinked: Option<String>,
     pub error: Option<String>,
+    /// Flash value: the handle we just kicked an archive-all run for.
+    pub archiving: Option<String>,
+    /// Flash value: the root CID produced by the most recent manual upload.
+    pub uploaded: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,7 +239,7 @@ pub fn default_bridge_config(state_file: &Path) -> BridgeConfig {
         relay_device_name: env::var("BRIDGE_DEVICE_NAME")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "Foundation desktop helper".to_string()),
+            .unwrap_or_else(default_device_label),
         relay_device_id: None,
         relay_device_label: None,
         relay_device_token: None,

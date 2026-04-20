@@ -8,10 +8,13 @@ use anyhow::anyhow;
 use axum::{
     Json,
     extract::{Multipart, Path as AxumPath, Query, State},
+    response::Redirect,
 };
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
 use tracing::warn;
+
+use crate::util::url::encode_query_component;
 
 use crate::{
     AppError, AppState,
@@ -194,10 +197,14 @@ pub async fn pin_cid(
     Ok(Json(result))
 }
 
-pub async fn add_files(
-    State(state): State<AppState>,
-    mut multipart: Multipart,
-) -> Result<Json<AddFilesResult>, AppError> {
+struct ParsedUpload {
+    session_secret: Option<String>,
+    label: Option<String>,
+    files: Vec<(String, Vec<u8>)>,
+    total_bytes: u64,
+}
+
+async fn parse_upload_multipart(mut multipart: Multipart) -> Result<ParsedUpload, AppError> {
     let mut session_secret: Option<String> = None;
     let mut label: Option<String> = None;
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
@@ -247,11 +254,20 @@ pub async fn add_files(
         }
     }
 
-    let secret = session_secret
-        .as_deref()
-        .ok_or_else(|| AppError::unauthorized("session_secret is required to upload files"))?;
-    validate_session(&state, secret).await?;
+    Ok(ParsedUpload {
+        session_secret,
+        label,
+        files,
+        total_bytes,
+    })
+}
 
+async fn ingest_uploaded_files(
+    state: &AppState,
+    label: Option<String>,
+    mut files: Vec<(String, Vec<u8>)>,
+    total_bytes: u64,
+) -> Result<AddFilesResult, AppError> {
     if files.is_empty() {
         return Err(AppError::bad_request(
             "At least one file is required. Use form field name `file` or `files`.",
@@ -363,7 +379,7 @@ pub async fn add_files(
     };
 
     remember_watched_pin(
-        &state,
+        state,
         WatchPinInput {
             cid: root_cid.clone(),
             label: derived_label.clone(),
@@ -383,11 +399,11 @@ pub async fn add_files(
     )
     .await?;
 
-    if let Err(error) = sync_cid_if_enabled(&state, &root_cid).await {
+    if let Err(error) = sync_cid_if_enabled(state, &root_cid).await {
         warn!("sync after upload failed for {}: {}", root_cid, error);
     }
 
-    Ok(Json(AddFilesResult {
+    Ok(AddFilesResult {
         root_cid: root_cid.clone(),
         label: derived_label,
         pinned: true,
@@ -398,7 +414,45 @@ pub async fn add_files(
         total_bytes,
         wrapped: wrap,
         entries,
-    }))
+    })
+}
+
+pub async fn add_files(
+    State(state): State<AppState>,
+    multipart: Multipart,
+) -> Result<Json<AddFilesResult>, AppError> {
+    let parsed = parse_upload_multipart(multipart).await?;
+
+    let secret = parsed
+        .session_secret
+        .as_deref()
+        .ok_or_else(|| AppError::unauthorized("session_secret is required to upload files"))?;
+    validate_session(&state, secret).await?;
+
+    let result =
+        ingest_uploaded_files(&state, parsed.label, parsed.files, parsed.total_bytes).await?;
+    Ok(Json(result))
+}
+
+/// Form-based upload used by the bridge's own HTML UI. The server only binds
+/// to loopback + CORS blocks cross-origin submissions, so skipping the
+/// session check is fine — no remote caller can reach this route.
+pub async fn add_files_form(
+    State(state): State<AppState>,
+    multipart: Multipart,
+) -> Result<Redirect, AppError> {
+    let parsed = parse_upload_multipart(multipart).await?;
+
+    match ingest_uploaded_files(&state, parsed.label, parsed.files, parsed.total_bytes).await {
+        Ok(result) => Ok(Redirect::to(&format!(
+            "/?uploaded={}",
+            encode_query_component(&result.root_cid),
+        ))),
+        Err(error) => Ok(Redirect::to(&format!(
+            "/?error={}",
+            encode_query_component(&error.message),
+        ))),
+    }
 }
 
 pub async fn diagnose_single_pin(

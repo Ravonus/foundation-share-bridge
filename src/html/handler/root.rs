@@ -1,6 +1,8 @@
 //! HTML handler for the bridge root (`GET /`) page.
 #![allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::pedantic, clippy::nursery)]
 
+use std::collections::HashMap;
+
 use axum::{
     extract::{Query, State},
     response::Html,
@@ -27,6 +29,7 @@ use crate::{
             service::list_local_pin_inventory,
         },
         relay::relay_is_connected,
+        session::types::BridgeSession,
         system::service::build_storage_snapshot,
     },
     util::{
@@ -34,6 +37,85 @@ use crate::{
         text::escape_html,
     },
 };
+
+/// Upload card — lets the local UI drop files that aren't on Foundation into
+/// the bridge's IPFS node. Loopback-trusted (server binds 127.0.0.1 + CORS).
+fn render_upload_card() -> &'static str {
+    r#"<section id="upload" class="card">
+  <p class="eyebrow">Upload &amp; pin</p>
+  <h2 style="margin-top:8px;">Pin your own files on this node</h2>
+  <p class="muted settings-copy">Drop one or more files here. The bridge wraps multi-file uploads in a directory and keeps the root CID pinned forever. Use this for anything that isn't already on Foundation.</p>
+  <form action="/ipfs/add/form" method="post" enctype="multipart/form-data" class="upload-form">
+    <label class="field">
+      <span>Label (optional)</span>
+      <input name="label" placeholder="e.g. Studio archive 2026" autocomplete="off" />
+    </label>
+    <label class="field">
+      <span>Files</span>
+      <input type="file" name="file" multiple required />
+    </label>
+    <div class="btn-row">
+      <button type="submit" class="btn">Upload &amp; pin</button>
+    </div>
+  </form>
+</section>"#
+}
+
+/// Render a card listing every active session with a disconnect button so
+/// stale links can be pruned from the local UI. `selected` highlights the
+/// session the user opened via `?session_id=` from the archive site.
+fn render_sessions_card(
+    sessions: &HashMap<String, BridgeSession>,
+    selected: Option<&BridgeSession>,
+) -> String {
+    if sessions.is_empty() {
+        return r#"<section class="card">
+  <p class="eyebrow">Sessions</p>
+  <h2>No archive sites connected</h2>
+  <p class="muted" style="margin-top: 10px;">Sessions show up here after the archive site hands off a share.</p>
+</section>"#
+            .to_string();
+    }
+
+    let mut entries: Vec<&BridgeSession> = sessions.values().collect();
+    entries.sort_by(|a, b| b.connected_at.cmp(&a.connected_at));
+
+    let rows = entries
+        .into_iter()
+        .map(|session| {
+            let is_selected = selected.map(|s| s.session_id == session.session_id).unwrap_or(false);
+            format!(
+                r#"<li class="session-row{selected_cls}">
+  <div class="session-meta">
+    <p class="session-origin">{origin}</p>
+    <p class="session-started muted">Started {started}</p>
+    <p class="session-id muted"><code>{id}</code></p>
+  </div>
+  <form action="/session/{id_attr}/disconnect/form" method="post" class="session-delete">
+    <button type="submit" class="btn ghost">Delete</button>
+  </form>
+</li>"#,
+                selected_cls = if is_selected { " selected" } else { "" },
+                origin = escape_html(&session.website_origin),
+                started = escape_html(&format_timestamp(session.connected_at)),
+                id = escape_html(&session.session_id),
+                id_attr = escape_html(&session.session_id),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"<section class="card">
+  <p class="eyebrow">Sessions</p>
+  <h2>Connected archive sites</h2>
+  <p class="muted" style="margin-top: 10px;">Delete any rows that belong to tabs, origins, or machines you don't use anymore.</p>
+  <ul class="session-list">
+{rows}
+  </ul>
+</section>"#,
+    )
+}
 
 pub async fn root_page(
     State(state): State<AppState>,
@@ -154,29 +236,23 @@ pub async fn root_page(
     } else if query.unlinked.as_deref() == Some("1") {
         r#"<div class="flash warn">Archive relay disconnected on this desktop app.</div>"#
             .to_string()
+    } else if let Some(username) = query.archiving.as_deref() {
+        format!(
+            r#"<div class="flash ok">Archiving everything by @{}. The live-status panel below shows progress.</div>"#,
+            escape_html(username),
+        )
+    } else if let Some(cid) = query.uploaded.as_deref() {
+        format!(
+            r#"<div class="flash ok">Upload pinned as <code>{}</code>. It will survive future repair cycles.</div>"#,
+            escape_html(cid),
+        )
     } else if let Some(error) = query.error.as_deref() {
         format!(r#"<div class="flash err">{}</div>"#, escape_html(error))
     } else {
         String::new()
     };
 
-    let session_block = selected_session
-        .map(|session| {
-            format!(
-                r#"<section class="card">
-  <p class="eyebrow">Session</p>
-  <h2>{id}</h2>
-  <dl class="kv" style="margin-top: 14px;">
-    <dt>Origin</dt><dd>{origin}</dd>
-    <dt>Started</dt><dd>{started}</dd>
-  </dl>
-</section>"#,
-                id = escape_html(&session.session_id),
-                origin = escape_html(&session.website_origin),
-                started = escape_html(&format_timestamp(session.connected_at))
-            )
-        })
-        .unwrap_or_default();
+    let session_block = render_sessions_card(&sessions, selected_session.as_ref());
 
     let connection_status = if relay_connected { "Live" } else { "Not linked" };
     let connection_pill_class = if relay_connected { "pill ok" } else { "pill" };
@@ -263,6 +339,7 @@ pub async fn root_page(
     };
     let gateway_card = render_gateway_card(&config);
     let export_card = render_export_card();
+    let upload_card = render_upload_card();
     let live_status_block = {
         let op_guard = state.operation.read().await;
         render_live_status_panel(&op_guard)
@@ -319,6 +396,8 @@ pub async fn root_page(
 
     {artist_summary_html}
 
+    {upload_card}
+
     <section id="inventory">
       <div class="section-head" style="border-bottom: 0; padding-bottom: 0;">
         <p class="eyebrow">Local inventory</p>
@@ -351,6 +430,7 @@ pub async fn root_page(
         connection = connection_block,
         session = session_block,
         artist_summary_html = artist_summary_html,
+        upload_card = upload_card,
         inventory_body = inventory_body,
         gateway_card = gateway_card,
         export_card = export_card,
