@@ -163,6 +163,32 @@ fn merge_unique(existing: &[String], additional: &str) -> Option<Vec<String>> {
     Some(next)
 }
 
+/// Sync the announce list so `keeper` is present while every older
+/// `libp2p-*.agorix.io` ingress (from a previous provisioning run) is
+/// dropped. Returns `Some(new_list)` only when the list changes.
+fn reconcile_libp2p_announce(existing: &[String], keeper: &str) -> Option<Vec<String>> {
+    let filtered: Vec<String> = existing
+        .iter()
+        .filter(|entry| {
+            // Keep anything that isn't one of our managed wss ingresses,
+            // plus the current keeper. Stale `libp2p-*.agorix.io/tcp/443/tls/ws`
+            // lines get trimmed.
+            let is_managed = entry.contains("/dns4/libp2p-")
+                && entry.contains(".agorix.io/")
+                && entry.contains("/tls/ws/");
+            !is_managed || entry.as_str() == keeper
+        })
+        .cloned()
+        .collect();
+
+    let mut next = filtered.clone();
+    if !next.iter().any(|entry| entry == keeper) {
+        next.push(keeper.to_string());
+    }
+
+    if next == existing.to_vec() { None } else { Some(next) }
+}
+
 /// Ensure Kubo is set up to (a) listen for WS libp2p on the proxied local
 /// port and (b) advertise the public WSS multiaddr to the DHT. Returns
 /// `true` when the config was mutated and Kubo needs a restart to activate
@@ -196,7 +222,7 @@ pub async fn ensure_kubo_wss_advertisement(state: &AppState) -> anyhow::Result<b
     }
 
     let current_announce = fetch_kubo_config_array(state, "Addresses.AppendAnnounce").await?;
-    if let Some(next) = merge_unique(&current_announce, &announce_addr) {
+    if let Some(next) = reconcile_libp2p_announce(&current_announce, &announce_addr) {
         write_kubo_config(state, "Addresses.AppendAnnounce", &next).await?;
         mutated = true;
     }

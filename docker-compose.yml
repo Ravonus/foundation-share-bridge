@@ -6,6 +6,10 @@ services:
     ports:
       - "127.0.0.1:5001:5001"
       - "127.0.0.1:8080:8080"
+      # WebSocket libp2p listener — the cloudflared ingress for
+      # libp2p-*.agorix.io forwards WSS → http://localhost:4002 so ipfs.io /
+      # dweb.link can dial this node even though 4001 is NAT-bound.
+      - "127.0.0.1:4002:4002"
     volumes:
       - ./data/kubo:/data/ipfs
     healthcheck:
