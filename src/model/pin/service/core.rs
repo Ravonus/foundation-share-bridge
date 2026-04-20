@@ -32,12 +32,93 @@ pub async fn pin_and_watch_cid(
     let result = pin_single_cid(state, &input.cid, input.label.clone()).await?;
     remember_watched_pin(state, input.clone(), Some(result.pin_reference.clone()), None, true)
         .await?;
-
-    if let Err(error) = sync_cid_if_enabled(state, &input.cid).await {
-        warn!("sync after pin failed for {}: {}", input.cid, error);
-    }
-
+    run_post_pin_side_effects(state, &input).await;
     Ok(result)
+}
+
+/// Fire-and-forget side effects that should not block the pin path: folder
+/// sync + eager replication to the configured remote pinning service. The
+/// tunnel makes this node reachable over HTTPS; libp2p stays behind NAT, so
+/// replication gives the pin a publicly-dialable provider the moment it
+/// lands here and ipfs.io / dweb.link start resolving it.
+async fn run_post_pin_side_effects(state: &AppState, input: &WatchPinInput) {
+    run_sync_side_effect(state, &input.cid).await;
+    run_remote_replication_side_effect(state, &input.cid, input.title.as_deref()).await;
+}
+
+async fn run_sync_side_effect(state: &AppState, cid: &str) {
+    if let Err(error) = sync_cid_if_enabled(state, cid).await {
+        warn!("sync after pin failed for {}: {}", cid, error);
+    }
+}
+
+async fn run_remote_replication_side_effect(
+    state: &AppState,
+    cid: &str,
+    name_hint: Option<&str>,
+) {
+    if let Err(error) = replicate_to_remote_service(state, cid, name_hint).await {
+        warn!("remote pin replication failed for {}: {error}", cid);
+    }
+}
+
+async fn replicate_to_remote_service(
+    state: &AppState,
+    cid: &str,
+    name_hint: Option<&str>,
+) -> anyhow::Result<()> {
+    let enabled = { state.config.read().await.remote_pinning_enabled };
+    if !enabled {
+        return Ok(());
+    }
+    let hint = name_hint.map(str::trim).filter(|value| !value.is_empty());
+    match submit_to_remote_pinning_service(state, cid, hint).await {
+        Ok(Some(service)) => {
+            info!("remote pin {} replicated via {} on first pin", cid, service);
+            mark_pin_remotely_replicated(state, cid, &service).await
+        }
+        Ok(None) => Ok(()),
+        Err(error) => {
+            mark_pin_remote_error(state, cid, &error.to_string()).await?;
+            Err(error)
+        }
+    }
+}
+
+async fn mark_pin_remotely_replicated(
+    state: &AppState,
+    cid: &str,
+    service: &str,
+) -> anyhow::Result<()> {
+    {
+        let mut persistent = state.persistent.write().await;
+        let now = Utc::now();
+        if let Some(existing) = persistent.watched_pins.get_mut(cid) {
+            existing.remote_pinned = true;
+            existing.remote_pin_service = Some(service.to_string());
+            existing.remote_pin_last_attempt_at = Some(now);
+            existing.remote_pin_last_error = None;
+        }
+        persistent.updated_at = Some(now);
+    }
+    persist_bridge_state(state).await
+}
+
+async fn mark_pin_remote_error(
+    state: &AppState,
+    cid: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    {
+        let mut persistent = state.persistent.write().await;
+        let now = Utc::now();
+        if let Some(existing) = persistent.watched_pins.get_mut(cid) {
+            existing.remote_pin_last_attempt_at = Some(now);
+            existing.remote_pin_last_error = Some(message.to_string());
+        }
+        persistent.updated_at = Some(now);
+    }
+    persist_bridge_state(state).await
 }
 
 // 5 args bundle the incoming pin request plus 4 identifying fields.
