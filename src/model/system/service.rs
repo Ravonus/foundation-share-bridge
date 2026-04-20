@@ -195,6 +195,12 @@ pub fn build_config_response(state: &AppState, config: &BridgeConfig) -> BridgeC
         tunnel_hostname: config.tunnel_hostname.clone(),
         tunnel_last_error: config.tunnel_last_error.clone(),
         tunnel_provisioned_at: config.tunnel_provisioned_at,
+        libp2p_hostname: config.libp2p_hostname.clone(),
+        libp2p_ws_local_port: config
+            .libp2p_ws_local_port
+            .unwrap_or(crate::model::relay::tunnel::kubo_announce::DEFAULT_LIBP2P_WS_PORT),
+        libp2p_last_error: config.libp2p_last_error.clone(),
+        libp2p_applied_at: config.libp2p_applied_at,
         config_file: state.config_file.display().to_string(),
         storage_quota_gb: config.storage_quota_gb,
         max_retry_attempts: config.max_retry_attempts,

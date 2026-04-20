@@ -71,6 +71,27 @@ pub struct BridgeConfig {
     pub tunnel_provisioned_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub tunnel_last_error: Option<String>,
+    /// Second subdomain the provisioning server allocates on the same
+    /// cloudflared tunnel. Traffic goes `wss://{this}` → cloudflared →
+    /// `http://127.0.0.1:{libp2p_ws_local_port}`, which is Kubo's
+    /// WebSocket libp2p listener. Once set, the bridge adds a
+    /// `/ip4/0.0.0.0/tcp/{libp2p_ws_local_port}/ws` Swarm listener and
+    /// announces `/dns4/{host}/tcp/443/tls/ws/p2p/{peer_id}` so ipfs.io /
+    /// dweb.link can dial in and fetch pinned content.
+    #[serde(default)]
+    pub libp2p_hostname: Option<String>,
+    #[serde(default)]
+    pub libp2p_subdomain: Option<String>,
+    /// Local TCP port Kubo listens on for WS libp2p. Defaults to 4002.
+    #[serde(default)]
+    pub libp2p_ws_local_port: Option<u16>,
+    /// Last error returned by the Kubo API while trying to sync the WS
+    /// listener + announce address. Surfaced on the settings page.
+    #[serde(default)]
+    pub libp2p_last_error: Option<String>,
+    /// Last time the libp2p public address was re-applied to Kubo.
+    #[serde(default)]
+    pub libp2p_applied_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub storage_quota_gb: Option<f64>,
     #[serde(default)]
@@ -105,6 +126,10 @@ pub struct BridgeConfigResponse {
     pub tunnel_hostname: Option<String>,
     pub tunnel_last_error: Option<String>,
     pub tunnel_provisioned_at: Option<DateTime<Utc>>,
+    pub libp2p_hostname: Option<String>,
+    pub libp2p_ws_local_port: u16,
+    pub libp2p_last_error: Option<String>,
+    pub libp2p_applied_at: Option<DateTime<Utc>>,
     pub config_file: String,
     pub storage_quota_gb: Option<f64>,
     pub max_retry_attempts: Option<u32>,
@@ -247,6 +272,11 @@ pub fn default_bridge_config(state_file: &Path) -> BridgeConfig {
         relay_last_error: None,
         tunnel_enabled: false,
         tunnel_hostname: None,
+        libp2p_hostname: None,
+        libp2p_subdomain: None,
+        libp2p_ws_local_port: None,
+        libp2p_last_error: None,
+        libp2p_applied_at: None,
         tunnel_subdomain: None,
         tunnel_token: None,
         tunnel_provisioned_at: None,

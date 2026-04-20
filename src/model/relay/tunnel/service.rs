@@ -23,7 +23,11 @@ use tracing::{info, warn};
 use crate::{
     AppState,
     model::{
-        config::service::persist_bridge_config, relay::tunnel::install::ensure_cloudflared_binary,
+        config::service::persist_bridge_config,
+        relay::tunnel::{
+            install::ensure_cloudflared_binary,
+            kubo_announce::try_ensure_kubo_wss_advertisement,
+        },
     },
 };
 
@@ -41,6 +45,10 @@ struct ProvisionResponse {
     subdomain: Option<String>,
     #[serde(rename = "tunnelToken")]
     tunnel_token: Option<String>,
+    #[serde(rename = "libp2pHostname", default)]
+    libp2p_hostname: Option<String>,
+    #[serde(rename = "libp2pSubdomain", default)]
+    libp2p_subdomain: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,6 +185,11 @@ async fn run_tunnel_supervisor(state: AppState) {
             }
         }
 
+        // Re-apply the Kubo WS listener + WSS announce every tick. Cheap to
+        // call when nothing's changed (GET + compare) and idempotent when
+        // the tunnel hostname is rotated or Kubo's config drifts.
+        try_ensure_kubo_wss_advertisement(&state).await;
+
         sleep(Duration::from_secs(3)).await;
     }
 }
@@ -248,6 +261,8 @@ async fn provision_tunnel(
         hostname: parsed.hostname,
         subdomain: parsed.subdomain,
         tunnel_token: parsed.tunnel_token,
+        libp2p_hostname: parsed.libp2p_hostname,
+        libp2p_subdomain: parsed.libp2p_subdomain,
     })
 }
 
@@ -290,6 +305,8 @@ struct ProvisionedTunnel {
     hostname: Option<String>,
     subdomain: Option<String>,
     tunnel_token: Option<String>,
+    libp2p_hostname: Option<String>,
+    libp2p_subdomain: Option<String>,
 }
 
 async fn apply_provisioned(state: &AppState, provisioned: &ProvisionedTunnel) {
@@ -299,6 +316,8 @@ async fn apply_provisioned(state: &AppState, provisioned: &ProvisionedTunnel) {
     config.tunnel_token = provisioned.tunnel_token.clone();
     config.tunnel_provisioned_at = Some(Utc::now());
     config.tunnel_last_error = None;
+    config.libp2p_hostname = provisioned.libp2p_hostname.clone();
+    config.libp2p_subdomain = provisioned.libp2p_subdomain.clone();
 }
 
 async fn clear_tunnel_fields_in_config(state: &AppState) {
@@ -308,6 +327,10 @@ async fn clear_tunnel_fields_in_config(state: &AppState) {
     config.tunnel_token = None;
     config.tunnel_provisioned_at = None;
     config.tunnel_last_error = None;
+    config.libp2p_hostname = None;
+    config.libp2p_subdomain = None;
+    config.libp2p_last_error = None;
+    config.libp2p_applied_at = None;
 }
 
 async fn write_tunnel_error(state: &AppState, message: String) {

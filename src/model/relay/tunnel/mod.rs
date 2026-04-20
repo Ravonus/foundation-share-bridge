@@ -8,6 +8,7 @@
 //! to `cloudflared tunnel run --token <token>`.
 
 pub mod install;
+pub mod kubo_announce;
 pub mod service;
 
 pub use service::spawn_tunnel_loop;
