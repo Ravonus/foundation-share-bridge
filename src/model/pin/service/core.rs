@@ -52,11 +52,7 @@ async fn run_sync_side_effect(state: &AppState, cid: &str) {
     }
 }
 
-async fn run_remote_replication_side_effect(
-    state: &AppState,
-    cid: &str,
-    name_hint: Option<&str>,
-) {
+async fn run_remote_replication_side_effect(state: &AppState, cid: &str, name_hint: Option<&str>) {
     if let Err(error) = replicate_to_remote_service(state, cid, name_hint).await {
         warn!("remote pin replication failed for {}: {error}", cid);
     }
@@ -104,11 +100,7 @@ async fn mark_pin_remotely_replicated(
     persist_bridge_state(state).await
 }
 
-async fn mark_pin_remote_error(
-    state: &AppState,
-    cid: &str,
-    message: &str,
-) -> anyhow::Result<()> {
+async fn mark_pin_remote_error(state: &AppState, cid: &str, message: &str) -> anyhow::Result<()> {
     {
         let mut persistent = state.persistent.write().await;
         let now = Utc::now();

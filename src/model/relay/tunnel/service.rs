@@ -25,8 +25,7 @@ use crate::{
     model::{
         config::service::persist_bridge_config,
         relay::tunnel::{
-            install::ensure_cloudflared_binary,
-            kubo_announce::try_ensure_kubo_wss_advertisement,
+            install::ensure_cloudflared_binary, kubo_announce::try_ensure_kubo_wss_advertisement,
         },
     },
 };
@@ -70,7 +69,14 @@ async fn run_tunnel_supervisor(state: AppState) {
     let mut provision_backoff = 2u64;
 
     loop {
-        let (enabled, device_token, relay_server_url, token_in_config, local_service, needs_libp2p_refresh) = {
+        let (
+            enabled,
+            device_token,
+            relay_server_url,
+            token_in_config,
+            local_service,
+            needs_libp2p_refresh,
+        ) = {
             let config = state.config.read().await;
             (
                 config.tunnel_enabled,

@@ -14,8 +14,8 @@ use crate::{
     model::{
         config::service::persist_bridge_state,
         session::types::{
-            BridgeSession, ConnectSessionRequest, ConnectSessionResponse,
-            DisconnectSessionRequest, DisconnectSessionResponse, SessionSummary,
+            BridgeSession, ConnectSessionRequest, ConnectSessionResponse, DisconnectSessionRequest,
+            DisconnectSessionResponse, SessionSummary,
         },
     },
     util::machine::deterministic_session_id,
@@ -68,10 +68,8 @@ async fn upsert_session(
     let now = Utc::now();
     let (session, is_new) = {
         let mut sessions = state.sessions.write().await;
-        let existing = sessions
-            .values()
-            .find(|candidate| candidate.session_id == input.session_id)
-            .cloned();
+        let existing =
+            sessions.values().find(|candidate| candidate.session_id == input.session_id).cloned();
 
         if let Some(mut existing) = existing {
             // Refresh the labels the site may have updated (account / profile)

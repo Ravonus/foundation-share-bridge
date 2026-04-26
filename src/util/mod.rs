@@ -8,5 +8,6 @@ pub mod data;
 pub mod file;
 pub mod format;
 pub mod machine;
-pub mod text;
-pub mod url;
+pub mod web;
+
+pub use web::{text, url};

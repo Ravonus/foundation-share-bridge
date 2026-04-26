@@ -305,19 +305,21 @@ pub async fn run() -> anyhow::Result<()> {
     spawn_relay_socket_loop(state.clone());
     spawn_tunnel_loop(state.clone());
 
-    let app = Router::new()
+    let health_routes = Router::new()
+        .route("/health", get(health))
+        .route("/gateway/health", get(gateway_health_handler))
+        .route("/storage/stats", get(storage_stats_handler))
+        .route("/status/live", get(live_status_handler));
+
+    let protected_routes = Router::new()
         .route("/", get(root_page))
         .route("/settings", get(settings_page))
-        .route("/health", get(health))
         .route("/sessions", get(list_sessions))
         .route("/session/connect", post(connect_session))
         .route("/session/disconnect", post(disconnect_session))
         .route("/session/{session_id}", get(session_by_id))
         .route("/session/{session_id}/disconnect", post(disconnect_session_by_id))
-        .route(
-            "/session/{session_id}/disconnect/form",
-            post(disconnect_session_by_id_form),
-        )
+        .route("/session/{session_id}/disconnect/form", post(disconnect_session_by_id_form))
         .route("/config", get(get_config).post(update_config))
         .route("/settings/form", post(update_config_form))
         .route("/relay/link", post(link_relay_device))
@@ -335,9 +337,6 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/pins/item/{cid}/retry-sync", post(retry_sync_single))
         .route("/pins/item/{cid}/tags", post(set_pin_tags))
         .route("/pins/export", get(export_pins_handler))
-        .route("/gateway/health", get(gateway_health_handler))
-        .route("/storage/stats", get(storage_stats_handler))
-        .route("/status/live", get(live_status_handler))
         .route("/artists/summary", get(artist_summary_handler))
         .route("/sync/run", post(sync_now))
         .route("/ipfs/pin", post(pin_cid))
@@ -347,18 +346,20 @@ pub async fn run() -> anyhow::Result<()> {
             post(add_files_form).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
         .route("/artists/{username}/archive-all", post(archive_all_for_artist))
-        .route(
-            "/artists/archive-all/form",
-            post(archive_all_for_artist_form),
-        )
+        .route("/artists/archive-all/form", post(archive_all_for_artist_form))
         .route("/share/work", post(share_work))
         .route("/share/work/view", get(share_work_view))
         .route("/share/work/form", post(share_work_form))
         .route("/share/profile", post(share_profile))
+        // Keep expensive/session-mutating routes guarded, but do not throttle
+        // readiness polling. Browser tabs and the menu companion can ask
+        // `/health` often without consuming this bucket.
+        .layer(bridge_governor_layer());
+
+    let app = Router::new()
+        .merge(health_routes)
+        .merge(protected_routes)
         .layer(bridge_cors_layer())
-        // Per-IP rate limit. Placed after CORS so 429 responses still carry
-        // CORS headers when the archive site gets throttled.
-        .layer(bridge_governor_layer())
         .layer(middleware::map_response(add_private_network_access_header))
         .layer(TraceLayer::new_for_http())
         .with_state(state);

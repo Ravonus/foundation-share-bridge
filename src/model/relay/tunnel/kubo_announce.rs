@@ -55,64 +55,44 @@ async fn fetch_kubo_peer_id(state: &AppState) -> anyhow::Result<String> {
     if let Some(header) = &state.ipfs_api_auth_header {
         request = request.header("Authorization", header);
     }
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("Unable to reach Kubo API at {url}"))?;
+    let response =
+        request.send().await.with_context(|| format!("Unable to reach Kubo API at {url}"))?;
     if !response.status().is_success() {
-        return Err(anyhow!(
-            "Kubo /api/v0/id returned HTTP {}",
-            response.status()
-        ));
+        return Err(anyhow!("Kubo /api/v0/id returned HTTP {}", response.status()));
     }
-    let parsed = response
-        .json::<KuboIdResponse>()
-        .await
-        .context("Malformed /api/v0/id payload")?;
+    let parsed = response.json::<KuboIdResponse>().await.context("Malformed /api/v0/id payload")?;
     Ok(parsed.id)
 }
 
 async fn fetch_kubo_config_array(state: &AppState, key: &str) -> anyhow::Result<Vec<String>> {
-    let url = format!(
-        "{}/api/v0/config?arg={key}",
-        state.ipfs_api_url.trim_end_matches('/')
-    );
+    let url = format!("{}/api/v0/config?arg={key}", state.ipfs_api_url.trim_end_matches('/'));
     let mut request = state.http.post(&url);
     if let Some(header) = &state.ipfs_api_auth_header {
         request = request.header("Authorization", header);
     }
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("Unable to read Kubo config {key}"))?;
+    let response =
+        request.send().await.with_context(|| format!("Unable to read Kubo config {key}"))?;
     let status = response.status();
     if !status.is_success() {
         return Err(anyhow!("Kubo config {key} returned HTTP {status}"));
     }
-    let wrapped = response
-        .json::<KuboConfigValue>()
-        .await
-        .context("Malformed Kubo config payload")?;
+    let wrapped =
+        response.json::<KuboConfigValue>().await.context("Malformed Kubo config payload")?;
     Ok(value_to_string_vec(&wrapped.value))
 }
 
 fn value_to_string_vec(value: &Value) -> Vec<String> {
     match value {
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|entry| entry.as_str().map(str::to_string))
-            .collect(),
+        Value::Array(items) => {
+            items.iter().filter_map(|entry| entry.as_str().map(str::to_string)).collect()
+        }
         _ => Vec::new(),
     }
 }
 
-async fn write_kubo_config(
-    state: &AppState,
-    key: &str,
-    items: &[String],
-) -> anyhow::Result<()> {
-    let json_body = serde_json::to_string(&json!(items))
-        .context("Unable to encode Kubo config value")?;
+async fn write_kubo_config(state: &AppState, key: &str, items: &[String]) -> anyhow::Result<()> {
+    let json_body =
+        serde_json::to_string(&json!(items)).context("Unable to encode Kubo config value")?;
     let url = format!(
         "{base}/api/v0/config?arg={key}&arg={value}&json=true",
         base = state.ipfs_api_url.trim_end_matches('/'),
@@ -124,34 +104,35 @@ async fn write_kubo_config(
     if let Some(header) = &state.ipfs_api_auth_header {
         request = request.header("Authorization", header);
     }
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("Unable to write Kubo config {key}"))?;
+    let response =
+        request.send().await.with_context(|| format!("Unable to write Kubo config {key}"))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "Kubo config write {key} returned HTTP {status}: {body}"
-        ));
+        return Err(anyhow!("Kubo config write {key} returned HTTP {status}: {body}"));
     }
     Ok(())
 }
 
 fn urlencoding_encode(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| match c {
-            c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') => c.to_string(),
-            c => {
-                let mut buf = [0u8; 4];
-                c.encode_utf8(&mut buf)
-                    .bytes()
-                    .map(|byte| format!("%{byte:02X}"))
-                    .collect::<String>()
-            }
-        })
-        .collect()
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for c in value.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            encoded.push(c);
+            continue;
+        }
+
+        let mut buf = [0u8; 4];
+        for byte in c.encode_utf8(&mut buf).bytes() {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+
+    encoded
 }
 
 fn merge_unique(existing: &[String], additional: &str) -> Option<Vec<String>> {
@@ -181,12 +162,12 @@ fn reconcile_libp2p_announce(existing: &[String], keeper: &str) -> Option<Vec<St
         .cloned()
         .collect();
 
-    let mut next = filtered.clone();
+    let mut next = filtered;
     if !next.iter().any(|entry| entry == keeper) {
         next.push(keeper.to_string());
     }
 
-    if next == existing.to_vec() { None } else { Some(next) }
+    if next.as_slice() == existing { None } else { Some(next) }
 }
 
 /// Ensure Kubo is set up to (a) listen for WS libp2p on the proxied local

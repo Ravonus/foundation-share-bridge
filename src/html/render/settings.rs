@@ -39,20 +39,13 @@ fn render_reachability_note(config: &BridgeConfig) -> String {
     if !config.tunnel_enabled {
         return String::new();
     }
-    let token_configured = config
-        .remote_pinning_access_token
-        .as_deref()
-        .map_or("", str::trim)
-        .is_empty()
-        .not();
+    let token_configured =
+        config.remote_pinning_access_token.as_deref().map_or("", str::trim).is_empty().not();
     if config.remote_pinning_enabled && token_configured {
         return format!(
             r#"<div class="flash ok" style="margin-top:14px;">Remote replication on via {service}. New pins are pushed there immediately so ipfs.io / dweb.link can resolve them through that provider.</div>"#,
             service = escape_html(
-                config
-                    .remote_pinning_service_name
-                    .as_deref()
-                    .unwrap_or("the configured service"),
+                config.remote_pinning_service_name.as_deref().unwrap_or("the configured service"),
             ),
         );
     }

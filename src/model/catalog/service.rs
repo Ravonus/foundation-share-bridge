@@ -67,10 +67,7 @@ pub fn sanitize_username(raw: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("Artist handle is required.".to_string());
     }
-    if !trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
+    if !trimmed.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
         return Err(
             "Invalid artist handle. Use the Foundation username (letters, numbers, -, _, .)."
                 .to_string(),

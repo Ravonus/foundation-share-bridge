@@ -7,7 +7,7 @@ use crate::model::pin::inventory::inventory_work_group_key;
 use crate::model::session::BridgeSession;
 use crate::util::text::escape_html;
 
-fn archive_any_form_html() -> &'static str {
+const fn archive_any_form_html() -> &'static str {
     r#"<form action="/artists/archive-all/form" method="post" class="archive-any-form">
   <label class="field">
     <span>Archive an artist's full Foundation catalog</span>
@@ -21,13 +21,12 @@ fn archive_any_form_html() -> &'static str {
 }
 
 fn render_empty_artist_summary(current_username: Option<&str>) -> String {
-    let me_line = match current_username {
-        Some(name) => format!(
+    let me_line = current_username.map_or_else(String::new, |name| {
+        format!(
             r#"<p class="pin-context" style="margin-top:10px;">No works by @{} pinned here yet.</p>"#,
             escape_html(name)
-        ),
-        None => String::new(),
-    };
+        )
+    });
     let form = archive_any_form_html();
     format!(
         r#"<section id="artists" class="card">
