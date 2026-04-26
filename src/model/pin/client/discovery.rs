@@ -47,7 +47,7 @@ pub async fn resolve_dependency_probe_paths(
         }
     };
 
-    if preferred_file_name.filter(|value| is_dependency_probe_candidate(value)).is_some() {
+    if preferred_file_name.as_ref().is_some_and(|value| is_dependency_probe_candidate(value)) {
         push_candidate(root_path.clone());
     }
 
@@ -77,7 +77,10 @@ pub async fn resolve_dependency_probe_paths(
             }
         }
         Err(_) => {
-            if preferred_file_name.filter(|value| is_dependency_probe_candidate(value)).is_some() {
+            if preferred_file_name
+                .as_ref()
+                .is_some_and(|value| is_dependency_probe_candidate(value))
+            {
                 push_candidate(root_path);
             }
         }

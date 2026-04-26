@@ -108,7 +108,7 @@ pub async fn show_backup_notification(body: &str) -> anyhow::Result<()> {
             return Err(anyhow!("Linux notification command exited unsuccessfully"));
         }
 
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]

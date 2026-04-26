@@ -78,7 +78,7 @@ fn render_sessions_card(
     }
 
     let mut entries: Vec<&BridgeSession> = sessions.values().collect();
-    entries.sort_by(|a, b| b.connected_at.cmp(&a.connected_at));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.connected_at));
 
     let rows = entries
         .into_iter()

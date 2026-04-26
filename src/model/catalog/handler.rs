@@ -74,11 +74,11 @@ pub async fn archive_all_for_artist_form(
     let sanitized = match sanitize_username(&input.username) {
         Ok(value) => value,
         Err(message) => {
-            return Ok(Redirect::to(&format!("/?error={}", encode_query_component(&message),)));
+            return Ok(Redirect::to(&format!("/?error={}", encode_query_component(&message))));
         }
     };
 
     spawn_archive_job(state, sanitized.clone());
 
-    Ok(Redirect::to(&format!("/?archiving={}", encode_query_component(&sanitized),)))
+    Ok(Redirect::to(&format!("/?archiving={}", encode_query_component(&sanitized))))
 }

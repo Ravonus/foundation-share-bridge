@@ -33,7 +33,7 @@ pub async fn submit_to_remote_pinning_service(
     let parsed = url::Url::parse(&service_url)
         .with_context(|| format!("Invalid remote_pinning_service_url: {service_url}"))?;
     if parsed.scheme() != "https" {
-        anyhow::bail!("remote_pinning_service_url must use https (got {})", parsed.scheme(),);
+        anyhow::bail!("remote_pinning_service_url must use https (got {})", parsed.scheme());
     }
     let token = token
         .filter(|value| !value.trim().is_empty())
